@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="ja">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -9,78 +9,203 @@
     <main class="container">
       <header>
         <h1>Rust VC</h1>
-        <p class="sub">TypeScript debug panel</p>
+        <p class="sub">リアルタイム音声変換コントロールパネル</p>
       </header>
 
-      <section class="card">
-        <h2>Model</h2>
-        <label for="modelPath">RVC model path</label>
-        <input id="modelPath" type="text" placeholder="model/model.onnx" />
-        <label for="hubertPath">HuBERT path (required for RVC)</label>
-        <input id="hubertPath" type="text" placeholder="model/hubert.onnx" />
-        <label for="rmvpePath">RMVPE path (required for RVC)</label>
-        <input id="rmvpePath" type="text" placeholder="model/rmvpe.onnx" />
-        <label for="indexPath">Index path (optional, supports .index via python faiss cache)</label>
-        <input id="indexPath" type="text" placeholder="model/model.index" />
+      <nav class="tabs" id="settingsTabs" aria-label="設定タブ">
+        <button class="tab-btn active" data-tab="model" type="button">モデル/デバイス</button>
+        <button class="tab-btn" data-tab="quality" type="button">音質</button>
+        <button class="tab-btn" data-tab="realtime" type="button">安定化</button>
+        <button class="tab-btn" data-tab="advanced" type="button">GPU/詳細</button>
+      </nav>
+
+      <section class="tab-panel active" data-tab-panel="model">
+        <section class="card">
+          <h2>モデル設定</h2>
+          <p class="section-hint">モデル不一致は機械感やノイズ増加の主因です。最初は標準構成をそのまま使ってください。</p>
+
+          <label for="modelPath">RVCモデル (`model.onnx`)</label>
+          <input id="modelPath" type="text" placeholder="model/model.onnx" />
+          <p class="hint">変換本体です。別モデルに替えると声質が大きく変わります。</p>
+
+          <label for="hubertPath">HuBERT (`hubert.onnx`)</label>
+          <input id="hubertPath" type="text" placeholder="model/hubert.onnx" />
+          <p class="hint">発話内容の特徴抽出です。不一致だと発音が崩れます。</p>
+
+          <label for="rmvpePath">RMVPE (`rmvpe.onnx`)</label>
+          <input id="rmvpePath" type="text" placeholder="model/rmvpe.onnx" />
+          <p class="hint">ピッチ推定です。不安定だとロボット感や音程ブレが増えます。</p>
+
+          <label for="indexPath">インデックス (`.bin` 推奨 / `.index` も可)</label>
+          <input id="indexPath" type="text" placeholder="model/model_vectors.bin" />
+          <p class="hint">`.bin` は高速で安定です。`.index` は初回に Python + faiss が必要です。</p>
+        </section>
+
+        <section class="card">
+          <h2>オーディオデバイス</h2>
+          <p class="section-hint">入出力デバイスの取り違えは「無音」「常時ノイズ」の頻出原因です。</p>
+          <div class="grid">
+            <div class="field">
+              <label for="inputDevice">入力デバイス（マイク）</label>
+              <select id="inputDevice"></select>
+            </div>
+            <div class="field">
+              <label for="outputDevice">出力デバイス（スピーカー）</label>
+              <select id="outputDevice"></select>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab-panel" data-tab-panel="quality">
+        <section class="card">
+          <h2>音質・声質</h2>
+          <p class="section-hint">機械感が強いときは `protect`, `index_rate`, `pitch_smooth`, `rms_mix` を優先調整してください。</p>
+          <div class="grid">
+            <div class="field">
+              <label for="pitchShift">ピッチ変更（半音）</label>
+              <input id="pitchShift" type="number" step="1" />
+              <p class="hint">上下に振りすぎると不自然になります。まずは -2 から +2 を推奨。</p>
+            </div>
+            <div class="field">
+              <label for="protect">子音保護（protect）</label>
+              <input id="protect" type="number" step="0.01" min="0" />
+              <p class="hint">上げると発音崩れを抑えますが、変換量は弱くなります（0.33-0.50目安）。</p>
+            </div>
+            <div class="field">
+              <label for="indexRate">インデックス比率（index_rate）</label>
+              <input id="indexRate" type="number" step="0.05" min="0" />
+              <p class="hint">上げるほど学習声質に寄ります。高すぎるとノイズ/息成分が増えます。</p>
+            </div>
+            <div class="field">
+              <label for="indexSmoothAlpha">インデックス平滑化（index_smooth）</label>
+              <input id="indexSmoothAlpha" type="number" step="0.01" min="0" />
+              <p class="hint">上げると突然の声質ジャンプを抑制します（0.75-0.92目安）。</p>
+            </div>
+            <div class="field">
+              <label for="indexTopK">近傍数（top_k）</label>
+              <input id="indexTopK" type="number" step="1" min="1" />
+              <p class="hint">増やすと平均化されやすくなり、音色変化がマイルドになります。</p>
+            </div>
+            <div class="field">
+              <label for="indexSearchRows">検索行数（index_rows）</label>
+              <input id="indexSearchRows" type="number" step="256" min="0" />
+              <p class="hint">上げると参照精度は上がりますが遅延/途切れが増えます（1024-4096目安）。</p>
+            </div>
+            <div class="field">
+              <label for="rmvpeThreshold">無声音しきい値（rmvpe_th）</label>
+              <input id="rmvpeThreshold" type="number" step="0.005" min="0" />
+              <p class="hint">上げるとノイズF0を無視しやすくなりますが、声が抜けることがあります。</p>
+            </div>
+            <div class="field">
+              <label for="pitchSmoothAlpha">ピッチ平滑化（pitch_smooth）</label>
+              <input id="pitchSmoothAlpha" type="number" step="0.01" min="0" />
+              <p class="hint">上げるとガタつきを抑えます。上げすぎると抑揚が減ります。</p>
+            </div>
+            <div class="field">
+              <label for="f0MedianFilterRadius">F0メディアン半径（f0_med_r）</label>
+              <input id="f0MedianFilterRadius" type="number" step="1" min="0" />
+              <p class="hint">3-5でジッタ軽減。大きすぎると反応が鈍くなります。</p>
+            </div>
+            <div class="field">
+              <label for="rmsMixRate">RMS Mix（入力エンベロープ継承）</label>
+              <input id="rmsMixRate" type="number" step="0.05" min="0" />
+              <p class="hint">上げると強弱が残り、機械感が減りやすくなります（0.15-0.35目安）。</p>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab-panel" data-tab-panel="realtime">
+        <section class="card">
+          <h2>リアルタイム安定化</h2>
+          <p class="section-hint">途切れが出る場合は `block_size` と `extra_ms` を上げ、しきい値を下げる方向で調整します。</p>
+          <div class="grid">
+            <div class="field">
+              <label for="sampleRate">モデルサンプルレート</label>
+              <input id="sampleRate" type="number" step="1000" />
+              <p class="hint">通常は 48000 固定推奨。特殊値は音程崩れの原因になります。</p>
+            </div>
+            <div class="field">
+              <label for="blockSize">ブロックサイズ</label>
+              <input id="blockSize" type="number" step="16" />
+              <p class="hint">上げるほど安定、下げるほど低遅延。8192 以上が安全です。</p>
+            </div>
+            <div class="field">
+              <label for="extraInferenceMs">追加推論時間（ms）</label>
+              <input id="extraInferenceMs" type="number" step="5" min="0" />
+              <p class="hint">上げるとバッファ余裕が増え途切れが減りますが、遅延は増えます。</p>
+            </div>
+            <div class="field">
+              <label for="responseThreshold">反応しきい値（dBFS または線形）</label>
+              <input id="responseThreshold" type="number" step="0.001" min="-90" />
+              <p class="hint">負値は dBFS（例: -50）。上げすぎると語頭/語尾が切れやすくなります。</p>
+            </div>
+            <div class="field">
+              <label for="fadeInMs">フェードイン（ms）</label>
+              <input id="fadeInMs" type="number" step="1" min="0" />
+              <p class="hint">小さすぎると立ち上がりノイズが出る場合があります。</p>
+            </div>
+            <div class="field">
+              <label for="fadeOutMs">フェードアウト（ms）</label>
+              <input id="fadeOutMs" type="number" step="1" min="0" />
+              <p class="hint">大きいほど自然に消えますが、語尾が伸びることがあります。</p>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab-panel" data-tab-panel="advanced">
+        <section class="card">
+          <h2>GPU / 詳細設定</h2>
+          <p class="section-hint">まずは `ort_provider=auto` 推奨。GPUが不安定なときだけ CPU 固定を試してください。</p>
+          <div class="grid">
+            <div class="field">
+              <label for="inputGain">入力ゲイン</label>
+              <input id="inputGain" type="number" step="0.1" />
+              <p class="hint">入力が小さいときだけ少し上げます。上げすぎると割れます。</p>
+            </div>
+            <div class="field">
+              <label for="outputGain">出力ゲイン</label>
+              <input id="outputGain" type="number" step="0.1" />
+              <p class="hint">最終音量です。1.0基準で微調整してください。</p>
+            </div>
+            <div class="field">
+              <label for="speakerId">話者ID</label>
+              <input id="speakerId" type="number" step="1" />
+              <p class="hint">マルチ話者モデルのみ有効です。</p>
+            </div>
+            <div class="field">
+              <label for="ortProvider">推論プロバイダ（ONNX Runtime）</label>
+              <select id="ortProvider">
+                <option value="auto">自動（CUDA→DirectML→CPU）</option>
+                <option value="cuda">CUDA (NVIDIA)</option>
+                <option value="directml">DirectML (Windows GPU)</option>
+                <option value="cpu">CPUのみ</option>
+              </select>
+              <p class="hint">ノイズや処理落ちが増える場合は切り替えて比較してください。</p>
+            </div>
+            <div class="field">
+              <label for="ortDeviceId">GPUデバイス番号</label>
+              <input id="ortDeviceId" type="number" step="1" min="0" />
+              <p class="hint">複数GPU環境向けです。通常は 0 のままで問題ありません。</p>
+            </div>
+            <div class="field">
+              <label for="ortGpuMemLimitMb">GPU VRAM上限（MB / 0で無制限）</label>
+              <input id="ortGpuMemLimitMb" type="number" step="128" min="0" />
+              <p class="hint">他アプリ併用時に有効です。低すぎると初期化失敗します。</p>
+            </div>
+          </div>
+        </section>
       </section>
 
       <section class="card">
-        <h2>Runtime</h2>
-        <div class="grid">
-          <div>
-            <label for="inputGain">Input Gain</label>
-            <input id="inputGain" type="number" step="0.1" />
-          </div>
-          <div>
-            <label for="outputGain">Output Gain</label>
-            <input id="outputGain" type="number" step="0.1" />
-          </div>
-          <div>
-            <label for="pitchShift">Pitch Shift (semitones)</label>
-            <input id="pitchShift" type="number" step="1" />
-          </div>
-          <div>
-            <label for="indexRate">Index Rate</label>
-            <input id="indexRate" type="number" step="0.05" min="0" max="1" />
-          </div>
-          <div>
-            <label for="indexTopK">Index Top-K</label>
-            <input id="indexTopK" type="number" step="1" min="1" max="64" />
-          </div>
-          <div>
-            <label for="indexSearchRows">Index Search Rows (0=all)</label>
-            <input id="indexSearchRows" type="number" step="256" min="0" />
-          </div>
-          <div>
-            <label for="protect">Protect (unvoiced blend)</label>
-            <input id="protect" type="number" step="0.01" min="0" max="0.5" />
-          </div>
-          <div>
-            <label for="rmvpeThreshold">RMVPE Threshold</label>
-            <input id="rmvpeThreshold" type="number" step="0.005" min="0" max="1" />
-          </div>
-          <div>
-            <label for="speakerId">Speaker ID</label>
-            <input id="speakerId" type="number" step="1" />
-          </div>
-          <div>
-            <label for="sampleRate">Sample Rate</label>
-            <input id="sampleRate" type="number" step="1000" />
-          </div>
-          <div>
-            <label for="blockSize">Block Size</label>
-            <input id="blockSize" type="number" step="16" />
-          </div>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2>Engine</h2>
+        <h2>エンジン操作</h2>
         <div class="actions">
-          <button id="reloadBtn">Reload</button>
-          <button id="saveBtn">Save</button>
-          <button id="startBtn" class="primary">Start</button>
-          <button id="stopBtn">Stop</button>
+          <button id="reloadBtn">再読込</button>
+          <button id="saveBtn">保存</button>
+          <button id="startBtn" class="primary">開始</button>
+          <button id="stopBtn">停止</button>
         </div>
         <p id="statusLine">status: idle</p>
         <p id="levelLine">input level: rms 0.0000 / peak 0.0000</p>
@@ -89,8 +214,8 @@
 
       <section class="card log-card">
         <div class="log-head">
-          <h2>Debug Log</h2>
-          <button id="clearLogBtn">Clear</button>
+          <h2>デバッグログ</h2>
+          <button id="clearLogBtn">クリア</button>
         </div>
         <pre id="logBox"></pre>
       </section>

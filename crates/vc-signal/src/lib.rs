@@ -101,12 +101,131 @@ pub fn postprocess_generated_audio(samples: &[f32]) -> Vec<f32> {
         out.fill(0.0);
         return out;
     }
-    let gain = if peak > 0.98 { 0.98 / peak } else { 1.0 };
+    let gain = if peak > 0.99 { 0.99 / peak } else { 1.0 };
+    // DC blocker + gentle peak limiter. Avoid always-on nonlinear shaping to reduce metallic tone.
+    let mut prev_x = 0.0_f32;
+    let mut prev_y = 0.0_f32;
+    let hp_alpha = 0.995_f32;
     for s in &mut out {
-        let v = (*s * gain).clamp(-0.98, 0.98);
-        *s = if v.abs() < 1.0e-5 { 0.0 } else { v };
+        let x = *s * gain;
+        let y_hp = x - prev_x + hp_alpha * prev_y;
+        prev_x = x;
+        prev_y = y_hp;
+        let mut v = y_hp;
+        let abs = v.abs();
+        if abs > 0.95 {
+            // Engage soft limiting only near clipping.
+            v = v.signum() * ((2.2_f32 * abs).tanh() / 2.2_f32);
+        }
+        *s = v.clamp(-0.99, 0.99);
     }
     out
+}
+
+pub fn apply_rms_mix(input: &[f32], output: &[f32], rms_mix_rate: f32) -> Vec<f32> {
+    if output.is_empty() {
+        return Vec::new();
+    }
+    let mix = rms_mix_rate.clamp(0.0, 1.0);
+    if mix >= 0.999 || input.is_empty() {
+        return output.to_vec();
+    }
+
+    let in_env = rms_envelope(input);
+    let out_env = rms_envelope(output);
+    let in_len = in_env.len();
+    let out_len = out_env.len();
+    if in_len == 0 || out_len == 0 {
+        return output.to_vec();
+    }
+
+    let mut out = output.to_vec();
+    let in_last = (in_len - 1) as f32;
+    let out_last = (out_len - 1).max(1) as f32;
+    let gain_exp = 1.0 - mix;
+    for (i, sample) in out.iter_mut().enumerate() {
+        let src_pos = i as f32 * in_last / out_last;
+        let left = src_pos.floor() as usize;
+        let right = (left + 1).min(in_len - 1);
+        let frac = src_pos - left as f32;
+        let in_rms = in_env[left] * (1.0 - frac) + in_env[right] * frac;
+        let out_rms = out_env[i].max(1e-4);
+        let gain = (in_rms / out_rms).clamp(0.1, 10.0).powf(gain_exp);
+        *sample *= gain;
+    }
+    out
+}
+
+pub fn median_filter_pitch_track_inplace(pitch: &mut [f32], radius: usize) {
+    if radius == 0 || pitch.len() < 3 {
+        return;
+    }
+    let src = pitch.to_vec();
+    let mut win = Vec::<f32>::with_capacity(radius * 2 + 1);
+    for (i, dst) in pitch.iter_mut().enumerate() {
+        if src[i] <= 0.0 {
+            continue;
+        }
+        win.clear();
+        let lo = i.saturating_sub(radius);
+        let hi = (i + radius + 1).min(src.len());
+        for &v in &src[lo..hi] {
+            if v > 0.0 {
+                win.push(v);
+            }
+        }
+        if win.is_empty() {
+            continue;
+        }
+        win.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        *dst = win[win.len() / 2];
+    }
+}
+
+fn rms_envelope(samples: &[f32]) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if samples.len() == 1 {
+        return vec![samples[0].abs()];
+    }
+
+    let frame = samples.len().clamp(256, 1024);
+    let hop = (frame / 4).max(1);
+    let mut points = Vec::<(usize, f32)>::new();
+    let mut start = 0usize;
+    while start < samples.len() {
+        let end = (start + frame).min(samples.len());
+        let seg = &samples[start..end];
+        let rms = (seg.iter().map(|v| v * v).sum::<f32>() / seg.len().max(1) as f32).sqrt();
+        points.push((start + (seg.len() / 2), rms));
+        if end == samples.len() {
+            break;
+        }
+        start += hop;
+    }
+
+    if points.len() == 1 {
+        return vec![points[0].1; samples.len()];
+    }
+
+    let mut env = vec![0.0_f32; samples.len()];
+    let mut p = 0usize;
+    for (i, slot) in env.iter_mut().enumerate() {
+        while p + 1 < points.len() && points[p + 1].0 <= i {
+            p += 1;
+        }
+        if p + 1 >= points.len() {
+            *slot = points[p].1;
+        } else {
+            let (x0, y0) = points[p];
+            let (x1, y1) = points[p + 1];
+            let denom = (x1.saturating_sub(x0)).max(1) as f32;
+            let t = (i.saturating_sub(x0)) as f32 / denom;
+            *slot = y0 * (1.0 - t) + y1 * t;
+        }
+    }
+    env
 }
 
 pub fn resample_linear_into(samples: &[f32], src_rate: u32, dst_rate: u32, out: &mut Vec<f32>) {

@@ -39,6 +39,19 @@ Python依存を減らし、推論・音声処理・UI連携をRust側に集約�
 - `*.index`（FAISSバイナリ）は対応済みです
   - 初回だけ Python + `faiss` で展開し、`*.rustvc.cache` を生成します
   - 2回目以降はキャッシュを読むため高速です
+- `.bin`（float32生配列）も対応済みです
+  - 既定では 768 次元として読み込みます
+  - 必要なら `RUST_VC_INDEX_BIN_DIM` で次元指定できます
+- 推論デバイス設定（UI）
+  - `ort_provider`: `auto` / `cuda` / `directml` / `cpu`
+  - `ort_device_id`: GPUデバイス番号
+  - `ort_gpu_mem_limit_mb`: CUDAメモリアリーナ上限（MB, 0で無制限）
+- 音質調整（UI）
+  - `index_smooth_alpha`: Index由来の声質変動を時間方向に平滑化（0.0〜0.98）
+  - `pitch_smooth_alpha`: F0平滑化量（0.0〜0.98）
+  - `f0_median_filter_radius`: F0メディアン平滑化の半径（0〜9）
+  - `rms_mix_rate`: 入力音量エンベロープ継承率（0.0〜1.0）
+  - 小さめ（0.05〜0.20）にすると機械感が減りやすい
 - 現状は「動くプロトタイプ」を優先した実装です
 
 ## Index変換スクリプト
@@ -53,6 +66,7 @@ Python依存を減らし、推論・音声処理・UI連携をRust側に集約�
   - `python scripts/export_faiss_index_bin.py --index model/model.index --out model/model_vectors.bin`
 
 出力時に `vector count` と `dimension(期待値768)` を表示し、次元不一致ならエラー終了します。
+この `.bin` は UI の `index_path` にそのまま指定できます。
 
 ## Todo
 

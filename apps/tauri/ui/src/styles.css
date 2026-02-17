@@ -44,6 +44,41 @@ h1 {
   color: var(--muted);
 }
 
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.tab-btn {
+  height: 36px;
+  border-radius: 999px;
+  background: #0b1220;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.tab-btn:hover {
+  color: var(--text);
+}
+
+.tab-btn.active {
+  color: #031327;
+  border-color: var(--accent-2);
+  background: linear-gradient(180deg, #17b9ff 0%, #0f7fe2 100%);
+  font-weight: 700;
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
 .card {
   background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
   border: 1px solid var(--line);
@@ -57,6 +92,13 @@ h2 {
   font-size: 17px;
 }
 
+.section-hint {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 label {
   display: block;
   margin: 8px 0 4px;
@@ -64,7 +106,19 @@ label {
   font-size: 12px;
 }
 
-input {
+.field {
+  min-width: 0;
+}
+
+.hint {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+input,
+select {
   width: 100%;
   height: 36px;
   border-radius: 8px;
@@ -74,7 +128,8 @@ input {
   padding: 6px 10px;
 }
 
-input:focus {
+input:focus,
+select:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(56, 212, 255, 0.2);
@@ -152,6 +207,15 @@ button.primary {
 }
 
 @media (max-width: 760px) {
+  .tabs {
+    gap: 6px;
+  }
+
+  .tab-btn {
+    width: calc(50% - 3px);
+    min-width: 140px;
+  }
+
   .grid {
     grid-template-columns: 1fr;
   }

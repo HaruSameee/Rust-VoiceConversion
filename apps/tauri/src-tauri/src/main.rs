@@ -13,7 +13,8 @@ use std::{
 use serde::Serialize;
 use tauri::State;
 use vc_audio::{
-    list_input_devices, list_output_devices, spawn_voice_changer_stream, RealtimeAudioEngine,
+    list_input_devices, list_output_devices, spawn_voice_changer_stream, AudioStreamOptions,
+    RealtimeAudioEngine,
 };
 use vc_core::{ModelConfig, RuntimeConfig, VoiceChanger};
 use vc_inference::RvcOrtEngine;
@@ -124,14 +125,27 @@ fn get_runtime_config_cmd(state: State<'_, AppState>) -> Result<RuntimeConfig, S
 #[tauri::command]
 fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> Result<(), String> {
     log_debug(&format!(
-        "set_runtime_config_cmd sample_rate={} block_size={} index_rate={} top_k={} rows={} protect={:.2} rmvpe_th={:.3}",
+        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={}",
         config.sample_rate,
         config.block_size,
+        config.input_device_name,
+        config.output_device_name,
+        config.extra_inference_ms,
+        config.response_threshold,
+        config.fade_in_ms,
+        config.fade_out_ms,
         config.index_rate,
+        config.index_smooth_alpha,
         config.index_top_k,
         config.index_search_rows,
         config.protect,
-        config.rmvpe_threshold
+        config.rmvpe_threshold,
+        config.pitch_smooth_alpha,
+        config.rms_mix_rate,
+        config.f0_median_filter_radius,
+        config.ort_provider,
+        config.ort_device_id,
+        config.ort_gpu_mem_limit_mb
     ));
     let mut guard = state.lock_runtime();
     guard.config = config;
@@ -163,7 +177,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
     run_panic_safe("start_engine_cmd", || {
         log_debug("start_engine_cmd");
         let _ = ensure_ort_dylib_path();
-        let (mut runtime_config, model_raw) = {
+        let (runtime_config, model_raw) = {
             let mut guard = state.lock_runtime();
             if guard.running {
                 log_debug("engine already running");
@@ -176,39 +190,52 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             }
             (guard.config.clone(), guard.model.clone())
         };
-        if runtime_config.block_size < 8_192 {
-            log_debug(&format!(
-                "block_size={} is too small for current pipeline; auto-raise to 8192",
-                runtime_config.block_size
-            ));
-            runtime_config.block_size = 8_192;
-        }
-
         let model = resolve_model_config_for_start(model_raw)?;
         log_debug(&format!(
             "ORT_DYLIB_PATH={:?}",
             std::env::var("ORT_DYLIB_PATH").ok()
         ));
         log_debug(&format!(
-            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} index_rate={} top_k={} rows={} protect={:.2} rmvpe_th={:.3}",
+            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={}",
             model.model_path,
             model.hubert_path,
             model.pitch_extractor_path,
             model.index_path,
             runtime_config.sample_rate,
             runtime_config.block_size,
+            runtime_config.input_device_name,
+            runtime_config.output_device_name,
+            runtime_config.extra_inference_ms,
+            runtime_config.response_threshold,
+            runtime_config.fade_in_ms,
+            runtime_config.fade_out_ms,
             runtime_config.index_rate,
+            runtime_config.index_smooth_alpha,
             runtime_config.index_top_k,
             runtime_config.index_search_rows,
             runtime_config.protect,
-            runtime_config.rmvpe_threshold
+            runtime_config.rmvpe_threshold,
+            runtime_config.pitch_smooth_alpha,
+            runtime_config.rms_mix_rate,
+            runtime_config.f0_median_filter_radius,
+            runtime_config.ort_provider,
+            runtime_config.ort_device_id,
+            runtime_config.ort_gpu_mem_limit_mb
         ));
-        let infer_engine = RvcOrtEngine::new(model).map_err(|e| e.to_string())?;
+        let infer_engine = RvcOrtEngine::new(model, &runtime_config).map_err(|e| e.to_string())?;
         let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());
         let audio_engine = spawn_voice_changer_stream(
             voice_changer,
-            runtime_config.sample_rate,
-            runtime_config.block_size,
+            AudioStreamOptions {
+                model_sample_rate: runtime_config.sample_rate,
+                block_size: runtime_config.block_size,
+                input_device_name: runtime_config.input_device_name.clone(),
+                output_device_name: runtime_config.output_device_name.clone(),
+                extra_inference_ms: runtime_config.extra_inference_ms,
+                response_threshold: runtime_config.response_threshold,
+                fade_in_ms: runtime_config.fade_in_ms,
+                fade_out_ms: runtime_config.fade_out_ms,
+            },
         )
         .map_err(|e| e.to_string())?;
 
@@ -287,6 +314,8 @@ fn default_model_config() -> ModelConfig {
     let index_path = std::env::var("RUST_VC_INDEX_PATH")
         .ok()
         .and_then(|p| resolve_existing_path(&p).or(Some(p)))
+        .or_else(|| resolve_existing_path("model/model_vectors.bin"))
+        .or_else(find_first_bin_in_model_dir)
         .or_else(|| resolve_existing_path("model/model.index"))
         .or_else(|| resolve_existing_path("model/feature.index"));
     let model_path = std::env::var("RUST_VC_MODEL_PATH")
@@ -369,6 +398,31 @@ fn find_first_onnx_in_model_dir() -> Option<String> {
                 p.is_file()
                     && p.extension()
                         .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("onnx"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        files.sort();
+        if let Some(first) = files.first() {
+            return Some(first.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn find_first_bin_in_model_dir() -> Option<String> {
+    for base in candidate_bases() {
+        let dir = base.join("model");
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("bin"))
                         .unwrap_or(false)
             })
             .collect();
