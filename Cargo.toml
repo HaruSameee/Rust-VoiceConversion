@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/vc-core",
+  "crates/vc-audio",
+  "crates/vc-signal",
+  "crates/vc-inference",
+  "apps/tauri/src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+cpal = "0.16"
+ringbuf = "0.4"
+rustfft = "6"
+ndarray = "0.16"
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
+tauri = { version = "2", features = [] }

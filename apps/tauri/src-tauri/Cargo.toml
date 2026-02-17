@@ -1,0 +1,18 @@
+[package]
+name = "rust-vc-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde.workspace = true
+tauri.workspace = true
+vc-audio = { path = "../../../crates/vc-audio" }
+vc-core = { path = "../../../crates/vc-core" }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

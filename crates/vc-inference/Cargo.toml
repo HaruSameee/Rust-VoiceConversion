@@ -1,0 +1,9 @@
+[package]
+name = "vc-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vc-core = { path = "../vc-core" }
+ort.workspace = true
