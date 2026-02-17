@@ -1,12 +1,18 @@
-use ndarray::Array2;
+use ndarray::{Array2, Array3};
 use rustfft::{num_complex::Complex32, FftPlanner};
 
 pub const RVC_N_FFT: usize = 1024;
 pub const RVC_HOP_LENGTH: usize = 160;
 pub const RVC_WIN_LENGTH: usize = RVC_N_FFT;
 
-/// 波形の最大振幅を `target_peak` にそろえる。
-/// 無音に近い入力はそのまま返す。
+#[derive(Debug, Clone)]
+pub struct RmvpePaddedInput {
+    pub padded: Vec<f32>,
+    pub left_pad: usize,
+    pub right_pad: usize,
+    pub original_len: usize,
+}
+
 pub fn normalize_peak(samples: &mut [f32], target_peak: f32) {
     let peak = samples
         .iter()
@@ -21,9 +27,58 @@ pub fn normalize_peak(samples: &mut [f32], target_peak: f32) {
     }
 }
 
-/// シンプルな線形補間リサンプラ。
-///
-/// 高品質化より「低依存で軽いこと」を優先した実装です。
+pub fn normalize_for_onnx_input(samples: &[f32], target_peak: f32) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
+    let mut out: Vec<f32> = samples.iter().map(|x| x - mean).collect();
+    normalize_peak(&mut out, target_peak);
+    out
+}
+
+pub fn pad_for_rmvpe(samples: &[f32], hop_length: usize) -> RmvpePaddedInput {
+    let normalized = normalize_for_onnx_input(samples, 0.95);
+    let left_pad = RVC_N_FFT / 2;
+    let mut right_pad = RVC_N_FFT / 2;
+
+    let mut padded = reflect_pad_center(&normalized, left_pad);
+    if hop_length > 0 {
+        let rem = padded.len() % hop_length;
+        if rem != 0 {
+            let extra = hop_length - rem;
+            padded.extend(std::iter::repeat_n(0.0_f32, extra));
+            right_pad += extra;
+        }
+    }
+
+    RmvpePaddedInput {
+        padded,
+        left_pad,
+        right_pad,
+        original_len: samples.len(),
+    }
+}
+
+pub fn trim_to_original_length(samples: &[f32], pad: &RmvpePaddedInput) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let start = pad.left_pad.min(samples.len());
+    let end = (start + pad.original_len).min(samples.len());
+    samples[start..end].to_vec()
+}
+
+pub fn postprocess_generated_audio(samples: &[f32]) -> Vec<f32> {
+    let mut out = samples.to_vec();
+    for s in &mut out {
+        *s = s.clamp(-1.0, 1.0);
+    }
+    normalize_peak(&mut out, 0.98);
+    out
+}
+
 pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if samples.is_empty() || src_rate == 0 || dst_rate == 0 {
         return Vec::new();
@@ -41,7 +96,6 @@ pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32
         let left = src_pos.floor() as usize;
         let right = (left + 1).min(samples.len() - 1);
         let frac = (src_pos - left as f64) as f32;
-
         let v = samples[left] * (1.0 - frac) + samples[right] * frac;
         out.push(v);
     }
@@ -49,9 +103,97 @@ pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32
     out
 }
 
-/// `librosa.stft` に寄せた振幅スペクトログラム（freq x time）を返す。
-///
-/// 返却形状: `[1 + n_fft / 2, n_frames]`
+pub fn frame_features_for_rvc(
+    signal: &[f32],
+    hop_length: usize,
+    feature_dim: usize,
+) -> Array3<f32> {
+    let channels = feature_dim.max(1);
+    if signal.is_empty() || hop_length == 0 {
+        return Array3::zeros((1, 1, channels));
+    }
+
+    let frames = signal.len().div_ceil(hop_length).max(1);
+    let mut out = Array3::<f32>::zeros((1, frames, channels));
+
+    for t in 0..frames {
+        let start = t * hop_length;
+        let end = (start + hop_length).min(signal.len());
+        let frame = &signal[start..end];
+        if frame.is_empty() {
+            continue;
+        }
+
+        let mean_abs = frame.iter().map(|v| v.abs()).sum::<f32>() / frame.len() as f32;
+        let rms = (frame.iter().map(|v| v * v).sum::<f32>() / frame.len() as f32).sqrt();
+        let zcr = frame
+            .windows(2)
+            .filter(|w| (w[0] >= 0.0 && w[1] < 0.0) || (w[0] < 0.0 && w[1] >= 0.0))
+            .count() as f32
+            / frame.len() as f32;
+
+        for c in 0..channels {
+            let v = match c % 4 {
+                0 => mean_abs,
+                1 => rms,
+                2 => zcr,
+                _ => frame[(c / 4) % frame.len()],
+            };
+            out[(0, t, c)] = v;
+        }
+    }
+
+    out
+}
+
+pub fn resize_pitch_to_frames(pitch: &[f32], frames: usize) -> Vec<f32> {
+    if frames == 0 {
+        return Vec::new();
+    }
+    if pitch.is_empty() {
+        return vec![0.0; frames];
+    }
+    if pitch.len() == frames {
+        return pitch.to_vec();
+    }
+    if pitch.len() == 1 {
+        return vec![pitch[0]; frames];
+    }
+
+    let mut out = Vec::with_capacity(frames);
+    let scale = (pitch.len() - 1) as f64 / (frames - 1).max(1) as f64;
+    for i in 0..frames {
+        let src = i as f64 * scale;
+        let left = src.floor() as usize;
+        let right = (left + 1).min(pitch.len() - 1);
+        let frac = (src - left as f64) as f32;
+        out.push(pitch[left] * (1.0 - frac) + pitch[right] * frac);
+    }
+    out
+}
+
+pub fn coarse_pitch_from_f0(f0: &[f32]) -> Vec<i64> {
+    let f0_min = 50.0_f32;
+    let f0_max = 1100.0_f32;
+    let f0_mel_min = 1127.0_f32 * (1.0 + f0_min / 700.0).ln();
+    let f0_mel_max = 1127.0_f32 * (1.0 + f0_max / 700.0).ln();
+    let mel_scale = 254.0_f32 / (f0_mel_max - f0_mel_min);
+
+    let mut out = Vec::with_capacity(f0.len());
+    for &v in f0 {
+        if v <= 0.0 {
+            out.push(1);
+            continue;
+        }
+        let mel = 1127.0_f32 * (1.0 + v / 700.0).ln();
+        let coarse = ((mel - f0_mel_min) * mel_scale + 1.0)
+            .round()
+            .clamp(1.0, 255.0) as i64;
+        out.push(coarse);
+    }
+    out
+}
+
 pub fn stft_magnitude(signal: &[f32], n_fft: usize, hop_length: usize) -> Array2<f32> {
     if signal.is_empty() || n_fft == 0 || hop_length == 0 {
         return Array2::zeros((0, 0));
@@ -90,7 +232,6 @@ pub fn stft_magnitude_rvc(signal: &[f32]) -> Array2<f32> {
     stft_magnitude(signal, RVC_N_FFT, RVC_HOP_LENGTH)
 }
 
-/// 周期版Hann窓（periodic）。
 fn hann_window_periodic(size: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(size);
     if size == 0 {
@@ -104,7 +245,6 @@ fn hann_window_periodic(size: usize) -> Vec<f32> {
     out
 }
 
-/// center=True 相当の反射パディング。
 fn reflect_pad_center(signal: &[f32], pad: usize) -> Vec<f32> {
     if signal.is_empty() {
         return Vec::new();
@@ -124,7 +264,6 @@ fn reflect_pad_center(signal: &[f32], pad: usize) -> Vec<f32> {
     out
 }
 
-/// 反射境界でのインデックス変換。
 fn reflect_index(index: isize, len: usize) -> usize {
     let period = (2 * (len - 1)) as isize;
     let mut x = index.rem_euclid(period);
@@ -147,6 +286,20 @@ mod tests {
     }
 
     #[test]
+    fn resample_linear_identity_when_same_rate() {
+        let x = vec![0.0_f32, 1.0, 0.0, -1.0];
+        let y = resample_linear(&x, 16_000, 16_000);
+        assert_eq!(x, y);
+    }
+
+    #[test]
+    fn resample_linear_changes_length_by_ratio() {
+        let x = vec![0.0_f32; 160];
+        let y = resample_linear(&x, 16_000, 48_000);
+        assert_eq!(y.len(), 480);
+    }
+
+    #[test]
     fn stft_returns_expected_shape_like_librosa() {
         let signal = vec![0.0_f32; 1024];
         let out = stft_magnitude(&signal, 256, 128);
@@ -161,16 +314,16 @@ mod tests {
     }
 
     #[test]
-    fn resample_linear_identity_when_same_rate() {
-        let x = vec![0.0_f32, 1.0, 0.0, -1.0];
-        let y = resample_linear(&x, 16_000, 16_000);
-        assert_eq!(x, y);
+    fn pitch_resize_matches_target_frames() {
+        let pitch = vec![100.0_f32; 10];
+        let resized = resize_pitch_to_frames(&pitch, 23);
+        assert_eq!(resized.len(), 23);
     }
 
     #[test]
-    fn resample_linear_changes_length_by_ratio() {
-        let x = vec![0.0_f32; 160];
-        let y = resample_linear(&x, 16_000, 48_000);
-        assert_eq!(y.len(), 480);
+    fn coarse_pitch_range_is_valid() {
+        let f0 = vec![0.0_f32, 50.0, 220.0, 880.0];
+        let coarse = coarse_pitch_from_f0(&f0);
+        assert!(coarse.iter().all(|v| (1..=255).contains(v)));
     }
 }

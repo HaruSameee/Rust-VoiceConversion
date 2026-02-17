@@ -1,17 +1,16 @@
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
         Arc,
     },
+    thread,
     time::Duration,
 };
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{
-    traits::{Consumer, Producer, Split},
-    HeapRb,
-};
 use vc_core::{InferenceEngine, VoiceChanger};
 use vc_signal::resample_linear;
 
@@ -42,14 +41,12 @@ pub fn default_sample_rate() -> Result<u32> {
     Ok(config.sample_rate().0)
 }
 
-/// 実行中のリアルタイム音声エンジンへのハンドル。
-///
-/// レベル取得と停止制御だけを公開し、ストリームの詳細は内部に隠します。
 pub struct RealtimeAudioEngine {
     running: Arc<AtomicBool>,
     input_rms: Arc<AtomicU32>,
     input_peak: Arc<AtomicU32>,
-    handle: tokio::task::JoinHandle<()>,
+    stream_task: tokio::task::JoinHandle<()>,
+    worker_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl RealtimeAudioEngine {
@@ -68,23 +65,19 @@ impl RealtimeAudioEngine {
         self.running.store(false, Ordering::Relaxed);
     }
 
-    pub fn stop_and_abort(self) {
+    pub fn stop_and_abort(mut self) {
         self.stop();
-        self.handle.abort();
+        self.stream_task.abort();
+        if let Some(handle) = self.worker_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
-/// `VoiceChanger` を `cpal` 入出力に接続して起動する。
-///
-/// 処理の流れ:
-/// 1. 入力をモノラル化
-/// 2. 必要ならモデルの想定レートへリサンプル
-/// 3. `VoiceChanger::process_frame`
-/// 4. 出力デバイスのレートへ戻して再生
 pub fn spawn_voice_changer_stream<E>(
     mut voice_changer: VoiceChanger<E>,
     model_sample_rate: u32,
-    block_size: usize,
+    _block_size: usize,
 ) -> Result<RealtimeAudioEngine>
 where
     E: InferenceEngine,
@@ -115,27 +108,149 @@ where
     let input_channels = input_stream_config.channels as usize;
     let output_channels = output_stream_config.channels as usize;
 
-    let latency_samples = (block_size.max(1) * output_channels * 12).max(output_channels * 1024);
-    let ring = HeapRb::<f32>::new(latency_samples * 2);
-    let (mut producer, mut consumer) = ring.split();
-    for _ in 0..latency_samples {
-        let _ = producer.try_push(0.0);
-    }
+    let (input_tx, input_rx) = sync_channel::<Vec<f32>>(8);
+    let (output_tx, output_rx) = sync_channel::<Vec<f32>>(8);
 
     let running = Arc::new(AtomicBool::new(true));
     let input_rms = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-    let running_in = Arc::clone(&running);
-    let input_rms_in = Arc::clone(&input_rms);
-    let input_peak_in = Arc::clone(&input_peak);
-    let mut level_meter = LevelMeter::new(0.92);
 
-    let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        if !running_in.load(Ordering::Relaxed) {
+    let input_data_fn = build_input_callback(Arc::clone(&running), input_channels, input_tx);
+    let output_data_fn = build_output_callback(Arc::clone(&running), output_rx);
+
+    let input_stream = input_device.build_input_stream(
+        &input_stream_config,
+        input_data_fn,
+        |err| eprintln!("input stream error: {err}"),
+        None,
+    )?;
+    let output_stream = output_device.build_output_stream(
+        &output_stream_config,
+        output_data_fn,
+        |err| eprintln!("output stream error: {err}"),
+        None,
+    )?;
+
+    let running_worker = Arc::clone(&running);
+    let input_rms_worker = Arc::clone(&input_rms);
+    let input_peak_worker = Arc::clone(&input_peak);
+    let worker_thread = thread::spawn(move || {
+        let mut level_meter = LevelMeter::new(0.92);
+        worker_loop(
+            &mut voice_changer,
+            input_rx,
+            output_tx,
+            model_sample_rate,
+            input_rate,
+            output_rate,
+            output_channels,
+            &running_worker,
+            &input_rms_worker,
+            &input_peak_worker,
+            &mut level_meter,
+        );
+    });
+
+    let running_stream = Arc::clone(&running);
+    let stream_task = tokio::spawn(async move {
+        if input_stream.play().is_err() || output_stream.play().is_err() {
+            running_stream.store(false, Ordering::Relaxed);
             return;
         }
 
+        while running_stream.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        drop(output_stream);
+        drop(input_stream);
+    });
+
+    Ok(RealtimeAudioEngine {
+        running,
+        input_rms,
+        input_peak,
+        stream_task,
+        worker_thread: Some(worker_thread),
+    })
+}
+
+fn build_input_callback(
+    running: Arc<AtomicBool>,
+    input_channels: usize,
+    input_tx: SyncSender<Vec<f32>>,
+) -> impl FnMut(&[f32], &cpal::InputCallbackInfo) + Send + 'static {
+    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+        if !running.load(Ordering::Relaxed) {
+            return;
+        }
         let mono = downmix_to_mono(data, input_channels);
+        match input_tx.try_send(mono) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                running.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn build_output_callback(
+    running: Arc<AtomicBool>,
+    output_rx: Receiver<Vec<f32>>,
+) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
+    let mut pending = VecDeque::<f32>::new();
+    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        if !running.load(Ordering::Relaxed) {
+            data.fill(0.0);
+            return;
+        }
+
+        while pending.len() < data.len() {
+            match output_rx.try_recv() {
+                Ok(block) => {
+                    pending.extend(block);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+
+        for sample in data {
+            *sample = pending.pop_front().unwrap_or(0.0);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_loop<E>(
+    voice_changer: &mut VoiceChanger<E>,
+    input_rx: Receiver<Vec<f32>>,
+    output_tx: SyncSender<Vec<f32>>,
+    model_sample_rate: u32,
+    input_rate: u32,
+    output_rate: u32,
+    output_channels: usize,
+    running: &Arc<AtomicBool>,
+    input_rms: &Arc<AtomicU32>,
+    input_peak: &Arc<AtomicU32>,
+    level_meter: &mut LevelMeter,
+) where
+    E: InferenceEngine,
+{
+    while running.load(Ordering::Relaxed) {
+        let mono = match input_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(v) => v,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                running.store(false, Ordering::Relaxed);
+                break;
+            }
+        };
+
         let model_in = if input_rate != model_sample_rate {
             resample_linear(&mono, input_rate, model_sample_rate)
         } else {
@@ -153,62 +268,19 @@ where
             model_out
         };
         level_meter.push_block(&output_mono);
-        input_rms_in.store(level_meter.rms().to_bits(), Ordering::Relaxed);
-        input_peak_in.store(level_meter.peak().to_bits(), Ordering::Relaxed);
+        input_rms.store(level_meter.rms().to_bits(), Ordering::Relaxed);
+        input_peak.store(level_meter.peak().to_bits(), Ordering::Relaxed);
 
         let output_interleaved = upmix_from_mono(&output_mono, output_channels);
-        for sample in output_interleaved {
-            if producer.try_push(sample).is_err() {
+        match output_tx.try_send(output_interleaved) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                running.store(false, Ordering::Relaxed);
                 break;
             }
         }
-    };
-
-    let running_out = Arc::clone(&running);
-    let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        if !running_out.load(Ordering::Relaxed) {
-            data.fill(0.0);
-            return;
-        }
-        for sample in data {
-            *sample = consumer.try_pop().unwrap_or(0.0);
-        }
-    };
-
-    let input_stream = input_device.build_input_stream(
-        &input_stream_config,
-        input_data_fn,
-        |err| eprintln!("input stream error: {err}"),
-        None,
-    )?;
-    let output_stream = output_device.build_output_stream(
-        &output_stream_config,
-        output_data_fn,
-        |err| eprintln!("output stream error: {err}"),
-        None,
-    )?;
-
-    let running_loop = Arc::clone(&running);
-    let handle = tokio::spawn(async move {
-        if input_stream.play().is_err() || output_stream.play().is_err() {
-            running_loop.store(false, Ordering::Relaxed);
-            return;
-        }
-
-        while running_loop.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-
-        drop(output_stream);
-        drop(input_stream);
-    });
-
-    Ok(RealtimeAudioEngine {
-        running,
-        input_rms,
-        input_peak,
-        handle,
-    })
+    }
 }
 
 fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {

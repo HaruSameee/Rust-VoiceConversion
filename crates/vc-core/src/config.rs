@@ -13,6 +13,7 @@ pub struct RuntimeConfig {
     pub output_gain: f32,
     pub pitch_shift_semitones: f32,
     pub index_rate: f32,
+    pub speaker_id: i64,
     pub sample_rate: u32,
     pub block_size: usize,
 }
@@ -24,6 +25,7 @@ impl Default for RuntimeConfig {
             output_gain: 1.0,
             pitch_shift_semitones: 0.0,
             index_rate: 0.5,
+            speaker_id: 0,
             sample_rate: 48_000,
             block_size: 480,
         }

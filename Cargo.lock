@@ -4089,6 +4089,7 @@ dependencies = [
  "ndarray",
  "ort",
  "vc-core",
+ "vc-signal",
 ]
 
 [[package]]

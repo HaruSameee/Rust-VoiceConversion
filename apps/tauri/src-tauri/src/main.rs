@@ -91,11 +91,19 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
     }
 
     let runtime_config = guard.config.clone();
+    let rmvpe_path = std::env::var("RUST_VC_RMVPE_PATH").ok().or_else(|| {
+        let default = std::path::Path::new("model/rmvpe.onnx");
+        if default.exists() {
+            Some(default.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
     let model = ModelConfig {
         model_path: std::env::var("RUST_VC_MODEL_PATH")
             .unwrap_or_else(|_| "model/model.onnx".to_string()),
         index_path: None,
-        pitch_extractor_path: None,
+        pitch_extractor_path: rmvpe_path,
     };
     let infer_engine = RvcOrtEngine::new(model).map_err(|e| e.to_string())?;
     let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());

@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 vc-core = { path = "../vc-core" }
+vc-signal = { path = "../vc-signal" }
 ort.workspace = true
 ndarray.workspace = true
