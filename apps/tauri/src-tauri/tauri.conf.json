@@ -4,7 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.example.rustvc",
   "build": {
-    "frontendDist": "../ui"
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm --prefix ./ui run dev -- --host",
+    "beforeBuildCommand": "npm --prefix ./ui run build"
   },
   "app": {
     "windows": [

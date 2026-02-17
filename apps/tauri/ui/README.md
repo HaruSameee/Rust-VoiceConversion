@@ -1,14 +1,12 @@
 # UI
 
-This directory contains a minimal frontend for Tauri.
+TypeScript + Vite frontend for Tauri.
 
-- `index.html`: layout
-- `styles.css`: styles
-- `app.js`: Tauri command calls
+- `index.html`: app shell
+- `src/main.ts`: command calls and debug logs
+- `src/styles.css`: night theme
 
-## Features
+## Commands
 
-- Configure model paths (RVC / HuBERT / RMVPE / Index)
-- Configure RuntimeConfig (gain, pitch shift, sample rate, block size)
-- Start / stop engine
-- Show level meter (RMS / Peak)
+- `npm run dev`
+- `npm run build`

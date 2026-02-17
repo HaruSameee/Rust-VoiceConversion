@@ -1,0 +1,158 @@
+:root {
+  --bg: #06090f;
+  --bg-soft: #0e1421;
+  --panel: #121a2b;
+  --panel-2: #0f1726;
+  --text: #e7ecff;
+  --muted: #9ba6c8;
+  --line: #24314d;
+  --accent: #38d4ff;
+  --accent-2: #18a1ff;
+  --danger: #ff7e7e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 12% 5%, rgba(56, 212, 255, 0.16) 0%, transparent 35%),
+    radial-gradient(circle at 90% 0%, rgba(24, 161, 255, 0.12) 0%, transparent 30%),
+    linear-gradient(180deg, #06090f 0%, #070b13 100%);
+  font-family: "Segoe UI", "Meiryo", sans-serif;
+}
+
+.container {
+  width: min(1000px, 94vw);
+  margin: 18px auto 28px;
+}
+
+header {
+  margin: 4px 0 12px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 32px;
+}
+
+.sub {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.card {
+  background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 17px;
+}
+
+label {
+  display: block;
+  margin: 8px 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+input {
+  width: 100%;
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #090f1b;
+  color: var(--text);
+  padding: 6px 10px;
+}
+
+input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(56, 212, 255, 0.2);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+button {
+  border: 1px solid var(--line);
+  height: 35px;
+  padding: 0 12px;
+  border-radius: 8px;
+  background: #0a1222;
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button.primary {
+  border-color: var(--accent-2);
+  background: linear-gradient(180deg, #17b9ff 0%, #0f7fe2 100%);
+  color: #031327;
+  font-weight: 700;
+}
+
+#statusLine,
+#levelLine {
+  margin: 6px 0;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px;
+}
+
+.message {
+  min-height: 18px;
+  color: var(--danger);
+  margin: 8px 0 0;
+}
+
+.log-card {
+  padding-bottom: 8px;
+}
+
+.log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+#logBox {
+  margin: 0;
+  padding: 10px;
+  height: 220px;
+  overflow: auto;
+  background: #050a13;
+  border-radius: 8px;
+  border: 1px solid #1a2742;
+  color: #9cf0ff;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+@media (max-width: 760px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}

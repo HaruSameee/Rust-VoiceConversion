@@ -4069,7 +4069,6 @@ dependencies = [
  "anyhow",
  "cpal",
  "ringbuf",
- "tokio",
  "vc-core",
  "vc-signal",
 ]

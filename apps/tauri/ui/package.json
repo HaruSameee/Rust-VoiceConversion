@@ -1,0 +1,17 @@
+{
+  "name": "rust-vc-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 1420 --strictPort",
+    "build": "tsc && vite build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^7.3.1"
+  }
+}

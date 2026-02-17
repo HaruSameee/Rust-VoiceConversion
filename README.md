@@ -24,13 +24,19 @@ Python依存を減らし、推論・音声処理・UI連携をRust側に集約�
 
 ## Run
 
-1. ONNXモデルを `model/` に配置する（またはUIで絶対パスを指定）
-2. `cargo run -p rust-vc-tauri` を実行
-3. 起動したUIで `Save Config` -> `Start` を押す
-4. マイク入力が推論を通ってスピーカーへ出力される
+1. `apps/tauri/ui` で `npm install`
+2. ONNXモデルを `model/` に配置する（またはUIで絶対パスを指定）
+   - `model.onnx`（RVC本体）
+   - `hubert.onnx`（特徴量抽出）
+   - `rmvpe.onnx`（ピッチ抽出）
+3. `apps/tauri/src-tauri` で `cargo tauri dev` を実行
+4. 起動したUIで `Save` -> `Start` を押す
+5. マイク入力が推論を通ってスピーカーへ出力される
 
 補足:
 - 環境変数未設定時は `model/model.onnx` などを既定値として使います
+- 現状のRVC推論は `hubert_path` と `pitch_extractor_path` が必須です
+- `*.index` のバイナリFAISS形式は未対応です（今はテキスト形式のみ）
 - 現状は「動くプロトタイプ」を優先した実装です
 
 ## Todo

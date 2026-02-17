@@ -6,7 +6,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -45,7 +45,7 @@ pub struct RealtimeAudioEngine {
     running: Arc<AtomicBool>,
     input_rms: Arc<AtomicU32>,
     input_peak: Arc<AtomicU32>,
-    stream_task: tokio::task::JoinHandle<()>,
+    stream_thread: Option<thread::JoinHandle<()>>,
     worker_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -67,7 +67,9 @@ impl RealtimeAudioEngine {
 
     pub fn stop_and_abort(mut self) {
         self.stop();
-        self.stream_task.abort();
+        if let Some(handle) = self.stream_thread.take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.worker_thread.take() {
             let _ = handle.join();
         }
@@ -107,6 +109,10 @@ where
     let output_rate = output_stream_config.sample_rate.0;
     let input_channels = input_stream_config.channels as usize;
     let output_channels = output_stream_config.channels as usize;
+    eprintln!(
+        "[vc-audio] input_rate={} output_rate={} input_ch={} output_ch={} model_rate={} block_size={}",
+        input_rate, output_rate, input_channels, output_channels, model_sample_rate, block_size
+    );
 
     let (input_tx, input_rx) = sync_channel::<Vec<f32>>(32);
     let (output_tx, output_rx) = sync_channel::<Vec<f32>>(32);
@@ -153,14 +159,14 @@ where
     });
 
     let running_stream = Arc::clone(&running);
-    let stream_task = tokio::spawn(async move {
+    let stream_thread = thread::spawn(move || {
         if input_stream.play().is_err() || output_stream.play().is_err() {
             running_stream.store(false, Ordering::Relaxed);
             return;
         }
 
         while running_stream.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            thread::sleep(Duration::from_millis(20));
         }
 
         drop(output_stream);
@@ -171,7 +177,7 @@ where
         running,
         input_rms,
         input_peak,
-        stream_task,
+        stream_thread: Some(stream_thread),
         worker_thread: Some(worker_thread),
     })
 }
@@ -181,6 +187,7 @@ fn build_input_callback(
     input_channels: usize,
     input_tx: SyncSender<Vec<f32>>,
 ) -> impl FnMut(&[f32], &cpal::InputCallbackInfo) + Send + 'static {
+    let mut dropped = 0usize;
     move |data: &[f32], _: &cpal::InputCallbackInfo| {
         if !running.load(Ordering::Relaxed) {
             return;
@@ -188,8 +195,14 @@ fn build_input_callback(
         let mono = downmix_to_mono(data, input_channels);
         match input_tx.try_send(mono) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                dropped += 1;
+                if dropped % 64 == 0 {
+                    eprintln!("[vc-audio] input queue full (dropped={dropped})");
+                }
+            }
             Err(TrySendError::Disconnected(_)) => {
+                eprintln!("[vc-audio] input queue disconnected");
                 running.store(false, Ordering::Relaxed);
             }
         }
@@ -201,6 +214,7 @@ fn build_output_callback(
     output_rx: Receiver<Vec<f32>>,
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut pending = VecDeque::<f32>::new();
+    let mut underruns = 0usize;
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
         if !running.load(Ordering::Relaxed) {
             data.fill(0.0);
@@ -214,6 +228,7 @@ fn build_output_callback(
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    eprintln!("[vc-audio] output queue disconnected");
                     running.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -221,7 +236,15 @@ fn build_output_callback(
         }
 
         for sample in data {
-            *sample = pending.pop_front().unwrap_or(0.0);
+            if let Some(v) = pending.pop_front() {
+                *sample = v;
+            } else {
+                *sample = 0.0;
+                underruns += 1;
+                if underruns % 64 == 0 {
+                    eprintln!("[vc-audio] output underrun count={underruns}");
+                }
+            }
         }
     }
 }
@@ -248,6 +271,9 @@ fn worker_loop<E>(
     let mut model_input_queue = VecDeque::<f32>::new();
     let mut model_block = Vec::<f32>::with_capacity(model_block_size);
     let mut output_rate_buf = Vec::<f32>::new();
+    let mut processed_blocks: u64 = 0;
+    let mut last_heartbeat = Instant::now();
+    let block_budget = Duration::from_secs_f64(model_block_size as f64 / model_sample_rate as f64);
 
     while running.load(Ordering::Relaxed) {
         let mono = match input_rx.recv_timeout(Duration::from_millis(5)) {
@@ -274,9 +300,13 @@ fn worker_loop<E>(
                 }
             }
 
+            let start = Instant::now();
             let model_out = match voice_changer.process_frame(&model_block) {
                 Ok(v) => v,
-                Err(_) => vec![0.0; model_block.len()],
+                Err(e) => {
+                    eprintln!("[vc-audio] process_frame failed: {e}");
+                    vec![0.0; model_block.len()]
+                }
             };
 
             let output_mono: &[f32] = if model_sample_rate != output_rate {
@@ -297,14 +327,39 @@ fn worker_loop<E>(
             let output_interleaved = upmix_from_mono(output_mono, output_channels);
             match output_tx.try_send(output_interleaved) {
                 Ok(()) => {}
-                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Full(_)) => {
+                    eprintln!("[vc-audio] output queue full");
+                }
                 Err(TrySendError::Disconnected(_)) => {
+                    eprintln!("[vc-audio] output queue disconnected");
                     running.store(false, Ordering::Relaxed);
                     break;
                 }
             }
+
+            processed_blocks += 1;
+            let elapsed = start.elapsed();
+            if elapsed > block_budget {
+                eprintln!(
+                    "[vc-audio] slow block: elapsed={:.2}ms budget={:.2}ms queue={}",
+                    elapsed.as_secs_f64() * 1000.0,
+                    block_budget.as_secs_f64() * 1000.0,
+                    model_input_queue.len()
+                );
+            }
+            if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "[vc-audio] heartbeat blocks={} queue={} rms={:.4} peak={:.4}",
+                    processed_blocks,
+                    model_input_queue.len(),
+                    level_meter.rms(),
+                    level_meter.peak()
+                );
+                last_heartbeat = Instant::now();
+            }
         }
     }
+    eprintln!("[vc-audio] worker loop stopped");
 }
 
 fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {

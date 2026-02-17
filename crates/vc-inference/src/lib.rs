@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{any::Any, panic::AssertUnwindSafe, path::Path, sync::OnceLock};
 
 use ndarray::{Array1, Array2, Array3};
 use ort::{
@@ -13,6 +13,7 @@ use vc_signal::{
 };
 
 const INDEX_TOP_K: usize = 8;
+static ORT_INIT_FAILED: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct FeatureIndex {
@@ -30,6 +31,13 @@ pub struct RvcOrtEngine {
 
 impl RvcOrtEngine {
     pub fn new(model: ModelConfig) -> Result<Self> {
+        eprintln!(
+            "[vc-inference] init model={} hubert={:?} rmvpe={:?} index={:?}",
+            model.model_path, model.hubert_path, model.pitch_extractor_path, model.index_path
+        );
+        if let Some(msg) = ORT_INIT_FAILED.get() {
+            return Err(VcError::Config(msg.clone()));
+        }
         if !Path::new(&model.model_path).exists() {
             return Err(VcError::Config(format!(
                 "model file not found: {}",
@@ -37,94 +45,135 @@ impl RvcOrtEngine {
             )));
         }
 
-        ort::init().commit();
+        let build_res = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<Self> {
+            ort::init().commit();
+            let rvc_session = Session::builder()
+                .map_err(|e| {
+                    VcError::Inference(format!("failed to create rvc session builder: {e}"))
+                })?
+                .commit_from_file(&model.model_path)
+                .map_err(|e| {
+                    VcError::Inference(format!(
+                        "failed to load rvc onnx model {}: {e}",
+                        model.model_path
+                    ))
+                })?;
 
-        let rvc_session = Session::builder()
-            .map_err(|e| VcError::Inference(format!("failed to create rvc session builder: {e}")))?
-            .commit_from_file(&model.model_path)
-            .map_err(|e| {
-                VcError::Inference(format!(
-                    "failed to load rvc onnx model {}: {e}",
-                    model.model_path
-                ))
-            })?;
-
-        let rmvpe_session = if let Some(path) = model.pitch_extractor_path.as_deref() {
-            if !Path::new(path).exists() {
-                return Err(VcError::Config(format!(
-                    "pitch extractor model file not found: {}",
-                    path
-                )));
-            }
-            Some(
-                Session::builder()
-                    .map_err(|e| {
-                        VcError::Inference(format!("failed to create rmvpe session builder: {e}"))
-                    })?
-                    .commit_from_file(path)
-                    .map_err(|e| {
-                        VcError::Inference(format!("failed to load rmvpe onnx model {path}: {e}"))
-                    })?,
-            )
-        } else {
-            None
-        };
-
-        let hubert_session = if let Some(path) = model.hubert_path.as_deref() {
-            if !Path::new(path).exists() {
-                return Err(VcError::Config(format!(
-                    "hubert model file not found: {}",
-                    path
-                )));
-            }
-            Some(
-                Session::builder()
-                    .map_err(|e| {
-                        VcError::Inference(format!("failed to create hubert session builder: {e}"))
-                    })?
-                    .commit_from_file(path)
-                    .map_err(|e| {
-                        VcError::Inference(format!("failed to load hubert onnx model {path}: {e}"))
-                    })?,
-            )
-        } else {
-            None
-        };
-
-        let phone_feature_dim = infer_phone_feature_dim_from_session(&rvc_session);
-        if let Some(session) = hubert_session.as_ref() {
-            if let Some(hubert_dim) = infer_hubert_output_dim_from_session(session) {
-                if hubert_dim != phone_feature_dim {
+            let rmvpe_session = if let Some(path) = model.pitch_extractor_path.as_deref() {
+                if !Path::new(path).exists() {
                     return Err(VcError::Config(format!(
-                        "hubert output dim mismatch: hubert={hubert_dim}, rvc_phone={phone_feature_dim}"
+                        "pitch extractor model file not found: {}",
+                        path
                     )));
                 }
-            }
-        }
-        let feature_index = match model.index_path.as_deref() {
-            Some(path) => {
+                Some(
+                    Session::builder()
+                        .map_err(|e| {
+                            VcError::Inference(format!(
+                                "failed to create rmvpe session builder: {e}"
+                            ))
+                        })?
+                        .commit_from_file(path)
+                        .map_err(|e| {
+                            VcError::Inference(format!(
+                                "failed to load rmvpe onnx model {path}: {e}"
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
+
+            let hubert_session = if let Some(path) = model.hubert_path.as_deref() {
                 if !Path::new(path).exists() {
-                    return Err(VcError::Config(format!("index file not found: {path}")));
+                    return Err(VcError::Config(format!(
+                        "hubert model file not found: {}",
+                        path
+                    )));
                 }
-                match load_feature_index(path, phone_feature_dim) {
-                    Ok(index) => Some(index),
-                    Err(e) => {
-                        eprintln!("index disabled: {e}");
-                        None
+                Some(
+                    Session::builder()
+                        .map_err(|e| {
+                            VcError::Inference(format!(
+                                "failed to create hubert session builder: {e}"
+                            ))
+                        })?
+                        .commit_from_file(path)
+                        .map_err(|e| {
+                            VcError::Inference(format!(
+                                "failed to load hubert onnx model {path}: {e}"
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
+
+            let phone_feature_dim = infer_phone_feature_dim_from_session(&rvc_session);
+            eprintln!("[vc-inference] rvc phone_feature_dim={phone_feature_dim}");
+            let requirements = infer_rvc_requirements(&rvc_session);
+            if requirements.needs_phone_features && hubert_session.is_none() {
+                return Err(VcError::Config(
+                    "this RVC model requires HuBERT features. set `hubert_path` (e.g. model/hubert.onnx)"
+                        .to_string(),
+                ));
+            }
+            if requirements.needs_pitch && rmvpe_session.is_none() {
+                return Err(VcError::Config(
+                    "this RVC model requires pitch inputs. set `pitch_extractor_path` (e.g. model/rmvpe.onnx)"
+                        .to_string(),
+                ));
+            }
+            if let Some(session) = hubert_session.as_ref() {
+                if let Some(hubert_dim) = infer_hubert_output_dim_from_session(session) {
+                    eprintln!("[vc-inference] hubert output_dim={hubert_dim}");
+                    if hubert_dim != phone_feature_dim {
+                        return Err(VcError::Config(format!(
+                            "hubert output dim mismatch: hubert={hubert_dim}, rvc_phone={phone_feature_dim}"
+                        )));
                     }
                 }
             }
-            None => None,
-        };
+            let feature_index = match model.index_path.as_deref() {
+                Some(path) => {
+                    if !Path::new(path).exists() {
+                        eprintln!("[vc-inference] index file not found, disable index: {path}");
+                        None
+                    } else {
+                        match load_feature_index(path, phone_feature_dim) {
+                            Ok(index) => Some(index),
+                            Err(e) => {
+                                eprintln!("index disabled: {e}");
+                                None
+                            }
+                        }
+                    }
+                }
+                None => None,
+            };
 
-        Ok(Self {
-            model,
-            rvc_session,
-            rmvpe_session,
-            hubert_session,
-            feature_index,
-            phone_feature_dim,
-        })
+            Ok(Self {
+                model,
+                rvc_session,
+                rmvpe_session,
+                hubert_session,
+                feature_index,
+                phone_feature_dim,
+            })
+        }));
+
+        match build_res {
+            Ok(result) => result,
+            Err(payload) => {
+                let details = panic_payload_to_string(payload);
+                let msg = format!(
+                    "failed to initialize ONNX Runtime (likely DLL/version mismatch). \
+Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {details}"
+                );
+                let _ = ORT_INIT_FAILED.set(msg.clone());
+                Err(VcError::Config(msg))
+            }
+        }
     }
 
     pub fn model_path(&self) -> &str {
@@ -256,6 +305,7 @@ impl RvcOrtEngine {
         pitch: &[i64],
         speaker_id: i64,
         frame_len: i64,
+        rnd: &Array3<f32>,
         waveform: &Array3<f32>,
     ) -> Result<Vec<f32>> {
         let mut input_map: Vec<(String, SessionInputValue<'static>)> = Vec::new();
@@ -327,6 +377,11 @@ impl RvcOrtEngine {
                         VcError::Inference(format!("failed to create wave tensor: {e}"))
                     })?)
                 }
+                RvcInputKind::Rnd => {
+                    SessionInputValue::from(Tensor::from_array(rnd.clone()).map_err(|e| {
+                        VcError::Inference(format!("failed to create rnd tensor: {e}"))
+                    })?)
+                }
             };
             input_map.push((name, value));
         }
@@ -362,6 +417,7 @@ impl InferenceEngine for RvcOrtEngine {
             let mut pitchf = resize_pitch_to_frames(&f0, frame_count);
             apply_pitch_shift_inplace(&mut pitchf, config.pitch_shift_semitones);
             let pitch = coarse_pitch_from_f0(&pitchf);
+            let rnd = make_rnd_tensor(frame_count);
             let wave =
                 Array3::from_shape_vec((1, 1, normalized.len()), normalized).map_err(|e| {
                     VcError::Inference(format!("failed to shape waveform as [1,1,T]: {e}"))
@@ -373,6 +429,7 @@ impl InferenceEngine for RvcOrtEngine {
                 &pitch,
                 config.speaker_id,
                 frame_count as i64,
+                &rnd,
                 &wave,
             )?;
             Ok(postprocess_generated_audio(&out))
@@ -396,23 +453,27 @@ enum RvcInputKind {
     Sid,
     Length,
     Wave,
+    Rnd,
 }
 
 fn classify_rvc_input(name: &str) -> Option<RvcInputKind> {
-    if name.contains("phone") || name.contains("hubert") || name.contains("feat") {
-        return Some(RvcInputKind::Phone);
+    if name.contains("len") || name.contains("p_len") {
+        return Some(RvcInputKind::Length);
+    }
+    if name == "ds" || name.contains("sid") || name.contains("spk") || name.contains("speaker") {
+        return Some(RvcInputKind::Sid);
     }
     if name.contains("pitchf") || name.contains("nsff0") || name.contains("f0") {
         return Some(RvcInputKind::PitchF);
     }
-    if name.contains("pitch") {
+    if name == "pitch" || name.contains("pitch_") {
         return Some(RvcInputKind::Pitch);
     }
-    if name.contains("sid") || name.contains("spk") || name.contains("speaker") {
-        return Some(RvcInputKind::Sid);
+    if name.contains("rnd") || name.contains("noise") {
+        return Some(RvcInputKind::Rnd);
     }
-    if name.contains("len") || name.contains("p_len") {
-        return Some(RvcInputKind::Length);
+    if name.contains("phone") || name.contains("hubert") || name.contains("feat") {
+        return Some(RvcInputKind::Phone);
     }
     if name.contains("wav") || name.contains("audio") {
         return Some(RvcInputKind::Wave);
@@ -470,6 +531,25 @@ fn infer_hubert_output_dim_from_session(session: &Session) -> Option<usize> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RvcRequirements {
+    needs_phone_features: bool,
+    needs_pitch: bool,
+}
+
+fn infer_rvc_requirements(session: &Session) -> RvcRequirements {
+    let mut req = RvcRequirements::default();
+    for input in session.inputs() {
+        let lname = input.name().to_lowercase();
+        match classify_rvc_input(&lname) {
+            Some(RvcInputKind::Phone) => req.needs_phone_features = true,
+            Some(RvcInputKind::Pitch) | Some(RvcInputKind::PitchF) => req.needs_pitch = true,
+            _ => {}
+        }
+    }
+    req
 }
 
 fn phone_from_hubert_tensor(
@@ -558,8 +638,11 @@ fn phone_from_hubert_tensor(
 }
 
 fn load_feature_index(path: &str, target_dim: usize) -> Result<FeatureIndex> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| VcError::Config(format!("failed to read index file as text ({path}): {e}")))?;
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        VcError::Config(format!(
+            "failed to read index file as text ({path}): {e}. binary .index is not supported yet; set index_path empty to disable"
+        ))
+    })?;
     let mut rows: Vec<Vec<f32>> = Vec::new();
     let mut dims = 0usize;
 
@@ -635,4 +718,19 @@ fn apply_pitch_shift_inplace(f0: &mut [f32], semitones: f32) {
             *v *= ratio;
         }
     }
+}
+
+fn make_rnd_tensor(frame_count: usize) -> Array3<f32> {
+    // RVC's `rnd` input is typically [1, 192, T]. Zero-noise keeps the pipeline deterministic.
+    Array3::<f32>::zeros((1, 192, frame_count.max(1)))
+}
+
+fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "unknown panic payload".to_string()
 }

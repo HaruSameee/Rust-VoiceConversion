@@ -28,7 +28,7 @@ impl Default for RuntimeConfig {
             index_rate: 0.5,
             speaker_id: 0,
             sample_rate: 48_000,
-            block_size: 480,
+            block_size: 960,
         }
     }
 }
