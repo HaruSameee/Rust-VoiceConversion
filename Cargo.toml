@@ -25,3 +25,15 @@ ndarray = "0.17"
 ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+[profile.dev.package.vc-inference]
+opt-level = 3
+
+[profile.dev.package.vc-signal]
+opt-level = 3
+
+[profile.dev.package.vc-audio]
+opt-level = 3
+
+[profile.dev.package.ort]
+opt-level = 3

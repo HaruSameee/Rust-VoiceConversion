@@ -4,6 +4,16 @@ use rustfft::{num_complex::Complex32, FftPlanner};
 pub const RVC_N_FFT: usize = 1024;
 pub const RVC_HOP_LENGTH: usize = 160;
 pub const RVC_WIN_LENGTH: usize = RVC_N_FFT;
+pub const RMVPE_SAMPLE_RATE: u32 = 16_000;
+pub const RMVPE_MEL_BINS: usize = 128;
+pub const RMVPE_MIN_FRAMES: usize = 32;
+pub const RMVPE_FRAME_ALIGN: usize = 32;
+
+#[derive(Debug, Clone)]
+pub struct RmvpeMelInput {
+    pub mel: Array3<f32>,
+    pub valid_frames: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct RmvpePaddedInput {
@@ -32,18 +42,26 @@ pub fn normalize_for_onnx_input(samples: &[f32], target_peak: f32) -> Vec<f32> {
         return Vec::new();
     }
 
-    let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
-    let mut out: Vec<f32> = samples.iter().map(|x| x - mean).collect();
-    normalize_peak(&mut out, target_peak);
+    let mut out: Vec<f32> = samples.to_vec();
+    let peak = out
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0_f32, |acc, v| acc.max(v));
+    // Streaming input should not be amplified per block; only attenuate when clipping.
+    if peak > target_peak && peak > f32::EPSILON {
+        let gain = target_peak / peak;
+        for sample in &mut out {
+            *sample *= gain;
+        }
+    }
     out
 }
 
 pub fn pad_for_rmvpe(samples: &[f32], hop_length: usize) -> RmvpePaddedInput {
-    let normalized = normalize_for_onnx_input(samples, 0.95);
     let left_pad = RVC_N_FFT / 2;
     let mut right_pad = RVC_N_FFT / 2;
 
-    let mut padded = reflect_pad_center(&normalized, left_pad);
+    let mut padded = reflect_pad_center(samples, left_pad);
     if hop_length > 0 {
         let rem = padded.len() % hop_length;
         if rem != 0 {
@@ -71,11 +89,23 @@ pub fn trim_to_original_length(samples: &[f32], pad: &RmvpePaddedInput) -> Vec<f
 }
 
 pub fn postprocess_generated_audio(samples: &[f32]) -> Vec<f32> {
-    let mut out = samples.to_vec();
-    for s in &mut out {
-        *s = s.clamp(-1.0, 1.0);
+    if samples.is_empty() {
+        return Vec::new();
     }
-    normalize_peak(&mut out, 0.98);
+    let mut out = samples.to_vec();
+    let peak = out
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0_f32, |acc, v| acc.max(v));
+    if peak <= 1.0e-4 {
+        out.fill(0.0);
+        return out;
+    }
+    let gain = if peak > 0.98 { 0.98 / peak } else { 1.0 };
+    for s in &mut out {
+        let v = (*s * gain).clamp(-0.98, 0.98);
+        *s = if v.abs() < 1.0e-5 { 0.0 } else { v };
+    }
     out
 }
 
@@ -106,6 +136,69 @@ pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32
     let mut out = Vec::new();
     resample_linear_into(samples, src_rate, dst_rate, &mut out);
     out
+}
+
+pub fn rmvpe_mel_from_audio(samples: &[f32], src_rate: u32) -> RmvpeMelInput {
+    if samples.is_empty() {
+        return RmvpeMelInput {
+            mel: Array3::zeros((1, RMVPE_MEL_BINS, RMVPE_MIN_FRAMES)),
+            valid_frames: 0,
+        };
+    }
+
+    let mut audio_16k = Vec::<f32>::new();
+    if src_rate == RMVPE_SAMPLE_RATE {
+        audio_16k.extend_from_slice(samples);
+    } else {
+        resample_linear_into(samples, src_rate, RMVPE_SAMPLE_RATE, &mut audio_16k);
+    }
+    if audio_16k.is_empty() {
+        return RmvpeMelInput {
+            mel: Array3::zeros((1, RMVPE_MEL_BINS, RMVPE_MIN_FRAMES)),
+            valid_frames: 0,
+        };
+    }
+
+    let spec = stft_magnitude(&audio_16k, RVC_N_FFT, RVC_HOP_LENGTH);
+    let frames = spec.ncols();
+    if frames == 0 {
+        return RmvpeMelInput {
+            mel: Array3::zeros((1, RMVPE_MEL_BINS, RMVPE_MIN_FRAMES)),
+            valid_frames: 0,
+        };
+    }
+
+    let bins = spec.nrows();
+    let mel_bank = mel_filter_bank(
+        bins,
+        RMVPE_SAMPLE_RATE,
+        RMVPE_MEL_BINS,
+        30.0_f32,
+        8_000.0_f32,
+    );
+    let mut mel = Array2::<f32>::zeros((RMVPE_MEL_BINS, frames));
+    for m in 0..RMVPE_MEL_BINS {
+        for t in 0..frames {
+            let mut acc = 0.0_f32;
+            for b in 0..bins {
+                acc += mel_bank[(m, b)] * spec[(b, t)];
+            }
+            mel[(m, t)] = acc.max(1e-5).ln();
+        }
+    }
+
+    let aligned_frames = align_up(frames.max(RMVPE_MIN_FRAMES), RMVPE_FRAME_ALIGN);
+    let mut out = Array3::<f32>::zeros((1, RMVPE_MEL_BINS, aligned_frames));
+    for m in 0..RMVPE_MEL_BINS {
+        for t in 0..aligned_frames {
+            let src_t = t.min(frames - 1);
+            out[(0, m, t)] = mel[(m, src_t)];
+        }
+    }
+    RmvpeMelInput {
+        mel: out,
+        valid_frames: frames,
+    }
 }
 
 pub fn frame_features_for_rvc(
@@ -248,6 +341,67 @@ fn hann_window_periodic(size: usize) -> Vec<f32> {
         out.push(0.5 - 0.5 * phase.cos());
     }
     out
+}
+
+fn mel_filter_bank(
+    stft_bins: usize,
+    sample_rate: u32,
+    mel_bins: usize,
+    fmin: f32,
+    fmax: f32,
+) -> Array2<f32> {
+    let n_fft = (stft_bins.saturating_sub(1)) * 2;
+    let sr = sample_rate as f32;
+    let mel_min = hz_to_mel(fmin.max(0.0));
+    let mel_max = hz_to_mel(fmax.min(sr * 0.5));
+
+    let mut mel_points = vec![0.0_f32; mel_bins + 2];
+    for (i, v) in mel_points.iter_mut().enumerate() {
+        let frac = i as f32 / (mel_bins + 1) as f32;
+        *v = mel_to_hz(mel_min + frac * (mel_max - mel_min));
+    }
+
+    let mut bins = vec![0usize; mel_bins + 2];
+    for (i, hz) in mel_points.iter().copied().enumerate() {
+        let b = ((n_fft + 1) as f32 * hz / sr).floor() as usize;
+        bins[i] = b.min(stft_bins.saturating_sub(1));
+    }
+
+    let mut fb = Array2::<f32>::zeros((mel_bins, stft_bins));
+    for m in 0..mel_bins {
+        let left = bins[m];
+        let center = bins[m + 1];
+        let right = bins[m + 2];
+        if left >= right {
+            continue;
+        }
+        if center > left {
+            for b in left..center {
+                fb[(m, b)] = (b - left) as f32 / (center - left) as f32;
+            }
+        }
+        if right > center {
+            for b in center..right {
+                fb[(m, b)] = (right - b) as f32 / (right - center) as f32;
+            }
+        }
+    }
+    fb
+}
+
+fn hz_to_mel(hz: f32) -> f32 {
+    2595.0_f32 * (1.0_f32 + hz / 700.0_f32).log10()
+}
+
+fn mel_to_hz(mel: f32) -> f32 {
+    700.0_f32 * (10.0_f32.powf(mel / 2595.0_f32) - 1.0_f32)
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    if align == 0 {
+        return value;
+    }
+    value.div_ceil(align) * align
 }
 
 fn reflect_pad_center(signal: &[f32], pad: usize) -> Vec<f32> {

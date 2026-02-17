@@ -9,11 +9,16 @@ pub struct ModelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RuntimeConfig {
     pub input_gain: f32,
     pub output_gain: f32,
     pub pitch_shift_semitones: f32,
     pub index_rate: f32,
+    pub index_top_k: usize,
+    pub index_search_rows: usize,
+    pub protect: f32,
+    pub rmvpe_threshold: f32,
     pub speaker_id: i64,
     pub sample_rate: u32,
     pub block_size: usize,
@@ -26,9 +31,13 @@ impl Default for RuntimeConfig {
             output_gain: 1.0,
             pitch_shift_semitones: 0.0,
             index_rate: 0.5,
+            index_top_k: 8,
+            index_search_rows: 24_576,
+            protect: 0.33,
+            rmvpe_threshold: 0.03,
             speaker_id: 0,
             sample_rate: 48_000,
-            block_size: 960,
+            block_size: 8_192,
         }
     }
 }

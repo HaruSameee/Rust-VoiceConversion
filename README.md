@@ -36,8 +36,23 @@ Python依存を減らし、推論・音声処理・UI連携をRust側に集約�
 補足:
 - 環境変数未設定時は `model/model.onnx` などを既定値として使います
 - 現状のRVC推論は `hubert_path` と `pitch_extractor_path` が必須です
-- `*.index` のバイナリFAISS形式は未対応です（今はテキスト形式のみ）
+- `*.index`（FAISSバイナリ）は対応済みです
+  - 初回だけ Python + `faiss` で展開し、`*.rustvc.cache` を生成します
+  - 2回目以降はキャッシュを読むため高速です
 - 現状は「動くプロトタイプ」を優先した実装です
+
+## Index変換スクリプト
+
+`scripts/export_faiss_index_bin.py` で `.index` から生の `float32` バイナリ `.bin` を作れます。
+
+- 最小実行（自動検出）:
+  - `python scripts/export_faiss_index_bin.py`
+  - `model/model.index` があればそれを使います
+- 明示指定:
+  - `python scripts/export_faiss_index_bin.py --index model/model.index`
+  - `python scripts/export_faiss_index_bin.py --index model/model.index --out model/model_vectors.bin`
+
+出力時に `vector count` と `dimension(期待値768)` を表示し、次元不一致ならエラー終了します。
 
 ## Todo
 

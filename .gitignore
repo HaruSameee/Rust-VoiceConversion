@@ -7,19 +7,33 @@ target/
 *.pdb
 **/mutants.out*/
 
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+
 # Tauri / frontend artifacts
 apps/tauri/ui/node_modules/
 apps/tauri/ui/dist/
 apps/tauri/ui/.vite/
 apps/tauri/src-tauri/gen/
 
-# Local model files
+# Local model files (large binaries)
 model/*.onnx
 model/*.pth
 model/*.index
+model/*.bin
+model/*.cache
+model/*.rustvc.cache
 models/*.onnx
 models/*.pth
 models/*.index
+models/*.bin
+models/*.cache
+models/*.rustvc.cache
+
+# Local references / dumps
+Mangio-RVC-v23.7.0/
 
 # Logs and env
 *.log

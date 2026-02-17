@@ -124,8 +124,14 @@ fn get_runtime_config_cmd(state: State<'_, AppState>) -> Result<RuntimeConfig, S
 #[tauri::command]
 fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> Result<(), String> {
     log_debug(&format!(
-        "set_runtime_config_cmd sample_rate={} block_size={} index_rate={}",
-        config.sample_rate, config.block_size, config.index_rate
+        "set_runtime_config_cmd sample_rate={} block_size={} index_rate={} top_k={} rows={} protect={:.2} rmvpe_th={:.3}",
+        config.sample_rate,
+        config.block_size,
+        config.index_rate,
+        config.index_top_k,
+        config.index_search_rows,
+        config.protect,
+        config.rmvpe_threshold
     ));
     let mut guard = state.lock_runtime();
     guard.config = config;
@@ -170,12 +176,12 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             }
             (guard.config.clone(), guard.model.clone())
         };
-        if runtime_config.block_size < 960 {
+        if runtime_config.block_size < 8_192 {
             log_debug(&format!(
-                "block_size={} is too small for current pipeline; auto-raise to 960",
+                "block_size={} is too small for current pipeline; auto-raise to 8192",
                 runtime_config.block_size
             ));
-            runtime_config.block_size = 960;
+            runtime_config.block_size = 8_192;
         }
 
         let model = resolve_model_config_for_start(model_raw)?;
@@ -184,13 +190,18 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             std::env::var("ORT_DYLIB_PATH").ok()
         ));
         log_debug(&format!(
-            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={}",
+            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} index_rate={} top_k={} rows={} protect={:.2} rmvpe_th={:.3}",
             model.model_path,
             model.hubert_path,
             model.pitch_extractor_path,
             model.index_path,
             runtime_config.sample_rate,
-            runtime_config.block_size
+            runtime_config.block_size,
+            runtime_config.index_rate,
+            runtime_config.index_top_k,
+            runtime_config.index_search_rows,
+            runtime_config.protect,
+            runtime_config.rmvpe_threshold
         ));
         let infer_engine = RvcOrtEngine::new(model).map_err(|e| e.to_string())?;
         let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());
@@ -276,6 +287,7 @@ fn default_model_config() -> ModelConfig {
     let index_path = std::env::var("RUST_VC_INDEX_PATH")
         .ok()
         .and_then(|p| resolve_existing_path(&p).or(Some(p)))
+        .or_else(|| resolve_existing_path("model/model.index"))
         .or_else(|| resolve_existing_path("model/feature.index"));
     let model_path = std::env::var("RUST_VC_MODEL_PATH")
         .ok()

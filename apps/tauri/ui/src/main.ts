@@ -15,6 +15,10 @@ interface RuntimeConfig {
   output_gain: number;
   pitch_shift_semitones: number;
   index_rate: number;
+  index_top_k: number;
+  index_search_rows: number;
+  protect: number;
+  rmvpe_threshold: number;
   speaker_id: number;
   sample_rate: number;
   block_size: number;
@@ -45,6 +49,10 @@ const ui = {
   outputGain: $<HTMLInputElement>("outputGain"),
   pitchShift: $<HTMLInputElement>("pitchShift"),
   indexRate: $<HTMLInputElement>("indexRate"),
+  indexTopK: $<HTMLInputElement>("indexTopK"),
+  indexSearchRows: $<HTMLInputElement>("indexSearchRows"),
+  protect: $<HTMLInputElement>("protect"),
+  rmvpeThreshold: $<HTMLInputElement>("rmvpeThreshold"),
   speakerId: $<HTMLInputElement>("speakerId"),
   sampleRate: $<HTMLInputElement>("sampleRate"),
   blockSize: $<HTMLInputElement>("blockSize"),
@@ -103,6 +111,10 @@ function runtimeFromInputs(): RuntimeConfig {
     output_gain: Number(ui.outputGain.value),
     pitch_shift_semitones: Number(ui.pitchShift.value),
     index_rate: Number(ui.indexRate.value),
+    index_top_k: Number(ui.indexTopK.value),
+    index_search_rows: Number(ui.indexSearchRows.value),
+    protect: Number(ui.protect.value),
+    rmvpe_threshold: Number(ui.rmvpeThreshold.value),
     speaker_id: Number(ui.speakerId.value),
     sample_rate: Number(ui.sampleRate.value),
     block_size: Number(ui.blockSize.value)
@@ -121,6 +133,10 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.outputGain.value = String(config.output_gain);
   ui.pitchShift.value = String(config.pitch_shift_semitones);
   ui.indexRate.value = String(config.index_rate);
+  ui.indexTopK.value = String(config.index_top_k);
+  ui.indexSearchRows.value = String(config.index_search_rows);
+  ui.protect.value = String(config.protect);
+  ui.rmvpeThreshold.value = String(config.rmvpe_threshold);
   ui.speakerId.value = String(config.speaker_id);
   ui.sampleRate.value = String(config.sample_rate);
   ui.blockSize.value = String(config.block_size);

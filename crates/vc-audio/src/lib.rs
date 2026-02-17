@@ -14,6 +14,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use vc_core::{InferenceEngine, VoiceChanger};
 use vc_signal::resample_linear_into;
 
+const MIN_INFERENCE_BLOCK: usize = 8_192;
+const OUTPUT_CROSSFADE_SAMPLES: usize = 256;
+
 pub fn list_input_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
     let devices = host
@@ -114,8 +117,8 @@ where
         input_rate, output_rate, input_channels, output_channels, model_sample_rate, block_size
     );
 
-    let (input_tx, input_rx) = sync_channel::<Vec<f32>>(32);
-    let (output_tx, output_rx) = sync_channel::<Vec<f32>>(32);
+    let (input_tx, input_rx) = sync_channel::<Vec<f32>>(64);
+    let (output_tx, output_rx) = sync_channel::<Vec<f32>>(64);
 
     let running = Arc::new(AtomicBool::new(true));
     let input_rms = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
@@ -215,6 +218,7 @@ fn build_output_callback(
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut pending = VecDeque::<f32>::new();
     let mut underruns = 0usize;
+    let mut last_sample = 0.0_f32;
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
         if !running.load(Ordering::Relaxed) {
             data.fill(0.0);
@@ -235,15 +239,25 @@ fn build_output_callback(
             }
         }
 
+        let mut callback_underrun = false;
         for sample in data {
             if let Some(v) = pending.pop_front() {
                 *sample = v;
+                last_sample = v;
             } else {
-                *sample = 0.0;
-                underruns += 1;
-                if underruns % 64 == 0 {
-                    eprintln!("[vc-audio] output underrun count={underruns}");
+                // Smoothly decay towards silence to avoid periodic clicks/tones on underrun.
+                last_sample *= 0.995;
+                if last_sample.abs() < 1.0e-5 {
+                    last_sample = 0.0;
                 }
+                *sample = last_sample;
+                callback_underrun = true;
+            }
+        }
+        if callback_underrun {
+            underruns += 1;
+            if underruns % 64 == 0 {
+                eprintln!("[vc-audio] output underrun callbacks={underruns}");
             }
         }
     }
@@ -266,14 +280,24 @@ fn worker_loop<E>(
 ) where
     E: InferenceEngine,
 {
-    let model_block_size = block_size.max(128);
+    let model_block_size = block_size.max(MIN_INFERENCE_BLOCK);
     let mut model_rate_buf = Vec::<f32>::new();
     let mut model_input_queue = VecDeque::<f32>::new();
     let mut model_block = Vec::<f32>::with_capacity(model_block_size);
     let mut output_rate_buf = Vec::<f32>::new();
+    let mut previous_output_tail = Vec::<f32>::new();
     let mut processed_blocks: u64 = 0;
     let mut last_heartbeat = Instant::now();
     let block_budget = Duration::from_secs_f64(model_block_size as f64 / model_sample_rate as f64);
+    eprintln!(
+        "[vc-audio] inference_block_size={} io_block_size={} block_budget_ms={:.2}",
+        model_block_size,
+        block_size,
+        block_budget.as_secs_f64() * 1000.0
+    );
+    // Prime output queue with short silence to hide startup gaps while first inference block is prepared.
+    let prefill_frames = block_size.max(480) * output_channels * 4;
+    let _ = output_tx.try_send(vec![0.0; prefill_frames]);
 
     while running.load(Ordering::Relaxed) {
         let mono = match input_rx.recv_timeout(Duration::from_millis(5)) {
@@ -320,11 +344,31 @@ fn worker_loop<E>(
             } else {
                 &model_out
             };
-            level_meter.push_block(output_mono);
+            let mut smoothed_output = output_mono.to_vec();
+            let crossfade = OUTPUT_CROSSFADE_SAMPLES
+                .min(smoothed_output.len())
+                .min(previous_output_tail.len());
+            if crossfade > 0 {
+                let prev_start = previous_output_tail.len() - crossfade;
+                for i in 0..crossfade {
+                    let a = previous_output_tail[prev_start + i];
+                    let b = smoothed_output[i];
+                    let t = (i + 1) as f32 / (crossfade + 1) as f32;
+                    smoothed_output[i] = a * (1.0 - t) + b * t;
+                }
+            }
+            let keep = OUTPUT_CROSSFADE_SAMPLES.min(smoothed_output.len());
+            previous_output_tail.clear();
+            if keep > 0 {
+                previous_output_tail
+                    .extend_from_slice(&smoothed_output[smoothed_output.len() - keep..]);
+            }
+
+            level_meter.push_block(&smoothed_output);
             input_rms.store(level_meter.rms().to_bits(), Ordering::Relaxed);
             input_peak.store(level_meter.peak().to_bits(), Ordering::Relaxed);
 
-            let output_interleaved = upmix_from_mono(output_mono, output_channels);
+            let output_interleaved = upmix_from_mono(&smoothed_output, output_channels);
             match output_tx.try_send(output_interleaved) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
