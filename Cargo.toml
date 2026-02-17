@@ -21,6 +21,7 @@ tracing = "0.1"
 cpal = "0.16"
 ringbuf = "0.4"
 rustfft = "6"
-ndarray = "0.16"
-ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
+ndarray = "0.17"
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
 tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

@@ -4,20 +4,22 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 use tauri::State;
-use vc_audio::{list_input_devices, list_output_devices};
-use vc_core::RuntimeConfig;
+use vc_audio::{
+    list_input_devices, list_output_devices, spawn_voice_changer_stream, RealtimeAudioEngine,
+};
+use vc_core::{ModelConfig, RuntimeConfig, VoiceChanger};
+use vc_inference::RvcOrtEngine;
 
-#[derive(Debug)]
 struct AppState {
     inner: Mutex<RuntimeState>,
 }
 
-#[derive(Debug)]
 struct RuntimeState {
     config: RuntimeConfig,
     running: bool,
     input_level_rms: f32,
     input_level_peak: f32,
+    engine_task: Option<RealtimeAudioEngine>,
 }
 
 impl Default for AppState {
@@ -28,6 +30,7 @@ impl Default for AppState {
                 running: false,
                 input_level_rms: 0.0,
                 input_level_peak: 0.0,
+                engine_task: None,
             }),
         }
     }
@@ -78,7 +81,34 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
         .inner
         .lock()
         .map_err(|_| "state lock poisoned".to_string())?;
+    if guard.running {
+        sync_levels_from_engine(&mut guard);
+        return Ok(EngineStatus {
+            running: guard.running,
+            input_level_rms: guard.input_level_rms,
+            input_level_peak: guard.input_level_peak,
+        });
+    }
+
+    let runtime_config = guard.config.clone();
+    let model = ModelConfig {
+        model_path: std::env::var("RUST_VC_MODEL_PATH")
+            .unwrap_or_else(|_| "model/model.onnx".to_string()),
+        index_path: None,
+        pitch_extractor_path: None,
+    };
+    let infer_engine = RvcOrtEngine::new(model).map_err(|e| e.to_string())?;
+    let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());
+    let audio_engine = spawn_voice_changer_stream(
+        voice_changer,
+        runtime_config.sample_rate,
+        runtime_config.block_size,
+    )
+    .map_err(|e| e.to_string())?;
+
     guard.running = true;
+    guard.engine_task = Some(audio_engine);
+    sync_levels_from_engine(&mut guard);
     Ok(EngineStatus {
         running: guard.running,
         input_level_rms: guard.input_level_rms,
@@ -92,6 +122,9 @@ fn stop_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> {
         .inner
         .lock()
         .map_err(|_| "state lock poisoned".to_string())?;
+    if let Some(task) = guard.engine_task.take() {
+        task.stop_and_abort();
+    }
     guard.running = false;
     Ok(EngineStatus {
         running: guard.running,
@@ -102,15 +135,25 @@ fn stop_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> {
 
 #[tauri::command]
 fn get_engine_status_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> {
-    let guard = state
+    let mut guard = state
         .inner
         .lock()
         .map_err(|_| "state lock poisoned".to_string())?;
+    sync_levels_from_engine(&mut guard);
     Ok(EngineStatus {
         running: guard.running,
         input_level_rms: guard.input_level_rms,
         input_level_peak: guard.input_level_peak,
     })
+}
+
+fn sync_levels_from_engine(state: &mut RuntimeState) {
+    if let Some(task) = &state.engine_task {
+        let (rms, peak) = task.levels();
+        state.input_level_rms = rms;
+        state.input_level_peak = peak;
+        state.running = task.is_running();
+    }
 }
 
 fn main() {

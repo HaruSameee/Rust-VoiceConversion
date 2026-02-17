@@ -12,6 +12,7 @@ serde.workspace = true
 tauri.workspace = true
 vc-audio = { path = "../../../crates/vc-audio" }
 vc-core = { path = "../../../crates/vc-core" }
+vc-inference = { path = "../../../crates/vc-inference" }
 
 [features]
 default = ["custom-protocol"]

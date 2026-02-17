@@ -1,33 +1,27 @@
 # Rust-VC
 
-Python依存を最小化し、RustのみでリアルタイムVC（RVC系）を組むためのワークスペースです。
+Rustだけで、リアルタイムのボイスチェンジャー�E�EVC系�E�を動かすため�E実験用ワークスペ�Eスです、E 
+「Python依存を減らして、推論�E音声処琁E�EUI連携をRust側に寁E��る」ことを主眼にしてぁE��す、E
+## こ�Eリポジトリで目持E��てぁE��こと
 
-## 目的
+- 推論エンジンの脱Python�E�Eort` + ONNX Runtime�E�E- 音声処琁E��型安�EなRustクレートで実裁E- Tauri経由でUIからリアルタイム制御
 
-- 推論エンジンの脱Python（`ort` による ONNX Runtime 連携）
-- 音声処理を型安全なクレートで実装
-- Tauri フロントエンドとの低遅延連携
+## ぁE��の構�E
 
-## 構成
+- `crates/vc-core`
+  - 設定型、エラー型、`VoiceChanger` パイプラインの共通層
+- `crates/vc-inference`
+  - ONNXモチE��を読み込んで推論する層�E�ERvcOrtEngine`�E�E- `crates/vc-signal`
+  - STFT、正規化、リサンプリングなどの信号処琁E��
+- `crates/vc-audio`
+  - `cpal` を使った�E出力ストリーム制御とレベルメータ
+- `apps/tauri/src-tauri`
+  - Tauriコマンド（デバイス列挙・起動停止・状態取得！E
+## 使ぁE���E�現状�E�E
+1. ONNXモチE��を用意して、`RUST_VC_MODEL_PATH` でパスを指宁E2. Tauri側から `start_engine_cmd` を呼び出ぁE3. マイク入力が推論を通ってスピ�Eカーに出力される
 
-- `crates/vc-core`: 設定型・エラー型・推論パイプライン抽象
-- `crates/vc-audio`: `cpal` ベースの Audio I/O 補助（デバイス列挙・レベルメータ）
-- `crates/vc-signal`: `rustfft` / `ndarray` ベースの STFT・正規化
-- `crates/vc-inference`: `ort` 依存を閉じ込めた推論層（現状はスタブ推論）
-- `apps/tauri/src-tauri`: Tauri Commands で UI <-> Rust コアを橋渡し
-
-## Tauri Command
-
-- `list_audio_devices_cmd`
-- `get_runtime_config_cmd`
-- `set_runtime_config_cmd`
-- `start_engine_cmd`
-- `stop_engine_cmd`
-- `get_engine_status_cmd`
-
-## 次段階（実運用に必要）
-
-1. `vc-inference` に RMVPE + RVC ONNX 入出力テンソル処理を実装
-2. `vc-audio` に入出力ストリーム + リングバッファ + 遅延制御を実装
-3. Tauri 側で状態イベント配信（meter/underrun/latency）を追加
-4. `apps/tauri/ui` に React/Vue/Svelte の制御UIを実装
+補足:
+- 環墁E��数未設定時は `model/model.onnx` を参照しまぁE- 現在は「動く�Eロトタイプ」を優先した実裁E��ぁE
+## これから詰めるポインチE
+1. RVC本体に合わせた前後�E琁E��テンソル形状・特徴量�E琁E���E精緻匁E2. レイチE��シ最適化（バチE��ァ戦略・ブロチE��サイズ調整�E�E3. UIからのモチE��刁E��替えと詳細パラメータ制御
+4. 異常系の扱ぁE��デバイス刁E��、推論失敗時のリカバリ�E�E

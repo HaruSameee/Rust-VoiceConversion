@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 cpal.workspace = true
+ringbuf.workspace = true
+tokio.workspace = true
+vc-core = { path = "../vc-core" }
+vc-signal = { path = "../vc-signal" }
