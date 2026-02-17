@@ -12,10 +12,20 @@ use vc_signal::{
     postprocess_generated_audio, resize_pitch_to_frames, RVC_HOP_LENGTH,
 };
 
+const INDEX_TOP_K: usize = 8;
+
+#[derive(Debug, Clone)]
+struct FeatureIndex {
+    vectors: Array2<f32>,
+}
+
 pub struct RvcOrtEngine {
     model: ModelConfig,
     rvc_session: Session,
     rmvpe_session: Option<Session>,
+    hubert_session: Option<Session>,
+    feature_index: Option<FeatureIndex>,
+    phone_feature_dim: usize,
 }
 
 impl RvcOrtEngine {
@@ -60,30 +70,56 @@ impl RvcOrtEngine {
             None
         };
 
+        let hubert_session = if let Some(path) = model.hubert_path.as_deref() {
+            if !Path::new(path).exists() {
+                return Err(VcError::Config(format!(
+                    "hubert model file not found: {}",
+                    path
+                )));
+            }
+            Some(
+                Session::builder()
+                    .map_err(|e| {
+                        VcError::Inference(format!("failed to create hubert session builder: {e}"))
+                    })?
+                    .commit_from_file(path)
+                    .map_err(|e| {
+                        VcError::Inference(format!("failed to load hubert onnx model {path}: {e}"))
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        let phone_feature_dim = infer_phone_feature_dim_from_session(&rvc_session);
+        let feature_index = match model.index_path.as_deref() {
+            Some(path) => {
+                if !Path::new(path).exists() {
+                    return Err(VcError::Config(format!("index file not found: {path}")));
+                }
+                match load_feature_index(path, phone_feature_dim) {
+                    Ok(index) => Some(index),
+                    Err(e) => {
+                        eprintln!("index disabled: {e}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         Ok(Self {
             model,
             rvc_session,
             rmvpe_session,
+            hubert_session,
+            feature_index,
+            phone_feature_dim,
         })
     }
 
     pub fn model_path(&self) -> &str {
         &self.model.model_path
-    }
-
-    fn infer_phone_feature_dim(&self) -> usize {
-        for input in self.rvc_session.inputs() {
-            let name = input.name().to_lowercase();
-            if !(name.contains("phone") || name.contains("hubert") || name.contains("feat")) {
-                continue;
-            }
-            if let Some(shape) = input.dtype().tensor_shape() {
-                if shape.len() >= 3 && shape[2] > 0 {
-                    return shape[2] as usize;
-                }
-            }
-        }
-        256
     }
 
     fn estimate_pitch(&mut self, padded_input: &[f32], fallback_frames: usize) -> Result<Vec<f32>> {
@@ -112,6 +148,92 @@ impl RvcOrtEngine {
             VcError::Inference(format!("failed to extract rmvpe output tensor<f32>: {e}"))
         })?;
         Ok(f0.to_vec())
+    }
+
+    fn extract_phone_features(
+        &mut self,
+        normalized: &[f32],
+        _fallback_frames: usize,
+    ) -> Result<Array3<f32>> {
+        if let Some(session) = self.hubert_session.as_mut() {
+            let inlet = session
+                .inputs()
+                .first()
+                .ok_or_else(|| VcError::Inference("hubert model has no inputs".to_string()))?;
+            let input_name = inlet.name().to_string();
+            let rank = inlet.dtype().tensor_shape().map_or(2, |s| s.len());
+            let input_tensor = tensor_from_audio_rank(rank, normalized)?;
+            let outputs = session
+                .run(vec![(input_name, SessionInputValue::from(input_tensor))])
+                .map_err(|e| VcError::Inference(format!("hubert inference failed: {e}")))?;
+            if outputs.len() == 0 {
+                return Err(VcError::Inference(
+                    "hubert model returned no outputs".to_string(),
+                ));
+            }
+            let (shape, hubert) = outputs[0].try_extract_tensor::<f32>().map_err(|e| {
+                VcError::Inference(format!("failed to extract hubert output tensor<f32>: {e}"))
+            })?;
+            return phone_from_hubert_tensor(shape, hubert, self.phone_feature_dim);
+        }
+
+        Ok(frame_features_for_rvc(
+            normalized,
+            RVC_HOP_LENGTH,
+            self.phone_feature_dim.max(1),
+        ))
+    }
+
+    fn blend_phone_with_index(&self, phone: &mut Array3<f32>, index_rate: f32) {
+        let Some(index) = &self.feature_index else {
+            return;
+        };
+        if index.vectors.nrows() == 0 || index.vectors.ncols() == 0 {
+            return;
+        }
+        let rate = index_rate.clamp(0.0, 1.0);
+        if rate <= f32::EPSILON {
+            return;
+        }
+
+        let frames = phone.shape()[1];
+        let dims = phone.shape()[2];
+        let rows = index.vectors.nrows();
+        let mut retrieved = vec![0.0_f32; dims];
+
+        for t in 0..frames {
+            let mut best = Vec::<(f32, usize)>::with_capacity(INDEX_TOP_K);
+            for row in 0..rows {
+                let mut l2 = 0.0_f32;
+                for c in 0..dims {
+                    let diff = phone[(0, t, c)] - index.vectors[(row, c)];
+                    l2 += diff * diff;
+                }
+                push_top_k(&mut best, (l2, row), INDEX_TOP_K);
+            }
+            if best.is_empty() {
+                continue;
+            }
+
+            retrieved.fill(0.0);
+            let mut weight_sum = 0.0_f32;
+            for (dist, row) in best {
+                let w = 1.0 / (dist.sqrt() + 1e-6);
+                weight_sum += w;
+                for c in 0..dims {
+                    retrieved[c] += index.vectors[(row, c)] * w;
+                }
+            }
+            if weight_sum <= f32::EPSILON {
+                continue;
+            }
+
+            for c in 0..dims {
+                let from_index = retrieved[c] / weight_sum;
+                let current = phone[(0, t, c)];
+                phone[(0, t, c)] = current * (1.0 - rate) + from_index * rate;
+            }
+        }
     }
 
     fn run_rvc(
@@ -220,10 +342,11 @@ impl InferenceEngine for RvcOrtEngine {
         let fallback_frames = normalized.len().div_ceil(RVC_HOP_LENGTH).max(1);
         let f0 = self.estimate_pitch(&rmvpe_pad.padded, fallback_frames)?;
 
-        let feature_dim = self.infer_phone_feature_dim();
-        let phone = frame_features_for_rvc(&normalized, RVC_HOP_LENGTH, feature_dim);
-        let frame_count = phone.shape()[1];
-        let pitchf = resize_pitch_to_frames(&f0, frame_count);
+        let mut phone = self.extract_phone_features(&normalized, fallback_frames)?;
+        self.blend_phone_with_index(&mut phone, config.index_rate);
+        let frame_count = phone.shape()[1].max(1);
+        let mut pitchf = resize_pitch_to_frames(&f0, frame_count);
+        apply_pitch_shift_inplace(&mut pitchf, config.pitch_shift_semitones);
         let pitch = coarse_pitch_from_f0(&pitchf);
         let wave = Array3::from_shape_vec((1, 1, normalized.len()), normalized.clone())
             .map_err(|e| VcError::Inference(format!("failed to shape waveform as [1,1,T]: {e}")))?;
@@ -288,5 +411,214 @@ fn tensor_from_audio_rank(rank: usize, samples: &[f32]) -> Result<Tensor<f32>> {
             })?,
         )
         .map_err(|e| VcError::Inference(format!("failed to create rank3 audio tensor: {e}"))),
+    }
+}
+
+fn infer_phone_feature_dim_from_session(session: &Session) -> usize {
+    for input in session.inputs() {
+        let name = input.name().to_lowercase();
+        if !(name.contains("phone") || name.contains("hubert") || name.contains("feat")) {
+            continue;
+        }
+        if let Some(shape) = input.dtype().tensor_shape() {
+            if shape.len() >= 3 && shape[2] > 0 {
+                return shape[2] as usize;
+            }
+        }
+    }
+    256
+}
+
+fn phone_from_hubert_tensor(
+    shape: &[i64],
+    hubert: &[f32],
+    feature_dim: usize,
+) -> Result<Array3<f32>> {
+    if hubert.is_empty() {
+        return Err(VcError::Inference(
+            "hubert output tensor is empty".to_string(),
+        ));
+    }
+
+    let dims = shape
+        .iter()
+        .map(|&v| if v > 0 { v as usize } else { 0 })
+        .collect::<Vec<usize>>();
+    let mut out = match dims.len() {
+        3 => {
+            let batch = dims[0];
+            let frames = dims[1].max(1);
+            let channels = dims[2].max(1);
+            if batch == 0 {
+                return Err(VcError::Inference(
+                    "hubert output has zero batch".to_string(),
+                ));
+            }
+            if hubert.len() < batch * frames * channels {
+                return Err(VcError::Inference(
+                    "hubert output tensor data is smaller than declared shape".to_string(),
+                ));
+            }
+            let mut arr = Array3::<f32>::zeros((1, frames, channels));
+            for t in 0..frames {
+                for c in 0..channels {
+                    let idx = t * channels + c;
+                    arr[(0, t, c)] = hubert[idx];
+                }
+            }
+            arr
+        }
+        2 => {
+            let frames = dims[0].max(1);
+            let channels = dims[1].max(1);
+            if hubert.len() < frames * channels {
+                return Err(VcError::Inference(
+                    "hubert output tensor data is smaller than declared shape".to_string(),
+                ));
+            }
+            let mut arr = Array3::<f32>::zeros((1, frames, channels));
+            for t in 0..frames {
+                for c in 0..channels {
+                    arr[(0, t, c)] = hubert[t * channels + c];
+                }
+            }
+            arr
+        }
+        1 => {
+            let frames = dims[0].max(1);
+            if hubert.len() < frames {
+                return Err(VcError::Inference(
+                    "hubert output tensor data is smaller than declared shape".to_string(),
+                ));
+            }
+            let mut arr = Array3::<f32>::zeros((1, frames, 1));
+            for t in 0..frames {
+                arr[(0, t, 0)] = hubert[t];
+            }
+            arr
+        }
+        _ => {
+            return Err(VcError::Inference(format!(
+                "unsupported hubert output rank: {}",
+                dims.len()
+            )));
+        }
+    };
+
+    if out.shape()[2] != feature_dim {
+        out = align_phone_feature_dim(out, feature_dim);
+    }
+    Ok(out)
+}
+
+fn align_phone_feature_dim(phone: Array3<f32>, target_dim: usize) -> Array3<f32> {
+    let frames = phone.shape()[1];
+    let src_dim = phone.shape()[2];
+    if src_dim == target_dim || target_dim == 0 {
+        return phone;
+    }
+    let mut aligned = Array3::<f32>::zeros((1, frames, target_dim));
+    for t in 0..frames {
+        for c in 0..target_dim {
+            let src = c % src_dim;
+            aligned[(0, t, c)] = phone[(0, t, src)];
+        }
+    }
+    aligned
+}
+
+fn load_feature_index(path: &str, target_dim: usize) -> Result<FeatureIndex> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| VcError::Config(format!("failed to read index file as text ({path}): {e}")))?;
+    let mut rows: Vec<Vec<f32>> = Vec::new();
+    let mut dims = 0usize;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let values: Vec<f32> = trimmed
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                v.parse::<f32>().map_err(|e| {
+                    VcError::Config(format!("invalid float in index file {path}: {e}"))
+                })
+            })
+            .collect::<Result<Vec<f32>>>()?;
+        if values.is_empty() {
+            continue;
+        }
+        if dims == 0 {
+            dims = values.len();
+        }
+        if values.len() != dims {
+            continue;
+        }
+        rows.push(values);
+    }
+
+    if rows.is_empty() || dims == 0 {
+        return Err(VcError::Config(format!(
+            "index file has no usable vectors: {path}"
+        )));
+    }
+
+    let mut flat = Vec::<f32>::with_capacity(rows.len() * dims);
+    for row in rows {
+        flat.extend(row);
+    }
+    let vectors = Array2::from_shape_vec((flat.len() / dims, dims), flat)
+        .map_err(|e| VcError::Config(format!("failed to build index matrix from {path}: {e}")))?;
+
+    let vectors = if vectors.ncols() != target_dim && target_dim > 0 {
+        align_index_dim(vectors, target_dim)
+    } else {
+        vectors
+    };
+    Ok(FeatureIndex { vectors })
+}
+
+fn align_index_dim(vectors: Array2<f32>, target_dim: usize) -> Array2<f32> {
+    if vectors.ncols() == target_dim || target_dim == 0 {
+        return vectors;
+    }
+
+    let rows = vectors.nrows();
+    let src_dim = vectors.ncols();
+    let mut aligned = Array2::<f32>::zeros((rows, target_dim));
+    for r in 0..rows {
+        for c in 0..target_dim {
+            aligned[(r, c)] = vectors[(r, c % src_dim)];
+        }
+    }
+    aligned
+}
+
+fn push_top_k(best: &mut Vec<(f32, usize)>, cand: (f32, usize), k: usize) {
+    let mut idx = 0usize;
+    while idx < best.len() && best[idx].0 <= cand.0 {
+        idx += 1;
+    }
+    if idx < k {
+        best.insert(idx, cand);
+        if best.len() > k {
+            best.pop();
+        }
+    } else if best.len() < k {
+        best.push(cand);
+    }
+}
+
+fn apply_pitch_shift_inplace(f0: &mut [f32], semitones: f32) {
+    if semitones.abs() <= f32::EPSILON {
+        return;
+    }
+    let ratio = 2.0_f32.powf(semitones / 12.0);
+    for v in f0 {
+        if *v > 0.0 {
+            *v *= ratio;
+        }
     }
 }

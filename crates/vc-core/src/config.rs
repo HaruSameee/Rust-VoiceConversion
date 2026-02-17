@@ -5,6 +5,7 @@ pub struct ModelConfig {
     pub model_path: String,
     pub index_path: Option<String>,
     pub pitch_extractor_path: Option<String>,
+    pub hubert_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

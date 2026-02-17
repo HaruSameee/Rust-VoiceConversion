@@ -79,27 +79,32 @@ pub fn postprocess_generated_audio(samples: &[f32]) -> Vec<f32> {
     out
 }
 
-pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+pub fn resample_linear_into(samples: &[f32], src_rate: u32, dst_rate: u32, out: &mut Vec<f32>) {
+    out.clear();
     if samples.is_empty() || src_rate == 0 || dst_rate == 0 {
-        return Vec::new();
+        return;
     }
     if src_rate == dst_rate {
-        return samples.to_vec();
+        out.extend_from_slice(samples);
+        return;
     }
 
     let ratio = dst_rate as f64 / src_rate as f64;
     let out_len = ((samples.len() as f64) * ratio).round().max(1.0) as usize;
-    let mut out = Vec::with_capacity(out_len);
+    out.reserve(out_len.saturating_sub(out.capacity()));
 
     for i in 0..out_len {
         let src_pos = (i as f64) / ratio;
         let left = src_pos.floor() as usize;
         let right = (left + 1).min(samples.len() - 1);
         let frac = (src_pos - left as f64) as f32;
-        let v = samples[left] * (1.0 - frac) + samples[right] * frac;
-        out.push(v);
+        out.push(samples[left] * (1.0 - frac) + samples[right] * frac);
     }
+}
 
+pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+    let mut out = Vec::new();
+    resample_linear_into(samples, src_rate, dst_rate, &mut out);
     out
 }
 

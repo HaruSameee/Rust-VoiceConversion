@@ -12,7 +12,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use vc_core::{InferenceEngine, VoiceChanger};
-use vc_signal::resample_linear;
+use vc_signal::resample_linear_into;
 
 pub fn list_input_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
@@ -241,6 +241,9 @@ fn worker_loop<E>(
 ) where
     E: InferenceEngine,
 {
+    let mut model_rate_buf = Vec::<f32>::new();
+    let mut output_rate_buf = Vec::<f32>::new();
+
     while running.load(Ordering::Relaxed) {
         let mono = match input_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(v) => v,
@@ -251,27 +254,34 @@ fn worker_loop<E>(
             }
         };
 
-        let model_in = if input_rate != model_sample_rate {
-            resample_linear(&mono, input_rate, model_sample_rate)
+        let model_in: &[f32] = if input_rate != model_sample_rate {
+            resample_linear_into(&mono, input_rate, model_sample_rate, &mut model_rate_buf);
+            &model_rate_buf
         } else {
-            mono
+            &mono
         };
 
-        let model_out = match voice_changer.process_frame(&model_in) {
+        let model_out = match voice_changer.process_frame(model_in) {
             Ok(v) => v,
-            Err(_) => model_in,
+            Err(_) => model_in.to_vec(),
         };
 
-        let output_mono = if model_sample_rate != output_rate {
-            resample_linear(&model_out, model_sample_rate, output_rate)
+        let output_mono: &[f32] = if model_sample_rate != output_rate {
+            resample_linear_into(
+                &model_out,
+                model_sample_rate,
+                output_rate,
+                &mut output_rate_buf,
+            );
+            &output_rate_buf
         } else {
-            model_out
+            &model_out
         };
-        level_meter.push_block(&output_mono);
+        level_meter.push_block(output_mono);
         input_rms.store(level_meter.rms().to_bits(), Ordering::Relaxed);
         input_peak.store(level_meter.peak().to_bits(), Ordering::Relaxed);
 
-        let output_interleaved = upmix_from_mono(&output_mono, output_channels);
+        let output_interleaved = upmix_from_mono(output_mono, output_channels);
         match output_tx.try_send(output_interleaved) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {}
