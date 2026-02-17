@@ -77,7 +77,7 @@ impl RealtimeAudioEngine {
 pub fn spawn_voice_changer_stream<E>(
     mut voice_changer: VoiceChanger<E>,
     model_sample_rate: u32,
-    _block_size: usize,
+    block_size: usize,
 ) -> Result<RealtimeAudioEngine>
 where
     E: InferenceEngine,
@@ -108,8 +108,8 @@ where
     let input_channels = input_stream_config.channels as usize;
     let output_channels = output_stream_config.channels as usize;
 
-    let (input_tx, input_rx) = sync_channel::<Vec<f32>>(8);
-    let (output_tx, output_rx) = sync_channel::<Vec<f32>>(8);
+    let (input_tx, input_rx) = sync_channel::<Vec<f32>>(32);
+    let (output_tx, output_rx) = sync_channel::<Vec<f32>>(32);
 
     let running = Arc::new(AtomicBool::new(true));
     let input_rms = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
@@ -141,6 +141,7 @@ where
             input_rx,
             output_tx,
             model_sample_rate,
+            block_size,
             input_rate,
             output_rate,
             output_channels,
@@ -231,6 +232,7 @@ fn worker_loop<E>(
     input_rx: Receiver<Vec<f32>>,
     output_tx: SyncSender<Vec<f32>>,
     model_sample_rate: u32,
+    block_size: usize,
     input_rate: u32,
     output_rate: u32,
     output_channels: usize,
@@ -241,11 +243,14 @@ fn worker_loop<E>(
 ) where
     E: InferenceEngine,
 {
+    let model_block_size = block_size.max(128);
     let mut model_rate_buf = Vec::<f32>::new();
+    let mut model_input_queue = VecDeque::<f32>::new();
+    let mut model_block = Vec::<f32>::with_capacity(model_block_size);
     let mut output_rate_buf = Vec::<f32>::new();
 
     while running.load(Ordering::Relaxed) {
-        let mono = match input_rx.recv_timeout(Duration::from_millis(20)) {
+        let mono = match input_rx.recv_timeout(Duration::from_millis(5)) {
             Ok(v) => v,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
@@ -254,40 +259,49 @@ fn worker_loop<E>(
             }
         };
 
-        let model_in: &[f32] = if input_rate != model_sample_rate {
+        if input_rate != model_sample_rate {
             resample_linear_into(&mono, input_rate, model_sample_rate, &mut model_rate_buf);
-            &model_rate_buf
+            model_input_queue.extend(model_rate_buf.iter().copied());
         } else {
-            &mono
-        };
+            model_input_queue.extend(mono.iter().copied());
+        }
 
-        let model_out = match voice_changer.process_frame(model_in) {
-            Ok(v) => v,
-            Err(_) => model_in.to_vec(),
-        };
+        while model_input_queue.len() >= model_block_size {
+            model_block.clear();
+            for _ in 0..model_block_size {
+                if let Some(sample) = model_input_queue.pop_front() {
+                    model_block.push(sample);
+                }
+            }
 
-        let output_mono: &[f32] = if model_sample_rate != output_rate {
-            resample_linear_into(
-                &model_out,
-                model_sample_rate,
-                output_rate,
-                &mut output_rate_buf,
-            );
-            &output_rate_buf
-        } else {
-            &model_out
-        };
-        level_meter.push_block(output_mono);
-        input_rms.store(level_meter.rms().to_bits(), Ordering::Relaxed);
-        input_peak.store(level_meter.peak().to_bits(), Ordering::Relaxed);
+            let model_out = match voice_changer.process_frame(&model_block) {
+                Ok(v) => v,
+                Err(_) => vec![0.0; model_block.len()],
+            };
 
-        let output_interleaved = upmix_from_mono(output_mono, output_channels);
-        match output_tx.try_send(output_interleaved) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {}
-            Err(TrySendError::Disconnected(_)) => {
-                running.store(false, Ordering::Relaxed);
-                break;
+            let output_mono: &[f32] = if model_sample_rate != output_rate {
+                resample_linear_into(
+                    &model_out,
+                    model_sample_rate,
+                    output_rate,
+                    &mut output_rate_buf,
+                );
+                &output_rate_buf
+            } else {
+                &model_out
+            };
+            level_meter.push_block(output_mono);
+            input_rms.store(level_meter.rms().to_bits(), Ordering::Relaxed);
+            input_peak.store(level_meter.peak().to_bits(), Ordering::Relaxed);
+
+            let output_interleaved = upmix_from_mono(output_mono, output_channels);
+            match output_tx.try_send(output_interleaved) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => {
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
             }
         }
     }

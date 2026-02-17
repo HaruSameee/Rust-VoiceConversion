@@ -4,8 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.example.rustvc",
   "build": {
-    "frontendDist": "../ui/dist",
-    "devUrl": "http://localhost:1420"
+    "frontendDist": "../ui"
   },
   "app": {
     "windows": [

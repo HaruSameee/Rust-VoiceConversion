@@ -16,6 +16,7 @@ struct AppState {
 
 struct RuntimeState {
     config: RuntimeConfig,
+    model: ModelConfig,
     running: bool,
     input_level_rms: f32,
     input_level_peak: f32,
@@ -27,6 +28,7 @@ impl Default for AppState {
         Self {
             inner: Mutex::new(RuntimeState {
                 config: RuntimeConfig::default(),
+                model: default_model_config(),
                 running: false,
                 input_level_rms: 0.0,
                 input_level_peak: 0.0,
@@ -76,6 +78,22 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
 }
 
 #[tauri::command]
+fn get_model_config_cmd(state: State<'_, AppState>) -> ModelConfig {
+    let guard = state.inner.lock().expect("state lock poisoned");
+    guard.model.clone()
+}
+
+#[tauri::command]
+fn set_model_config_cmd(model: ModelConfig, state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state
+        .inner
+        .lock()
+        .map_err(|_| "state lock poisoned".to_string())?;
+    guard.model = model;
+    Ok(())
+}
+
+#[tauri::command]
 fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> {
     let mut guard = state
         .inner
@@ -91,37 +109,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
     }
 
     let runtime_config = guard.config.clone();
-    let rmvpe_path = std::env::var("RUST_VC_RMVPE_PATH").ok().or_else(|| {
-        let default = std::path::Path::new("model/rmvpe.onnx");
-        if default.exists() {
-            Some(default.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    });
-    let hubert_path = std::env::var("RUST_VC_HUBERT_PATH").ok().or_else(|| {
-        let default = std::path::Path::new("model/hubert.onnx");
-        if default.exists() {
-            Some(default.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    });
-    let index_path = std::env::var("RUST_VC_INDEX_PATH").ok().or_else(|| {
-        let default = std::path::Path::new("model/feature.index");
-        if default.exists() {
-            Some(default.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    });
-    let model = ModelConfig {
-        model_path: std::env::var("RUST_VC_MODEL_PATH")
-            .unwrap_or_else(|_| "model/model.onnx".to_string()),
-        index_path,
-        pitch_extractor_path: rmvpe_path,
-        hubert_path,
-    };
+    let model = guard.model.clone();
     let infer_engine = RvcOrtEngine::new(model).map_err(|e| e.to_string())?;
     let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());
     let audio_engine = spawn_voice_changer_stream(
@@ -181,6 +169,41 @@ fn sync_levels_from_engine(state: &mut RuntimeState) {
     }
 }
 
+fn default_model_config() -> ModelConfig {
+    let pitch_extractor_path = std::env::var("RUST_VC_RMVPE_PATH").ok().or_else(|| {
+        let default = std::path::Path::new("model/rmvpe.onnx");
+        if default.exists() {
+            Some(default.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
+    let hubert_path = std::env::var("RUST_VC_HUBERT_PATH").ok().or_else(|| {
+        let default = std::path::Path::new("model/hubert.onnx");
+        if default.exists() {
+            Some(default.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
+    let index_path = std::env::var("RUST_VC_INDEX_PATH").ok().or_else(|| {
+        let default = std::path::Path::new("model/feature.index");
+        if default.exists() {
+            Some(default.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
+
+    ModelConfig {
+        model_path: std::env::var("RUST_VC_MODEL_PATH")
+            .unwrap_or_else(|_| "model/model.onnx".to_string()),
+        index_path,
+        pitch_extractor_path,
+        hubert_path,
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -188,6 +211,8 @@ fn main() {
             list_audio_devices_cmd,
             get_runtime_config_cmd,
             set_runtime_config_cmd,
+            get_model_config_cmd,
+            set_model_config_cmd,
             start_engine_cmd,
             stop_engine_cmd,
             get_engine_status_cmd

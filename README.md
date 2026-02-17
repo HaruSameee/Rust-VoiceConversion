@@ -24,12 +24,13 @@ Python依存を減らし、推論・音声処理・UI連携をRust側に集約�
 
 ## Run
 
-1. ONNXモデルを配置し、必要なら `RUST_VC_MODEL_PATH` を設定
-2. Tauri側から `start_engine_cmd` を呼び出す
-3. マイク入力が推論を通ってスピーカーへ出力される
+1. ONNXモデルを `model/` に配置する（またはUIで絶対パスを指定）
+2. `cargo run -p rust-vc-tauri` を実行
+3. 起動したUIで `Save Config` -> `Start` を押す
+4. マイク入力が推論を通ってスピーカーへ出力される
 
 補足:
-- 環境変数未設定時は `model/model.onnx` を参照します
+- 環境変数未設定時は `model/model.onnx` などを既定値として使います
 - 現状は「動くプロトタイプ」を優先した実装です
 
 ## Todo

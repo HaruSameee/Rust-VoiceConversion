@@ -1,12 +1,14 @@
-# UI Placeholder
+# UI
 
-このディレクトリに React / Vue / Svelte のフロントエンドを配置します。
+This directory contains a minimal frontend for Tauri.
 
-最低限必要な機能:
+- `index.html`: layout
+- `styles.css`: styles
+- `app.js`: Tauri command calls
 
-- ピッチ、Index、ゲインなどのリアルタイム設定
-- モデル選択（RVC本体 / RMVPE）
-- レベルメータ表示（RMS / Peak）
-- エンジン開始/停止
+## Features
 
-Rust 側コマンドは `apps/tauri/src-tauri/src/main.rs` で公開済みです。
+- Configure model paths (RVC / HuBERT / RMVPE / Index)
+- Configure RuntimeConfig (gain, pitch shift, sample rate, block size)
+- Start / stop engine
+- Show level meter (RMS / Peak)

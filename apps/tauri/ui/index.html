@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rust VC</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Rust VC</h1>
+        <p class="sub">Minimum prototype UI</p>
+      </header>
+
+      <section class="card">
+        <h2>Model</h2>
+        <label>RVC model path</label>
+        <input id="modelPath" type="text" placeholder="model/model.onnx" />
+        <label>HuBERT path (optional)</label>
+        <input id="hubertPath" type="text" placeholder="model/hubert.onnx" />
+        <label>RMVPE path (optional)</label>
+        <input id="rmvpePath" type="text" placeholder="model/rmvpe.onnx" />
+        <label>Index path (optional)</label>
+        <input id="indexPath" type="text" placeholder="model/feature.index" />
+      </section>
+
+      <section class="card">
+        <h2>Runtime</h2>
+        <div class="grid">
+          <div>
+            <label>Input Gain</label>
+            <input id="inputGain" type="number" step="0.1" />
+          </div>
+          <div>
+            <label>Output Gain</label>
+            <input id="outputGain" type="number" step="0.1" />
+          </div>
+          <div>
+            <label>Pitch Shift (semitones)</label>
+            <input id="pitchShift" type="number" step="1" />
+          </div>
+          <div>
+            <label>Index Rate</label>
+            <input id="indexRate" type="number" step="0.05" min="0" max="1" />
+          </div>
+          <div>
+            <label>Speaker ID</label>
+            <input id="speakerId" type="number" step="1" />
+          </div>
+          <div>
+            <label>Sample Rate</label>
+            <input id="sampleRate" type="number" step="1000" />
+          </div>
+          <div>
+            <label>Block Size</label>
+            <input id="blockSize" type="number" step="16" />
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Engine</h2>
+        <div class="actions">
+          <button id="reloadBtn">Reload</button>
+          <button id="saveBtn">Save Config</button>
+          <button id="startBtn" class="primary">Start</button>
+          <button id="stopBtn">Stop</button>
+        </div>
+        <p id="statusLine">status: idle</p>
+        <p id="levelLine">input level: rms 0.0000 / peak 0.0000</p>
+        <p id="messageLine" class="message"></p>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
