@@ -1,27 +1,40 @@
-# Rust-VC
+﻿# Rust-VC
 
-Rustだけで、リアルタイムのボイスチェンジャー�E�EVC系�E�を動かすため�E実験用ワークスペ�Eスです、E 
-「Python依存を減らして、推論�E音声処琁E�EUI連携をRust側に寁E��る」ことを主眼にしてぁE��す、E
-## こ�Eリポジトリで目持E��てぁE��こと
+Rustだけでリアルタイムのボイスチェンジャー（RVC系）を動かすためのプロジェクトです。
+Python依存を減らし、推論・音声処理・UI連携をRust側に集約することを目的にしています。
 
-- 推論エンジンの脱Python�E�Eort` + ONNX Runtime�E�E- 音声処琁E��型安�EなRustクレートで実裁E- Tauri経由でUIからリアルタイム制御
+## 目的
 
-## ぁE��の構�E
+- 推論エンジンの脱Python（`ort` + ONNX Runtime）
+- 音声処理を型安全なRustクレートで実装
+- Tauri経由でUIからリアルタイム制御
+
+## 構成
 
 - `crates/vc-core`
-  - 設定型、エラー型、`VoiceChanger` パイプラインの共通層
+  - 設定型、エラー型、`VoiceChanger` の共通層
 - `crates/vc-inference`
-  - ONNXモチE��を読み込んで推論する層�E�ERvcOrtEngine`�E�E- `crates/vc-signal`
-  - STFT、正規化、リサンプリングなどの信号処琁E��
+  - ONNXモデルのロードと推論（`RvcOrtEngine`）
+- `crates/vc-signal`
+  - STFT、正規化、リサンプリングなどの信号処理
 - `crates/vc-audio`
-  - `cpal` を使った�E出力ストリーム制御とレベルメータ
+  - `cpal` を使った入出力ストリームとレベル監視
 - `apps/tauri/src-tauri`
-  - Tauriコマンド（デバイス列挙・起動停止・状態取得！E
-## 使ぁE���E�現状�E�E
-1. ONNXモチE��を用意して、`RUST_VC_MODEL_PATH` でパスを指宁E2. Tauri側から `start_engine_cmd` を呼び出ぁE3. マイク入力が推論を通ってスピ�Eカーに出力される
+  - Tauriコマンド（デバイス列挙、起動/停止、状態取得）
+
+## Run
+
+1. ONNXモデルを配置し、必要なら `RUST_VC_MODEL_PATH` を設定
+2. Tauri側から `start_engine_cmd` を呼び出す
+3. マイク入力が推論を通ってスピーカーへ出力される
 
 補足:
-- 環墁E��数未設定時は `model/model.onnx` を参照しまぁE- 現在は「動く�Eロトタイプ」を優先した実裁E��ぁE
-## これから詰めるポインチE
-1. RVC本体に合わせた前後�E琁E��テンソル形状・特徴量�E琁E���E精緻匁E2. レイチE��シ最適化（バチE��ァ戦略・ブロチE��サイズ調整�E�E3. UIからのモチE��刁E��替えと詳細パラメータ制御
-4. 異常系の扱ぁE��デバイス刁E��、推論失敗時のリカバリ�E�E
+- 環境変数未設定時は `model/model.onnx` を参照します
+- 現状は「動くプロトタイプ」を優先した実装です
+
+## Todo
+
+1. RVC本体仕様に合わせた前後処理の精緻化
+2. レイテンシ最適化（バッファ戦略、ブロックサイズ調整）
+3. UIからのモデル切り替えと詳細パラメータ制御
+4. 異常系（デバイス切断、推論失敗時）のリカバリ強化
