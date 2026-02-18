@@ -18,8 +18,8 @@ use ort::{
 };
 use vc_core::{InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::{
-    apply_rms_mix, coarse_pitch_from_f0, frame_features_for_rvc, median_filter_pitch_track_inplace,
-    normalize_for_onnx_input, pad_for_rmvpe, postprocess_generated_audio, resample_hq_into,
+    apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace, normalize_for_onnx_input,
+    pad_for_rmvpe, postprocess_generated_audio, resample_hq_into,
     resize_pitch_to_frames, rmvpe_mel_from_audio, RMVPE_SAMPLE_RATE, RVC_HOP_LENGTH,
 };
 
@@ -190,9 +190,9 @@ impl RvcOrtEngine {
             let phone_feature_dim = infer_phone_feature_dim_from_session(&rvc_session);
             eprintln!("[vc-inference] rvc phone_feature_dim={phone_feature_dim}");
             let requirements = infer_rvc_requirements(&rvc_session);
-            if requirements.needs_phone_features && hubert_session.is_none() {
+            if hubert_session.is_none() {
                 return Err(VcError::Config(
-                    "this RVC model requires HuBERT features. set `hubert_path` (e.g. model/hubert.onnx)"
+                    "RVC requires HuBERT/ContentVec features. set `hubert_path` (e.g. model/hubert.onnx)"
                         .to_string(),
                 ));
             }
@@ -329,76 +329,75 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         input_sample_rate: u32,
         target_phone_frames: usize,
     ) -> Result<Array3<f32>> {
-        if self.hubert_session.is_some() {
-            let mut chunk_16k = Vec::<f32>::new();
-            if input_sample_rate == RMVPE_SAMPLE_RATE {
-                chunk_16k.extend_from_slice(normalized);
-            } else {
-                resample_hq_into(
-                    normalized,
-                    input_sample_rate,
-                    RMVPE_SAMPLE_RATE,
-                    &mut chunk_16k,
-                );
-            }
-            if chunk_16k.is_empty() {
-                chunk_16k.push(0.0);
-            }
-
-            let chunk_len_16k = chunk_16k.len();
-            self.hubert_source_history_16k.extend(chunk_16k);
-            let dynamic_ctx = self
-                .hubert_context_samples_16k
-                .max(chunk_len_16k)
-                .min(MAX_HUBERT_CONTEXT_SAMPLES_16K);
-            if self.hubert_source_history_16k.len() > dynamic_ctx {
-                let drop_n = self.hubert_source_history_16k.len() - dynamic_ctx;
-                self.hubert_source_history_16k.drain(0..drop_n);
-            }
-
-            let mut source = vec![0.0_f32; dynamic_ctx];
-            let hist_len = self.hubert_source_history_16k.len().min(dynamic_ctx);
-            let pad_left = dynamic_ctx - hist_len;
-            source[pad_left..].copy_from_slice(
-                &self.hubert_source_history_16k[self.hubert_source_history_16k.len() - hist_len..],
-            );
-
-            let phone = match run_hubert_session_with_len_fallback(
-                self.hubert_session
-                    .as_mut()
-                    .expect("hubert_session checked above"),
-                &source,
-                pad_left,
-                self.phone_feature_dim,
-                self.hubert_output_layer,
-                &mut self.hubert_source_len_fixes,
-            ) {
-                Ok(phone) => phone,
-                Err(err) => {
-                    if !self.try_hubert_runtime_cpu_fallback(&err)? {
-                        return Err(err);
-                    }
-                    run_hubert_session_with_len_fallback(
-                        self.hubert_session
-                            .as_mut()
-                            .expect("hubert_session fallback should exist"),
-                        &source,
-                        pad_left,
-                        self.phone_feature_dim,
-                        self.hubert_output_layer,
-                        &mut self.hubert_source_len_fixes,
-                    )?
-                }
-            };
-            let tail = tail_phone_frames(&phone, target_phone_frames.max(1));
-            return Ok(tail);
+        if self.hubert_session.is_none() {
+            return Err(VcError::Config(
+                "hubert session is unavailable. RVC requires HuBERT/ContentVec phone features; set `hubert_path` to a valid ONNX model."
+                    .to_string(),
+            ));
         }
 
-        Ok(frame_features_for_rvc(
-            normalized,
-            RVC_HOP_LENGTH,
-            self.phone_feature_dim.max(1),
-        ))
+        let mut chunk_16k = Vec::<f32>::new();
+        if input_sample_rate == RMVPE_SAMPLE_RATE {
+            chunk_16k.extend_from_slice(normalized);
+        } else {
+            resample_hq_into(
+                normalized,
+                input_sample_rate,
+                RMVPE_SAMPLE_RATE,
+                &mut chunk_16k,
+            );
+        }
+        if chunk_16k.is_empty() {
+            chunk_16k.push(0.0);
+        }
+
+        let chunk_len_16k = chunk_16k.len();
+        self.hubert_source_history_16k.extend(chunk_16k);
+        let dynamic_ctx = self
+            .hubert_context_samples_16k
+            .max(chunk_len_16k)
+            .min(MAX_HUBERT_CONTEXT_SAMPLES_16K);
+        if self.hubert_source_history_16k.len() > dynamic_ctx {
+            let drop_n = self.hubert_source_history_16k.len() - dynamic_ctx;
+            self.hubert_source_history_16k.drain(0..drop_n);
+        }
+
+        let mut source = vec![0.0_f32; dynamic_ctx];
+        let hist_len = self.hubert_source_history_16k.len().min(dynamic_ctx);
+        let pad_left = dynamic_ctx - hist_len;
+        source[pad_left..].copy_from_slice(
+            &self.hubert_source_history_16k[self.hubert_source_history_16k.len() - hist_len..],
+        );
+
+        let phone = match run_hubert_session_with_len_fallback(
+            self.hubert_session
+                .as_mut()
+                .expect("hubert_session checked above"),
+            &source,
+            pad_left,
+            self.phone_feature_dim,
+            self.hubert_output_layer,
+            &mut self.hubert_source_len_fixes,
+        ) {
+            Ok(phone) => phone,
+            Err(err) => {
+                if !self.try_hubert_runtime_cpu_fallback(&err)? {
+                    return Err(err);
+                }
+                run_hubert_session_with_len_fallback(
+                    self.hubert_session
+                        .as_mut()
+                        .expect("hubert_session fallback should exist"),
+                    &source,
+                    pad_left,
+                    self.phone_feature_dim,
+                    self.hubert_output_layer,
+                    &mut self.hubert_source_len_fixes,
+                )?
+            }
+        };
+        let tail = tail_phone_frames(&phone, target_phone_frames.max(1));
+        Ok(tail)
     }
 
     fn try_hubert_runtime_cpu_fallback(&mut self, cause: &VcError) -> Result<bool> {
@@ -793,22 +792,14 @@ impl InferenceEngine for RvcOrtEngine {
                     *raw = upsample_phone_frames(raw, self.hubert_upsample_factor);
                 }
             }
-            let phone_frames = phone.shape()[1].max(1);
-            let pitch_frames = f0.len().max(1);
-            let frame_count = phone_frames.min(pitch_frames).max(1);
-            if phone_frames != frame_count {
-                phone = resize_phone_frames(&phone, frame_count);
-            }
+            let frame_count = fallback_frames.max(1);
+            phone = align_phone_frames_to_target(&phone, frame_count);
             if let Some(raw) = phone_raw.take() {
-                let raw = if raw.shape()[1] == frame_count {
-                    raw
-                } else {
-                    resize_phone_frames(&raw, frame_count)
-                };
+                let raw = align_phone_frames_to_target(&raw, frame_count);
                 apply_unvoiced_protect(&mut phone, &raw, &f0, config.protect);
             }
 
-            let mut pitchf = resize_pitch_to_frames(&f0, frame_count);
+            let mut pitchf = align_pitch_frames_to_target(&f0, frame_count);
             apply_pitch_shift_inplace(&mut pitchf, config.pitch_shift_semitones);
             let f0_median_radius = config.f0_median_filter_radius;
             if f0_median_radius > 0 {
@@ -931,6 +922,37 @@ fn classify_rvc_input(name: &str) -> Option<RvcInputKind> {
     None
 }
 
+fn fallback_rvc_input_kind(
+    rank: usize,
+    ty: Option<TensorElementType>,
+    name: &str,
+) -> RvcInputKind {
+    if rank == 3 && ty == Some(TensorElementType::Float32) {
+        return RvcInputKind::Phone;
+    }
+    if rank == 2 && ty == Some(TensorElementType::Float32) {
+        return RvcInputKind::PitchF;
+    }
+    if rank == 2 && ty == Some(TensorElementType::Int64) {
+        return RvcInputKind::Pitch;
+    }
+    if rank == 1 && ty == Some(TensorElementType::Int64) {
+        if name.contains("len") {
+            return RvcInputKind::Length;
+        }
+        return RvcInputKind::Sid;
+    }
+    RvcInputKind::Wave
+}
+
+fn classify_rvc_input_with_fallback(
+    name: &str,
+    rank: usize,
+    ty: Option<TensorElementType>,
+) -> RvcInputKind {
+    classify_rvc_input(name).unwrap_or_else(|| fallback_rvc_input_kind(rank, ty, name))
+}
+
 fn tensor_from_audio_rank(rank: usize, samples: &[f32]) -> Result<Tensor<f32>> {
     tensor_from_audio_rank_owned(rank, samples.to_vec())
 }
@@ -993,9 +1015,11 @@ fn infer_rvc_requirements(session: &Session) -> RvcRequirements {
     let mut req = RvcRequirements::default();
     for input in session.inputs() {
         let lname = input.name().to_lowercase();
-        match classify_rvc_input(&lname) {
-            Some(RvcInputKind::Phone) => req.needs_phone_features = true,
-            Some(RvcInputKind::Pitch) | Some(RvcInputKind::PitchF) => req.needs_pitch = true,
+        let rank = input.dtype().tensor_shape().map_or(1, |shape| shape.len());
+        let ty = input.dtype().tensor_type();
+        match classify_rvc_input_with_fallback(&lname, rank, ty) {
+            RvcInputKind::Phone => req.needs_phone_features = true,
+            RvcInputKind::Pitch | RvcInputKind::PitchF => req.needs_pitch = true,
             _ => {}
         }
     }
@@ -1121,36 +1145,43 @@ fn upsample_phone_frames(phone: &Array3<f32>, factor: usize) -> Array3<f32> {
     out
 }
 
-fn resize_phone_frames(phone: &Array3<f32>, target_frames: usize) -> Array3<f32> {
+fn align_phone_frames_to_target(phone: &Array3<f32>, target_frames: usize) -> Array3<f32> {
     let frames = phone.shape()[1].max(1);
     let target = target_frames.max(1);
-    let dims = phone.shape()[2];
-    if target == frames {
+    if frames == target {
         return phone.clone();
     }
+    if frames > target {
+        return tail_phone_frames(phone, target);
+    }
 
+    // Keep temporal alignment by extending the tail frame, instead of time-warp interpolation.
+    let dims = phone.shape()[2];
     let mut out = Array3::<f32>::zeros((1, target, dims));
-    if frames == 1 {
-        for t in 0..target {
-            for c in 0..dims {
-                out[(0, t, c)] = phone[(0, 0, c)];
-            }
+    for t in 0..target {
+        let src_t = t.min(frames - 1);
+        for c in 0..dims {
+            out[(0, t, c)] = phone[(0, src_t, c)];
         }
-        return out;
+    }
+    out
+}
+
+fn align_pitch_frames_to_target(pitch: &[f32], target_frames: usize) -> Vec<f32> {
+    let target = target_frames.max(1);
+    if pitch.is_empty() {
+        return vec![0.0; target];
+    }
+    if pitch.len() == target {
+        return pitch.to_vec();
+    }
+    if pitch.len() > target {
+        return pitch[pitch.len() - target..].to_vec();
     }
 
-    let scale = (frames - 1) as f64 / (target - 1).max(1) as f64;
-    for t in 0..target {
-        let src = t as f64 * scale;
-        let left = src.floor() as usize;
-        let right = (left + 1).min(frames - 1);
-        let frac = (src - left as f64) as f32;
-        for c in 0..dims {
-            let a = phone[(0, left, c)];
-            let b = phone[(0, right, c)];
-            out[(0, t, c)] = a * (1.0 - frac) + b * frac;
-        }
-    }
+    let mut out = pitch.to_vec();
+    let fill = out.last().copied().unwrap_or(0.0);
+    out.resize(target, fill);
     out
 }
 

@@ -403,6 +403,7 @@ fn worker_loop<E>(
         map_model_samples_to_output(io_block_size, model_sample_rate, output_rate);
     let crossfade_samples = default_output_crossfade_samples(output_rate).min(output_step_samples);
     let sola_search_output = sola_search_samples(output_rate);
+    let edge_guard_samples = crossfade_samples.max(sola_search_output / 2);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
     let inference_block_size = io_block_size
@@ -438,13 +439,14 @@ fn worker_loop<E>(
         model_sample_rate,
     );
     eprintln!(
-        "[vc-audio] inference_block_size={} io_block_size={} target_buffer_samples={} process_window_samples={} block_budget_ms={:.2} sola_search_out={}",
+        "[vc-audio] inference_block_size={} io_block_size={} target_buffer_samples={} process_window_samples={} block_budget_ms={:.2} sola_search_out={} edge_guard_out={}",
         inference_block_size,
         io_block_size,
         target_buffer_samples,
         process_window_samples,
         block_budget.as_secs_f64() * 1000.0,
-        sola_search_output
+        sola_search_output,
+        edge_guard_samples
     );
     if target_buffer_samples > process_window_samples {
         if allow_process_window_grow {
@@ -554,9 +556,13 @@ fn worker_loop<E>(
                 &output_source
             };
             let expected_len = output_step_samples.min(output_mono.len().max(1));
+            // Avoid using the very end of each block where non-causal generators are often unstable.
+            let max_guard = output_mono.len().saturating_sub(expected_len);
+            let applied_guard = edge_guard_samples.min(max_guard);
+            let anchor_end = output_mono.len().saturating_sub(applied_guard);
             let tail_span = expected_len.saturating_add(sola_search_output);
-            let tail_start = output_mono.len().saturating_sub(tail_span);
-            let tail = &output_mono[tail_start..];
+            let tail_start = anchor_end.saturating_sub(tail_span);
+            let tail = &output_mono[tail_start..anchor_end];
             let search_limit = tail
                 .len()
                 .saturating_sub(expected_len)

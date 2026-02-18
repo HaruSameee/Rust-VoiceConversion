@@ -102,7 +102,8 @@ pub fn postprocess_generated_audio(samples: &[f32]) -> Vec<f32> {
         return out;
     }
     let gain = if peak > 0.99 { 0.99 / peak } else { 1.0 };
-    // DC blocker + gentle peak limiter. Avoid always-on nonlinear shaping to reduce metallic tone.
+    // DC blocker + safety clip only.
+    // Keep post-process as linear as possible to avoid adding metallic harmonics.
     let mut prev_x = 0.0_f32;
     let mut prev_y = 0.0_f32;
     let hp_alpha = 0.995_f32;
@@ -111,12 +112,7 @@ pub fn postprocess_generated_audio(samples: &[f32]) -> Vec<f32> {
         let y_hp = x - prev_x + hp_alpha * prev_y;
         prev_x = x;
         prev_y = y_hp;
-        let mut v = y_hp;
-        let abs = v.abs();
-        if abs > 0.95 {
-            // Engage soft limiting only near clipping.
-            v = v.signum() * ((2.2_f32 * abs).tanh() / 2.2_f32);
-        }
+        let v = y_hp;
         *s = v.clamp(-0.99, 0.99);
     }
     out
