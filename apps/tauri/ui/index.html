@@ -178,12 +178,12 @@
             <div class="field">
               <label for="ortProvider">推論プロバイダ（ONNX Runtime）</label>
               <select id="ortProvider">
-                <option value="auto">自動（CUDA→DirectML→CPU）</option>
-                <option value="cuda">CUDA (NVIDIA)</option>
-                <option value="directml">DirectML (Windows GPU)</option>
-                <option value="cpu">CPUのみ</option>
+                <option value="cuda">CUDA（推奨 / NVIDIA）</option>
+                <option value="directml">DirectML（対応 / Windows GPU）</option>
+                <option value="auto">自動（環境に応じて選択）</option>
+                <option value="cpu">CPU（非推奨）</option>
               </select>
-              <p class="hint">ノイズや処理落ちが増える場合は切り替えて比較してください。</p>
+              <p class="hint">基本は CUDA 推奨です。CUDA が使えない環境は DirectML を使用し、CPU は検証用途を推奨します。</p>
             </div>
             <div class="field">
               <label for="ortDeviceId">GPUデバイス番号</label>

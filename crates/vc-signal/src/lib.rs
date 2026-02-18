@@ -257,6 +257,61 @@ pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32
     out
 }
 
+pub fn resample_hq_into(samples: &[f32], src_rate: u32, dst_rate: u32, out: &mut Vec<f32>) {
+    out.clear();
+    if samples.is_empty() || src_rate == 0 || dst_rate == 0 {
+        return;
+    }
+    if src_rate == dst_rate {
+        out.extend_from_slice(samples);
+        return;
+    }
+    // Small blocks are cheaper with linear interpolation and practically indistinguishable.
+    if samples.len() < 64 {
+        resample_linear_into(samples, src_rate, dst_rate, out);
+        return;
+    }
+
+    let ratio = dst_rate as f64 / src_rate as f64;
+    let out_len = ((samples.len() as f64) * ratio).round().max(1.0) as usize;
+    out.reserve(out_len.saturating_sub(out.capacity()));
+
+    // Windowed-sinc resampling. This is significantly cleaner than linear interpolation,
+    // especially in downsampling paths (e.g. 48k -> 16k for HuBERT/RMVPE).
+    const HALF_TAPS: isize = 16;
+    let cutoff = (dst_rate.min(src_rate) as f32 / src_rate as f32).clamp(0.01, 1.0);
+    let denom = (HALF_TAPS as f32 + 1.0).max(1.0);
+    let pi = std::f32::consts::PI;
+
+    for i in 0..out_len {
+        let src_pos = i as f64 / ratio;
+        let center = src_pos.floor() as isize;
+        let frac = (src_pos - center as f64) as f32;
+
+        let mut acc = 0.0_f32;
+        let mut wsum = 0.0_f32;
+        for k in -HALF_TAPS..=HALF_TAPS {
+            let idx = center + k;
+            if idx < 0 || idx >= samples.len() as isize {
+                continue;
+            }
+            let x = (k as f32 - frac) * cutoff;
+            let sinc = if x.abs() < 1.0e-6 {
+                1.0
+            } else {
+                let pix = pi * x;
+                pix.sin() / pix
+            };
+            let win_pos = ((k as f32 - frac) / denom).clamp(-1.0, 1.0);
+            let window = 0.5 * (1.0 + (pi * win_pos).cos());
+            let w = cutoff * sinc * window;
+            acc += samples[idx as usize] * w;
+            wsum += w;
+        }
+        out.push(if wsum.abs() > 1.0e-8 { acc / wsum } else { 0.0 });
+    }
+}
+
 pub fn rmvpe_mel_from_audio(samples: &[f32], src_rate: u32) -> RmvpeMelInput {
     if samples.is_empty() {
         return RmvpeMelInput {
@@ -269,7 +324,7 @@ pub fn rmvpe_mel_from_audio(samples: &[f32], src_rate: u32) -> RmvpeMelInput {
     if src_rate == RMVPE_SAMPLE_RATE {
         audio_16k.extend_from_slice(samples);
     } else {
-        resample_linear_into(samples, src_rate, RMVPE_SAMPLE_RATE, &mut audio_16k);
+        resample_hq_into(samples, src_rate, RMVPE_SAMPLE_RATE, &mut audio_16k);
     }
     if audio_16k.is_empty() {
         return RmvpeMelInput {
@@ -574,6 +629,22 @@ mod tests {
     fn resample_linear_changes_length_by_ratio() {
         let x = vec![0.0_f32; 160];
         let y = resample_linear(&x, 16_000, 48_000);
+        assert_eq!(y.len(), 480);
+    }
+
+    #[test]
+    fn resample_hq_identity_when_same_rate() {
+        let x = vec![0.0_f32, 1.0, 0.0, -1.0];
+        let mut y = Vec::new();
+        resample_hq_into(&x, 16_000, 16_000, &mut y);
+        assert_eq!(x, y);
+    }
+
+    #[test]
+    fn resample_hq_changes_length_by_ratio() {
+        let x = vec![0.0_f32; 160];
+        let mut y = Vec::new();
+        resample_hq_into(&x, 16_000, 48_000, &mut y);
         assert_eq!(y.len(), 480);
     }
 

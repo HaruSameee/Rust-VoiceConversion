@@ -224,6 +224,10 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
         ));
         let infer_engine = RvcOrtEngine::new(model, &runtime_config).map_err(|e| e.to_string())?;
         let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());
+        let ort_provider_lc = runtime_config.ort_provider.to_ascii_lowercase();
+        // DirectML/CPU are often sensitive to aggressive context-window growth.
+        // Keep window fixed for stability; allow growth on explicit CUDA.
+        let allow_process_window_grow = ort_provider_lc == "cuda";
         let audio_engine = spawn_voice_changer_stream(
             voice_changer,
             AudioStreamOptions {
@@ -231,6 +235,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
                 block_size: runtime_config.block_size,
                 input_device_name: runtime_config.input_device_name.clone(),
                 output_device_name: runtime_config.output_device_name.clone(),
+                allow_process_window_grow,
                 extra_inference_ms: runtime_config.extra_inference_ms,
                 response_threshold: runtime_config.response_threshold,
                 fade_in_ms: runtime_config.fade_in_ms,
@@ -450,31 +455,90 @@ fn candidate_bases() -> Vec<PathBuf> {
     out
 }
 
+fn prepend_path_dir(dir: &Path) {
+    let dir_str = dir.to_string_lossy().to_string();
+    if dir_str.is_empty() {
+        return;
+    }
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let current_s = current.to_string_lossy().to_string();
+    let exists = current_s
+        .split(';')
+        .any(|p| p.eq_ignore_ascii_case(&dir_str));
+    if exists {
+        return;
+    }
+    let new_path = if current_s.is_empty() {
+        dir_str.clone()
+    } else {
+        format!("{dir_str};{current_s}")
+    };
+    std::env::set_var("PATH", &new_path);
+    log_debug(&format!("prepended DLL search path: {}", dir_str));
+}
+
+fn set_ort_dylib_path(path: &str, source_label: &str) {
+    std::env::set_var("ORT_DYLIB_PATH", path);
+    if let Some(parent) = Path::new(path).parent() {
+        prepend_path_dir(parent);
+    }
+    log_debug(&format!(
+        "ORT_DYLIB_PATH auto-set from {}: {}",
+        source_label, path
+    ));
+}
+
+fn ort_bundle_has_provider_shared(onnxruntime_dll_path: &str) -> bool {
+    let dll_path = Path::new(onnxruntime_dll_path);
+    let Some(dir) = dll_path.parent() else {
+        return false;
+    };
+    dir.join("onnxruntime_providers_shared.dll").exists()
+}
+
 fn ensure_ort_dylib_path() -> Option<String> {
+    let mut incomplete_candidate: Option<String> = None;
+
     if let Ok(current) = std::env::var("ORT_DYLIB_PATH") {
         let p = PathBuf::from(&current);
         if p.exists() {
-            return Some(current);
+            if ort_bundle_has_provider_shared(&current) {
+                return Some(current);
+            }
+            log_debug(&format!(
+                "ORT_DYLIB_PATH points to '{}' but onnxruntime_providers_shared.dll is missing nearby; trying fallback candidates",
+                current
+            ));
+            incomplete_candidate = Some(current);
+        } else {
+            log_debug(&format!(
+                "ORT_DYLIB_PATH is set but not found on disk: {}",
+                current
+            ));
         }
-        log_debug(&format!(
-            "ORT_DYLIB_PATH is set but not found on disk: {}",
-            current
-        ));
     }
 
     if let Some(path) = resolve_existing_path("model/onnxruntime.dll") {
-        std::env::set_var("ORT_DYLIB_PATH", &path);
+        if ort_bundle_has_provider_shared(&path) {
+            set_ort_dylib_path(&path, "model directory");
+            return Some(path);
+        }
         log_debug(&format!(
-            "ORT_DYLIB_PATH auto-set from model directory: {}",
+            "model/onnxruntime.dll found but onnxruntime_providers_shared.dll is missing; skipping model bundle candidate: {}",
             path
         ));
-        return Some(path);
+        incomplete_candidate.get_or_insert(path);
     }
 
     if let Some(path) = find_onnxruntime_dll_via_python() {
-        std::env::set_var("ORT_DYLIB_PATH", &path);
+        set_ort_dylib_path(&path, "python onnxruntime");
+        return Some(path);
+    }
+
+    if let Some(path) = incomplete_candidate {
+        set_ort_dylib_path(&path, "incomplete fallback candidate");
         log_debug(&format!(
-            "ORT_DYLIB_PATH auto-set from python onnxruntime: {}",
+            "using incomplete ORT candidate (fallback): {}. provider startup may fail until runtime DLL bundle is fixed",
             path
         ));
         return Some(path);
@@ -486,15 +550,34 @@ fn ensure_ort_dylib_path() -> Option<String> {
 fn find_onnxruntime_dll_via_python() -> Option<String> {
     let py = r#"import os
 import onnxruntime as ort
-print(os.path.join(os.path.dirname(ort.__file__), "capi", "onnxruntime.dll"))"#;
+print(os.path.join(os.path.dirname(ort.__file__), "capi", "onnxruntime.dll"))
+print(",".join(ort.get_available_providers()))"#;
 
     let output = Command::new("python").args(["-c", py]).output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let candidate = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let candidate = lines.next().unwrap_or("").trim().to_string();
+    let providers_line = lines.next().unwrap_or("").trim().to_string();
     if candidate.is_empty() {
         return None;
+    }
+    if !providers_line.is_empty() {
+        let providers: Vec<String> = providers_line
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let has_gpu = providers.iter().any(|p| {
+            p.eq_ignore_ascii_case("CUDAExecutionProvider")
+                || p.eq_ignore_ascii_case("DmlExecutionProvider")
+        });
+        log_debug(&format!(
+            "python onnxruntime providers={:?} gpu_available={}",
+            providers, has_gpu
+        ));
     }
     if Path::new(&candidate).exists() {
         Some(candidate)

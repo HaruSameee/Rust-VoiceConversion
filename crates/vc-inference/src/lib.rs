@@ -11,7 +11,7 @@ use std::{
 
 use ndarray::{Array1, Array2, Array3};
 use ort::{
-    ep::{self, ExecutionProviderDispatch},
+    ep::{self, ExecutionProvider, ExecutionProviderDispatch},
     session::{builder::GraphOptimizationLevel, Session, SessionInputValue},
     tensor::TensorElementType,
     value::Tensor,
@@ -19,7 +19,7 @@ use ort::{
 use vc_core::{InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::{
     apply_rms_mix, coarse_pitch_from_f0, frame_features_for_rvc, median_filter_pitch_track_inplace,
-    normalize_for_onnx_input, pad_for_rmvpe, postprocess_generated_audio, resample_linear_into,
+    normalize_for_onnx_input, pad_for_rmvpe, postprocess_generated_audio, resample_hq_into,
     resize_pitch_to_frames, rmvpe_mel_from_audio, RMVPE_SAMPLE_RATE, RVC_HOP_LENGTH,
 };
 
@@ -30,6 +30,11 @@ const DEFAULT_RMVPE_THRESHOLD: f32 = 0.03;
 const DEFAULT_BIN_INDEX_DIM: usize = 768;
 static ORT_INIT_FAILED: OnceLock<String> = OnceLock::new();
 static HUBERT_LEN_FIX_CACHE: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+static ORT_PROVIDER_AVAIL_LOGGED: OnceLock<()> = OnceLock::new();
+static ORT_CUDA_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
+static ORT_DML_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
+static ORT_AUTO_CPU_WARN_LOGGED: OnceLock<()> = OnceLock::new();
+static ORT_CUDA_TUNE_LOGGED: OnceLock<()> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 enum OrtProvider {
@@ -44,6 +49,13 @@ struct OrtExecutionConfig {
     provider: OrtProvider,
     device_id: i32,
     gpu_mem_limit_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrtProviderAvailability {
+    cuda: bool,
+    dml: bool,
+    cpu: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +75,8 @@ pub struct RvcOrtEngine {
     hubert_context_samples_16k: usize,
     hubert_output_layer: i64,
     hubert_upsample_factor: usize,
+    hubert_runtime_cpu_fallback_tried: bool,
+    rvc_runtime_cpu_fallback_tried: bool,
     default_pitch_smooth_alpha: f32,
     index_prev_vector: Vec<f32>,
     last_pitch_hz: f32,
@@ -142,7 +156,7 @@ impl RvcOrtEngine {
                         path
                     )));
                 }
-                Some(build_ort_session(
+                Some(build_aux_session_with_cpu_fallback(
                     path,
                     "rmvpe",
                     ort_intra_threads,
@@ -161,7 +175,7 @@ impl RvcOrtEngine {
                         path
                     )));
                 }
-                Some(build_ort_session(
+                Some(build_aux_session_with_cpu_fallback(
                     path,
                     "hubert",
                     ort_intra_threads,
@@ -228,6 +242,8 @@ impl RvcOrtEngine {
                 hubert_context_samples_16k,
                 hubert_output_layer,
                 hubert_upsample_factor,
+                hubert_runtime_cpu_fallback_tried: false,
+                rvc_runtime_cpu_fallback_tried: false,
                 default_pitch_smooth_alpha: pitch_smooth_alpha,
                 index_prev_vector: Vec::new(),
                 last_pitch_hz: 0.0,
@@ -318,7 +334,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             if input_sample_rate == RMVPE_SAMPLE_RATE {
                 chunk_16k.extend_from_slice(normalized);
             } else {
-                resample_linear_into(
+                resample_hq_into(
                     normalized,
                     input_sample_rate,
                     RMVPE_SAMPLE_RATE,
@@ -347,7 +363,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
                 &self.hubert_source_history_16k[self.hubert_source_history_16k.len() - hist_len..],
             );
 
-            let phone = run_hubert_session_with_len_fallback(
+            let phone = match run_hubert_session_with_len_fallback(
                 self.hubert_session
                     .as_mut()
                     .expect("hubert_session checked above"),
@@ -356,7 +372,24 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
                 self.phone_feature_dim,
                 self.hubert_output_layer,
                 &mut self.hubert_source_len_fixes,
-            )?;
+            ) {
+                Ok(phone) => phone,
+                Err(err) => {
+                    if !self.try_hubert_runtime_cpu_fallback(&err)? {
+                        return Err(err);
+                    }
+                    run_hubert_session_with_len_fallback(
+                        self.hubert_session
+                            .as_mut()
+                            .expect("hubert_session fallback should exist"),
+                        &source,
+                        pad_left,
+                        self.phone_feature_dim,
+                        self.hubert_output_layer,
+                        &mut self.hubert_source_len_fixes,
+                    )?
+                }
+            };
             let tail = tail_phone_frames(&phone, target_phone_frames.max(1));
             return Ok(tail);
         }
@@ -366,6 +399,55 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             RVC_HOP_LENGTH,
             self.phone_feature_dim.max(1),
         ))
+    }
+
+    fn try_hubert_runtime_cpu_fallback(&mut self, cause: &VcError) -> Result<bool> {
+        if self.hubert_runtime_cpu_fallback_tried {
+            return Ok(false);
+        }
+        if !is_hubert_cuda_runtime_failure(cause) {
+            return Ok(false);
+        }
+        let Some(path) = self.model.hubert_path.as_deref() else {
+            return Ok(false);
+        };
+        self.hubert_runtime_cpu_fallback_tried = true;
+
+        eprintln!(
+            "[vc-inference] warning: hubert runtime failed on GPU EP; switching hubert session to CPU EP. cause={}",
+            cause
+        );
+
+        let ort_intra_threads = read_env_usize("RUST_VC_ORT_INTRA_THREADS")
+            .unwrap_or_else(default_ort_intra_threads)
+            .max(1);
+        let ort_inter_threads = read_env_usize("RUST_VC_ORT_INTER_THREADS")
+            .unwrap_or(1)
+            .max(1);
+        let ort_parallel_execution = read_env_bool("RUST_VC_ORT_PARALLEL").unwrap_or(false);
+        let cpu_execution = OrtExecutionConfig {
+            provider: OrtProvider::Cpu,
+            device_id: 0,
+            gpu_mem_limit_bytes: None,
+        };
+
+        let cpu_session = build_ort_session(
+            path,
+            "hubert(cpu-fallback)",
+            ort_intra_threads,
+            ort_inter_threads,
+            ort_parallel_execution,
+            &cpu_execution,
+        )
+        .map_err(|e| {
+            VcError::Inference(format!(
+                "hubert runtime GPU failure and CPU fallback session init failed: {e}"
+            ))
+        })?;
+        self.hubert_session = Some(cpu_session);
+        self.hubert_source_len_fixes.clear();
+        eprintln!("[vc-inference] hubert session fallback: using CPU EP");
+        Ok(true)
     }
 
     fn blend_phone_with_index(&mut self, phone: &mut Array3<f32>, config: &RuntimeConfig) {
@@ -396,12 +478,33 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let frames = phone.shape()[1];
         let dims = phone.shape()[2];
         let rows = index.vectors.nrows();
-        let search_rows = if config.index_search_rows == 0 {
+        let mut search_rows = if config.index_search_rows == 0 {
             rows
         } else {
             config.index_search_rows.min(rows)
         }
         .max(top_k);
+        // Lower index influence should also lower search cost.
+        if rate < 1.0 {
+            let scaled = ((search_rows as f32) * rate.max(0.15)).round() as usize;
+            search_rows = scaled.max(top_k).min(rows);
+        }
+        let frame_search_stride = if search_rows >= 4_096 {
+            3
+        } else if search_rows >= 2_048 {
+            2
+        } else {
+            1
+        };
+        let dist_dim_step = if search_rows >= 4_096 {
+            8
+        } else if search_rows >= 2_048 {
+            4
+        } else if search_rows >= 1_024 {
+            2
+        } else {
+            1
+        };
         let stride = (rows / search_rows.max(1)).max(1);
         let mut retrieved = vec![0.0_f32; dims];
         let mut prev_vec = if self.index_prev_vector.len() == dims {
@@ -412,12 +515,20 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let mut has_prev = self.index_prev_vector.len() == dims;
 
         for t in 0..frames {
+            if frame_search_stride > 1 && has_prev && t % frame_search_stride != 0 {
+                for c in 0..dims {
+                    let from_index = prev_vec[c];
+                    let base = phone[(0, t, c)];
+                    phone[(0, t, c)] = base * (1.0 - rate) + from_index * rate;
+                }
+                continue;
+            }
             let mut best = Vec::<(f32, usize)>::with_capacity(top_k);
             let mut scanned = 0usize;
             let mut row = 0usize;
             while row < rows && scanned < search_rows {
                 let mut l2 = 0.0_f32;
-                for c in 0..dims {
+                for c in (0..dims).step_by(dist_dim_step) {
                     let diff = phone[(0, t, c)] - index.vectors[(row, c)];
                     l2 += diff * diff;
                 }
@@ -595,6 +706,51 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let theta = 2.0_f32 * std::f32::consts::PI * u2;
         r * theta.cos()
     }
+
+    fn try_rvc_runtime_cpu_fallback(&mut self, cause: &VcError) -> Result<bool> {
+        if self.rvc_runtime_cpu_fallback_tried {
+            return Ok(false);
+        }
+        if !is_rvc_cuda_runtime_failure(cause) {
+            return Ok(false);
+        }
+        self.rvc_runtime_cpu_fallback_tried = true;
+
+        eprintln!(
+            "[vc-inference] warning: rvc runtime failed on GPU EP; switching rvc session to CPU EP. cause={}",
+            cause
+        );
+
+        let ort_intra_threads = read_env_usize("RUST_VC_ORT_INTRA_THREADS")
+            .unwrap_or_else(default_ort_intra_threads)
+            .max(1);
+        let ort_inter_threads = read_env_usize("RUST_VC_ORT_INTER_THREADS")
+            .unwrap_or(1)
+            .max(1);
+        let ort_parallel_execution = read_env_bool("RUST_VC_ORT_PARALLEL").unwrap_or(false);
+        let cpu_execution = OrtExecutionConfig {
+            provider: OrtProvider::Cpu,
+            device_id: 0,
+            gpu_mem_limit_bytes: None,
+        };
+
+        let cpu_session = build_ort_session(
+            &self.model.model_path,
+            "rvc(cpu-fallback)",
+            ort_intra_threads,
+            ort_inter_threads,
+            ort_parallel_execution,
+            &cpu_execution,
+        )
+        .map_err(|e| {
+            VcError::Inference(format!(
+                "rvc runtime GPU failure and CPU fallback session init failed: {e}"
+            ))
+        })?;
+        self.rvc_session = cpu_session;
+        eprintln!("[vc-inference] rvc session fallback: using CPU EP");
+        Ok(true)
+    }
 }
 
 impl InferenceEngine for RvcOrtEngine {
@@ -673,7 +829,7 @@ impl InferenceEngine for RvcOrtEngine {
                     VcError::Inference(format!("failed to shape waveform as [1,1,T]: {e}"))
                 })?;
 
-            let out = self.run_rvc(
+            let out = match self.run_rvc(
                 &phone,
                 &pitchf,
                 &pitch,
@@ -681,7 +837,23 @@ impl InferenceEngine for RvcOrtEngine {
                 frame_count as i64,
                 &rnd,
                 &wave,
-            )?;
+            ) {
+                Ok(out) => out,
+                Err(err) => {
+                    if !self.try_rvc_runtime_cpu_fallback(&err)? {
+                        return Err(err);
+                    }
+                    self.run_rvc(
+                        &phone,
+                        &pitchf,
+                        &pitch,
+                        config.speaker_id,
+                        frame_count as i64,
+                        &rnd,
+                        &wave,
+                    )?
+                }
+            };
             let mixed = apply_rms_mix(&normalized, &out, config.rms_mix_rate);
             let processed = postprocess_generated_audio(&mixed);
             Ok(match_output_length(&processed, frame.len()))
@@ -1290,6 +1462,39 @@ fn is_hubert_length_compat_error(err: &VcError) -> bool {
             || msg.contains("Invalid input shape"))
 }
 
+fn is_hubert_cuda_runtime_failure(err: &VcError) -> bool {
+    let VcError::Inference(msg) = err else {
+        return false;
+    };
+    let m = msg.to_ascii_lowercase();
+    if !m.contains("hubert") {
+        return false;
+    }
+    is_cuda_kernel_compat_failure_text(&m)
+        || m.contains("onnxruntime_providers_cuda.dll")
+        || (m.contains("cuda") && m.contains("failed"))
+}
+
+fn is_rvc_cuda_runtime_failure(err: &VcError) -> bool {
+    let VcError::Inference(msg) = err else {
+        return false;
+    };
+    let m = msg.to_ascii_lowercase();
+    if !m.contains("rvc inference failed") {
+        return false;
+    }
+    is_cuda_kernel_compat_failure_text(&m)
+        || m.contains("onnxruntime_providers_cuda.dll")
+        || (m.contains("cuda") && m.contains("failed"))
+}
+
+fn is_cuda_kernel_compat_failure_text(message_lc: &str) -> bool {
+    message_lc.contains("no kernel image is available for execution on the device")
+        || message_lc.contains("cudnn_fe failure")
+        || message_lc.contains("cudnn_status_execution_failed_cudart")
+        || message_lc.contains("cudnn failure 5003")
+}
+
 fn decode_rmvpe_output(shape: &[i64], data: &[f32], threshold: f32) -> Result<Vec<f32>> {
     if data.is_empty() {
         return Ok(Vec::new());
@@ -1847,6 +2052,21 @@ fn build_execution_providers(config: &OrtExecutionConfig) -> Vec<ExecutionProvid
         if let Some(limit) = config.gpu_mem_limit_bytes {
             cuda = cuda.with_memory_limit(limit);
         }
+        let conv_algo = resolve_cuda_conv_algorithm();
+        let conv_max_workspace = read_env_bool("RUST_VC_CUDA_CONV_MAX_WORKSPACE").unwrap_or(false);
+        let conv1d_pad_to_nc1d = read_env_bool("RUST_VC_CUDA_CONV1D_PAD_TO_NC1D").unwrap_or(false);
+        let tf32 = read_env_bool("RUST_VC_CUDA_TF32").unwrap_or(false);
+        if ORT_CUDA_TUNE_LOGGED.set(()).is_ok() {
+            eprintln!(
+                "[vc-inference] cuda ep tuning: conv_algo={:?} conv_max_workspace={} conv1d_pad_to_nc1d={} tf32={} (env: RUST_VC_CUDA_CONV_ALGO / RUST_VC_CUDA_CONV_MAX_WORKSPACE / RUST_VC_CUDA_CONV1D_PAD_TO_NC1D / RUST_VC_CUDA_TF32)",
+                conv_algo, conv_max_workspace, conv1d_pad_to_nc1d, tf32
+            );
+        }
+        cuda = cuda
+            .with_conv_algorithm_search(conv_algo)
+            .with_conv_max_workspace(conv_max_workspace)
+            .with_conv1d_pad_to_nc1d(conv1d_pad_to_nc1d)
+            .with_tf32(tf32);
         cuda.build()
     };
     let dml_ep = || {
@@ -1855,11 +2075,74 @@ fn build_execution_providers(config: &OrtExecutionConfig) -> Vec<ExecutionProvid
             .build()
     };
 
+    let availability = detect_ort_provider_availability();
+    if ORT_PROVIDER_AVAIL_LOGGED.set(()).is_ok() {
+        eprintln!(
+            "[vc-inference] ort providers available: cuda={} dml={} cpu={}",
+            availability.cuda, availability.dml, availability.cpu
+        );
+    }
+
     match config.provider {
         OrtProvider::Cpu => vec![ep::CPU::default().build().error_on_failure()],
-        OrtProvider::Cuda => vec![cuda_ep().error_on_failure()],
-        OrtProvider::DirectMl => vec![dml_ep().error_on_failure()],
-        OrtProvider::Auto => vec![cuda_ep().fail_silently(), dml_ep().fail_silently()],
+        OrtProvider::Cuda => {
+            if !availability.cuda {
+                if ORT_CUDA_MISSING_WARN_LOGGED.set(()).is_ok() {
+                    eprintln!(
+                        "[vc-inference] warning: CUDA provider requested but unavailable in current onnxruntime.dll; startup may fail unless GPU-enabled ORT is installed"
+                    );
+                }
+            }
+            vec![cuda_ep().error_on_failure()]
+        }
+        OrtProvider::DirectMl => {
+            if !availability.dml {
+                if ORT_DML_MISSING_WARN_LOGGED.set(()).is_ok() {
+                    eprintln!(
+                        "[vc-inference] warning: DirectML provider requested but unavailable in current onnxruntime.dll; startup may fail unless DirectML-enabled ORT is installed"
+                    );
+                }
+            }
+            vec![dml_ep().error_on_failure()]
+        }
+        OrtProvider::Auto => {
+            let mut eps = Vec::<ExecutionProviderDispatch>::new();
+            if availability.cuda {
+                eps.push(cuda_ep().error_on_failure());
+            }
+            if availability.dml {
+                eps.push(dml_ep().error_on_failure());
+            }
+            if eps.is_empty() {
+                if ORT_AUTO_CPU_WARN_LOGGED.set(()).is_ok() {
+                    eprintln!(
+                        "[vc-inference] warning: Auto provider resolved to CPU only (no CUDA/DML available). For typical RVC realtime, install a GPU-enabled onnxruntime.dll."
+                    );
+                }
+                eps.push(ep::CPU::default().build().error_on_failure());
+            }
+            eps
+        }
+    }
+}
+
+fn detect_ort_provider_availability() -> OrtProviderAvailability {
+    let cuda = ep::CUDA::default().is_available().unwrap_or(false);
+    let dml = ep::DirectML::default().is_available().unwrap_or(false);
+    let cpu = ep::CPU::default().is_available().unwrap_or(true);
+    OrtProviderAvailability { cuda, dml, cpu }
+}
+
+fn resolve_cuda_conv_algorithm() -> ep::cuda::ConvAlgorithmSearch {
+    let raw = std::env::var("RUST_VC_CUDA_CONV_ALGO")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "default".to_string());
+    match raw.as_str() {
+        "exhaustive" | "exh" => ep::cuda::ConvAlgorithmSearch::Exhaustive,
+        "heuristic" | "heu" => ep::cuda::ConvAlgorithmSearch::Heuristic,
+        "default" | "def" | "" => ep::cuda::ConvAlgorithmSearch::Default,
+        _ => ep::cuda::ConvAlgorithmSearch::Default,
     }
 }
 
@@ -1883,11 +2166,135 @@ fn build_ort_session(
         .map_err(|e| VcError::Inference(format!("failed to set {label} execution mode: {e}")))?;
     let eps = build_execution_providers(execution);
     builder = builder.with_execution_providers(eps).map_err(|e| {
-        VcError::Inference(format!("failed to set {label} execution providers: {e}"))
+        let raw = e.to_string();
+        let raw_lc = raw.to_ascii_lowercase();
+        if raw_lc.contains("cublaslt64_12.dll")
+            || (raw_lc.contains("onnxruntime_providers_cuda.dll") && raw_lc.contains("missing"))
+        {
+            let missing = extract_missing_dep_dll_name(&raw)
+                .unwrap_or_else(|| "CUDA runtime DLL".to_string());
+            VcError::Inference(format!(
+                "failed to set {label} execution providers: {raw}. \
+Missing dependency: {missing}. \
+Run scripts\\install_onnxruntime_provider.bat cuda (CUDA12) or cuda11 (legacy CUDA11), then retry. \
+If CUDA is unavailable on this machine, switch ort_provider to directml."
+            ))
+        } else if matches!(execution.provider, OrtProvider::Cuda)
+            && is_cuda_kernel_compat_failure_text(&raw_lc)
+        {
+            VcError::Inference(format!(
+                "failed to set {label} execution providers: {raw}. \
+CUDA kernel compatibility issue detected. \
+Try scripts\\install_onnxruntime_provider.bat cuda11 (legacy CUDA11 feed, recommended for GTX 10xx and older). \
+If your GPU supports CUDA12 + cuDNN9, keep cuda and update NVIDIA driver/runtime."
+            ))
+        } else if raw.contains("onnxruntime_providers_shared.dll") {
+            VcError::Inference(format!(
+                "failed to set {label} execution providers: {raw}. \
+ONNX Runtime DLL bundle is incomplete. \
+Place onnxruntime.dll and onnxruntime*.dll together (onnxruntime_providers_shared.dll is required). \
+On Windows, run scripts\\install_onnxruntime_provider.bat cuda or directml."
+            ))
+        } else {
+            VcError::Inference(format!("failed to set {label} execution providers: {raw}"))
+        }
     })?;
-    builder
-        .commit_from_file(path)
-        .map_err(|e| VcError::Inference(format!("failed to load {label} onnx model {path}: {e}")))
+    builder.commit_from_file(path).map_err(|e| {
+        let raw = e.to_string();
+        let raw_lc = raw.to_ascii_lowercase();
+        if matches!(execution.provider, OrtProvider::Cuda)
+            && is_cuda_kernel_compat_failure_text(&raw_lc)
+        {
+            VcError::Inference(format!(
+                "failed to load {label} onnx model {path}: {raw}. \
+CUDA kernel compatibility issue detected. \
+Try scripts\\install_onnxruntime_provider.bat cuda11 (legacy CUDA11 feed, recommended for GTX 10xx and older). \
+If your GPU supports CUDA12 + cuDNN9, keep cuda and update NVIDIA driver/runtime."
+            ))
+        } else {
+            VcError::Inference(format!("failed to load {label} onnx model {path}: {raw}"))
+        }
+    })
+}
+
+fn build_aux_session_with_cpu_fallback(
+    path: &str,
+    label: &str,
+    intra_threads: usize,
+    inter_threads: usize,
+    parallel_execution: bool,
+    execution: &OrtExecutionConfig,
+) -> Result<Session> {
+    match build_ort_session(
+        path,
+        label,
+        intra_threads,
+        inter_threads,
+        parallel_execution,
+        execution,
+    ) {
+        Ok(session) => Ok(session),
+        Err(primary_err) => {
+            let primary_text = primary_err.to_string();
+            if !should_try_aux_cpu_fallback(execution.provider, &primary_text) {
+                return Err(primary_err);
+            }
+
+            eprintln!(
+                "[vc-inference] warning: {label} session init failed on {:?}; retrying with CPU EP. cause={}",
+                execution.provider, primary_text
+            );
+
+            let mut cpu_execution = *execution;
+            cpu_execution.provider = OrtProvider::Cpu;
+            cpu_execution.gpu_mem_limit_bytes = None;
+
+            match build_ort_session(
+                path,
+                label,
+                intra_threads,
+                inter_threads,
+                parallel_execution,
+                &cpu_execution,
+            ) {
+                Ok(session) => {
+                    eprintln!("[vc-inference] {label} session fallback: using CPU EP");
+                    Ok(session)
+                }
+                Err(cpu_err) => Err(VcError::Inference(format!(
+                    "{label} session init failed on {:?}: {primary_text}; CPU fallback also failed: {cpu_err}",
+                    execution.provider
+                ))),
+            }
+        }
+    }
+}
+
+fn should_try_aux_cpu_fallback(provider: OrtProvider, error_text: &str) -> bool {
+    if matches!(provider, OrtProvider::Cpu) {
+        return false;
+    }
+    let msg = error_text.to_ascii_lowercase();
+    msg.contains("onnxruntime_providers_cuda.dll")
+        || msg.contains("onnxruntime_providers_dml.dll")
+        || msg.contains("cuda")
+        || msg.contains("cudnn")
+        || msg.contains("directml")
+        || msg.contains("providerlibrary::get")
+        || msg.contains("failed to set")
+}
+
+fn extract_missing_dep_dll_name(message: &str) -> Option<String> {
+    let marker = "depends on \"";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('"')?;
+    let dll = rest[..end].trim();
+    if dll.is_empty() {
+        None
+    } else {
+        Some(dll.to_string())
+    }
 }
 
 fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {

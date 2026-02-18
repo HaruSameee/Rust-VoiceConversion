@@ -12,10 +12,12 @@ use std::{
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use vc_core::{InferenceEngine, VoiceChanger};
-use vc_signal::resample_linear_into;
+use vc_signal::resample_hq_into;
 
 const MIN_INFERENCE_BLOCK: usize = 8_192;
-const OUTPUT_CROSSFADE_SAMPLES: usize = 256;
+const MIN_OUTPUT_CROSSFADE_SAMPLES: usize = 256;
+const MAX_OUTPUT_CROSSFADE_SAMPLES: usize = 1_024;
+const SOLA_SEARCH_MS: f32 = 10.0;
 
 pub fn list_input_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
@@ -58,6 +60,7 @@ pub struct AudioStreamOptions {
     pub block_size: usize,
     pub input_device_name: Option<String>,
     pub output_device_name: Option<String>,
+    pub allow_process_window_grow: bool,
     pub extra_inference_ms: u32,
     pub response_threshold: f32,
     pub fade_in_ms: u32,
@@ -101,6 +104,7 @@ where
     let host = cpal::default_host();
     let model_sample_rate = options.model_sample_rate;
     let block_size = options.block_size;
+    let allow_process_window_grow = options.allow_process_window_grow;
     let extra_inference_ms = options.extra_inference_ms;
     let response_threshold = normalize_response_threshold(options.response_threshold);
     let fade_in_ms = options.fade_in_ms;
@@ -128,7 +132,12 @@ where
     let output_channels = output_stream_config.channels as usize;
     let extra_samples =
         ((model_sample_rate as f64) * (extra_inference_ms as f64 / 1000.0)).round() as usize;
-    let inference_block_size = block_size.max(MIN_INFERENCE_BLOCK);
+    let sola_search_output = sola_search_samples(output_rate);
+    let sola_search_model =
+        map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
+    let inference_block_size = block_size
+        .max(MIN_INFERENCE_BLOCK)
+        .saturating_add(sola_search_model);
     let target_buffer_samples = inference_block_size.saturating_add(extra_samples);
     let needed_input_frames = ((target_buffer_samples as f64) * (input_rate as f64)
         / (model_sample_rate as f64))
@@ -143,13 +152,14 @@ where
         input_rate, output_rate, input_channels, output_channels, model_sample_rate, block_size
     );
     eprintln!(
-        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={}",
+        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} allow_window_grow={}",
         input_device.name().unwrap_or_else(|_| "unknown-input".to_string()),
         output_device.name().unwrap_or_else(|_| "unknown-output".to_string()),
         extra_inference_ms,
         response_threshold,
         fade_in_ms,
-        fade_out_ms
+        fade_out_ms,
+        allow_process_window_grow
     );
     eprintln!(
         "[vc-audio] queue_capacity input={} output={} (est_cb={} frames, infer_block={} target_buffer={})",
@@ -159,6 +169,27 @@ where
         inference_block_size,
         target_buffer_samples
     );
+    // Warm up the model before starting audio streams to avoid first-block stalls
+    // (notably large on GPU providers like DirectML during graph compilation).
+    let warmup_input = vec![0.0_f32; inference_block_size.max(MIN_INFERENCE_BLOCK)];
+    let warmup_start = Instant::now();
+    match voice_changer.process_frame(&warmup_input) {
+        Ok(out) => {
+            eprintln!(
+                "[vc-audio] warmup done: in={} out={} elapsed={:.2}ms",
+                warmup_input.len(),
+                out.len(),
+                warmup_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "[vc-audio] warmup failed (continuing): {} elapsed={:.2}ms",
+                err,
+                warmup_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
 
     let (input_tx, input_rx) = sync_channel::<Vec<f32>>(input_queue_capacity);
     let (output_tx, output_rx) = sync_channel::<Vec<f32>>(output_queue_capacity);
@@ -197,6 +228,7 @@ where
             input_rate,
             output_rate,
             output_channels,
+            allow_process_window_grow,
             extra_inference_ms,
             response_threshold,
             fade_in_ms,
@@ -352,6 +384,7 @@ fn worker_loop<E>(
     input_rate: u32,
     output_rate: u32,
     output_channels: usize,
+    allow_process_window_grow: bool,
     extra_inference_ms: u32,
     response_threshold: f32,
     fade_in_ms: u32,
@@ -366,8 +399,24 @@ fn worker_loop<E>(
     let extra_samples =
         ((model_sample_rate as f64) * (extra_inference_ms as f64 / 1000.0)).round() as usize;
     let io_block_size = block_size.max(1);
-    let inference_block_size = io_block_size.max(MIN_INFERENCE_BLOCK);
+    let output_step_samples =
+        map_model_samples_to_output(io_block_size, model_sample_rate, output_rate);
+    let crossfade_samples = default_output_crossfade_samples(output_rate).min(output_step_samples);
+    let sola_search_output = sola_search_samples(output_rate);
+    let sola_search_model =
+        map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
+    let inference_block_size = io_block_size
+        .max(MIN_INFERENCE_BLOCK)
+        .saturating_add(sola_search_model);
     let target_buffer_samples = inference_block_size.saturating_add(extra_samples);
+    let min_process_window_samples = inference_block_size;
+    let process_window_cap = if allow_process_window_grow {
+        target_buffer_samples
+    } else {
+        min_process_window_samples
+    };
+    let mut process_window_samples = min_process_window_samples;
+    let mut smoothed_elapsed_ms = 0.0_f64;
     let mut model_rate_buf = Vec::<f32>::new();
     let mut model_input_queue = VecDeque::<f32>::new();
     let mut model_block = Vec::<f32>::with_capacity(inference_block_size);
@@ -389,12 +438,27 @@ fn worker_loop<E>(
         model_sample_rate,
     );
     eprintln!(
-        "[vc-audio] inference_block_size={} io_block_size={} target_buffer_samples={} block_budget_ms={:.2}",
+        "[vc-audio] inference_block_size={} io_block_size={} target_buffer_samples={} process_window_samples={} block_budget_ms={:.2} sola_search_out={}",
         inference_block_size,
         io_block_size,
         target_buffer_samples,
-        block_budget.as_secs_f64() * 1000.0
+        process_window_samples,
+        block_budget.as_secs_f64() * 1000.0,
+        sola_search_output
     );
+    if target_buffer_samples > process_window_samples {
+        if allow_process_window_grow {
+            eprintln!(
+                "[vc-audio] process_window adaptive start: requested={} start={} (auto-grow when realtime budget allows)",
+                target_buffer_samples, process_window_samples
+            );
+        } else {
+            eprintln!(
+                "[vc-audio] process_window fixed: requested={} using={} (grow disabled for stability)",
+                target_buffer_samples, process_window_samples
+            );
+        }
+    }
     // Prime output queue to cover startup buffering and first inference warm-up.
     let prefill_model_samples = if model_sample_rate != output_rate {
         ((target_buffer_samples.saturating_add(io_block_size) as f64) * output_rate as f64
@@ -419,20 +483,26 @@ fn worker_loop<E>(
         gate.process_block(&mut mono);
 
         if input_rate != model_sample_rate {
-            resample_linear_into(&mono, input_rate, model_sample_rate, &mut model_rate_buf);
+            resample_hq_into(&mono, input_rate, model_sample_rate, &mut model_rate_buf);
             model_input_queue.extend(model_rate_buf.iter().copied());
         } else {
             model_input_queue.extend(mono.iter().copied());
         }
 
-        while model_input_queue.len() >= target_buffer_samples {
+        while model_input_queue.len() >= process_window_samples {
             model_block.clear();
-            model_block.extend(model_input_queue.iter().take(inference_block_size).copied());
+            model_block.extend(
+                model_input_queue
+                    .iter()
+                    .take(process_window_samples)
+                    .copied(),
+            );
             if model_block.len() < io_block_size {
                 break;
             }
             let step_len = io_block_size.min(model_block.len());
-            let step_input = &model_block[..step_len];
+            let step_start = model_block.len().saturating_sub(step_len);
+            let step_input = &model_block[step_start..];
 
             let mut block_peak = 0.0_f32;
             let mut sum_sq = 0.0_f32;
@@ -465,15 +535,15 @@ fn worker_loop<E>(
                 }
             };
 
-            let output_source: Vec<f32> = if model_out.len() >= step_len {
-                model_out[..step_len].to_vec()
+            let output_source: Vec<f32> = if model_out.len() >= process_window_samples {
+                model_out[..process_window_samples].to_vec()
             } else {
                 let mut padded = model_out;
-                padded.resize(step_len, 0.0);
+                padded.resize(process_window_samples, 0.0);
                 padded
             };
             let output_mono: &[f32] = if model_sample_rate != output_rate {
-                resample_linear_into(
+                resample_hq_into(
                     &output_source,
                     model_sample_rate,
                     output_rate,
@@ -483,8 +553,33 @@ fn worker_loop<E>(
             } else {
                 &output_source
             };
-            let mut smoothed_output = output_mono.to_vec();
-            let crossfade = OUTPUT_CROSSFADE_SAMPLES
+            let expected_len = output_step_samples.min(output_mono.len().max(1));
+            let tail_span = expected_len.saturating_add(sola_search_output);
+            let tail_start = output_mono.len().saturating_sub(tail_span);
+            let tail = &output_mono[tail_start..];
+            let search_limit = tail
+                .len()
+                .saturating_sub(expected_len)
+                .min(sola_search_output);
+            let crossfade_for_search = crossfade_samples
+                .min(previous_output_tail.len())
+                .min(tail.len());
+            let mut offset = 0usize;
+            if search_limit > 0 && crossfade_for_search >= 16 {
+                offset = find_best_sola_offset(
+                    &previous_output_tail,
+                    tail,
+                    crossfade_for_search,
+                    search_limit,
+                );
+            }
+            let mut smoothed_output =
+                tail[offset..(offset + expected_len).min(tail.len())].to_vec();
+            if smoothed_output.len() < expected_len {
+                let pad = smoothed_output.last().copied().unwrap_or(0.0);
+                smoothed_output.resize(expected_len, pad);
+            }
+            let crossfade = crossfade_samples
                 .min(smoothed_output.len())
                 .min(previous_output_tail.len());
             if crossfade > 0 {
@@ -496,16 +591,7 @@ fn worker_loop<E>(
                     smoothed_output[i] = a * (1.0 - t) + b * t;
                 }
             }
-            if response_threshold > 0.0 {
-                let gate_ratio = (block_rms / response_threshold).clamp(0.0, 1.0);
-                if gate_ratio < 1.0 {
-                    let gain = gate_ratio * gate_ratio;
-                    for s in &mut smoothed_output {
-                        *s *= gain;
-                    }
-                }
-            }
-            let keep = OUTPUT_CROSSFADE_SAMPLES.min(smoothed_output.len());
+            let keep = crossfade_samples.min(smoothed_output.len());
             previous_output_tail.clear();
             if keep > 0 {
                 previous_output_tail
@@ -534,11 +620,50 @@ fn worker_loop<E>(
                 let _ = model_input_queue.pop_front();
             }
             let elapsed = start.elapsed();
+            let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+            let budget_ms = block_budget.as_secs_f64() * 1000.0;
+            smoothed_elapsed_ms = if smoothed_elapsed_ms <= 0.0 {
+                elapsed_ms
+            } else {
+                smoothed_elapsed_ms * 0.9 + elapsed_ms * 0.1
+            };
+            if process_window_samples > min_process_window_samples
+                && smoothed_elapsed_ms > budget_ms * 1.03
+            {
+                let span = process_window_samples - min_process_window_samples;
+                let shrink = ((span as f32) * 0.30).ceil().max(128.0) as usize;
+                let next = process_window_samples
+                    .saturating_sub(shrink)
+                    .max(min_process_window_samples);
+                if next != process_window_samples {
+                    process_window_samples = next;
+                    eprintln!(
+                        "[vc-audio] process_window auto-shrink: now={} requested={} elapsed={:.2}ms budget={:.2}ms",
+                        process_window_samples, target_buffer_samples, smoothed_elapsed_ms, budget_ms
+                    );
+                }
+            } else if allow_process_window_grow
+                && process_window_samples < process_window_cap
+                && smoothed_elapsed_ms < budget_ms * 0.78
+            {
+                let span = process_window_cap - process_window_samples;
+                let grow = ((span as f32) * 0.12).ceil().max(64.0) as usize;
+                let next = process_window_samples
+                    .saturating_add(grow)
+                    .min(process_window_cap);
+                if next != process_window_samples {
+                    process_window_samples = next;
+                    eprintln!(
+                        "[vc-audio] process_window auto-grow: now={} cap={} elapsed={:.2}ms budget={:.2}ms",
+                        process_window_samples, process_window_cap, smoothed_elapsed_ms, budget_ms
+                    );
+                }
+            }
             if elapsed > block_budget {
                 eprintln!(
                     "[vc-audio] slow block: elapsed={:.2}ms budget={:.2}ms queue={}",
-                    elapsed.as_secs_f64() * 1000.0,
-                    block_budget.as_secs_f64() * 1000.0,
+                    elapsed_ms,
+                    budget_ms,
                     model_input_queue.len()
                 );
             }
@@ -560,9 +685,12 @@ fn worker_loop<E>(
 
 #[derive(Debug, Clone)]
 struct ReactionGate {
-    threshold: f32,
+    threshold_open: f32,
+    threshold_close: f32,
     attack_step: f32,
     release_step: f32,
+    hold_samples: usize,
+    hold_remaining: usize,
     env: f32,
 }
 
@@ -571,10 +699,16 @@ impl ReactionGate {
         let sr = sample_rate.max(1) as f32;
         let attack_samples = ((fade_in_ms as f32 / 1000.0) * sr).max(1.0);
         let release_samples = ((fade_out_ms as f32 / 1000.0) * sr).max(1.0);
+        let open = threshold.clamp(0.0, 1.0);
+        let close = (open * 0.7).clamp(0.0, open);
+        let hold_samples = ((fade_out_ms as f32 / 1000.0) * sr * 0.5).round().max(1.0) as usize;
         Self {
-            threshold: threshold.clamp(0.0, 1.0),
+            threshold_open: open,
+            threshold_close: close,
             attack_step: (1.0 / attack_samples).clamp(0.0001, 1.0),
             release_step: (1.0 / release_samples).clamp(0.00001, 1.0),
+            hold_samples,
+            hold_remaining: 0,
             env: 0.0,
         }
     }
@@ -583,11 +717,30 @@ impl ReactionGate {
         if samples.is_empty() {
             return;
         }
+        let mut sum_sq = 0.0_f32;
         let peak = samples
             .iter()
-            .map(|v| v.abs())
+            .map(|v| {
+                let a = v.abs();
+                sum_sq += v * v;
+                a
+            })
             .fold(0.0_f32, |acc, v| acc.max(v));
-        let open = peak >= self.threshold;
+        let rms = (sum_sq / samples.len() as f32).sqrt();
+        let open_cond = rms >= self.threshold_open || peak >= self.threshold_open * 4.0;
+        let hold_cond = rms >= self.threshold_close || peak >= self.threshold_close * 4.0;
+        let open = if open_cond {
+            self.hold_remaining = self.hold_samples;
+            true
+        } else if hold_cond {
+            self.hold_remaining = self.hold_samples;
+            true
+        } else if self.hold_remaining > 0 {
+            self.hold_remaining = self.hold_remaining.saturating_sub(samples.len());
+            true
+        } else {
+            false
+        };
         for s in samples {
             if open {
                 self.env = (self.env + self.attack_step).min(1.0);
@@ -609,6 +762,80 @@ fn normalize_response_threshold(raw: f32) -> f32 {
         return 10.0_f32.powf(db / 20.0);
     }
     raw.clamp(0.0, 1.0)
+}
+
+fn map_model_samples_to_output(model_samples: usize, model_rate: u32, output_rate: u32) -> usize {
+    if model_rate == 0 || output_rate == 0 {
+        return model_samples.max(1);
+    }
+    ((model_samples as f64) * (output_rate as f64) / (model_rate as f64))
+        .round()
+        .max(1.0) as usize
+}
+
+fn map_output_samples_to_model(output_samples: usize, model_rate: u32, output_rate: u32) -> usize {
+    if model_rate == 0 || output_rate == 0 {
+        return output_samples.max(1);
+    }
+    ((output_samples as f64) * (model_rate as f64) / (output_rate as f64))
+        .ceil()
+        .max(1.0) as usize
+}
+
+fn sola_search_samples(output_rate: u32) -> usize {
+    ((output_rate as f32) * (SOLA_SEARCH_MS / 1000.0))
+        .round()
+        .clamp(128.0, 1_024.0) as usize
+}
+
+fn default_output_crossfade_samples(output_rate: u32) -> usize {
+    ((output_rate as f32) * 0.01).round().clamp(
+        MIN_OUTPUT_CROSSFADE_SAMPLES as f32,
+        MAX_OUTPUT_CROSSFADE_SAMPLES as f32,
+    ) as usize
+}
+
+fn find_best_sola_offset(
+    previous_tail: &[f32],
+    current: &[f32],
+    crossfade: usize,
+    search_limit: usize,
+) -> usize {
+    if crossfade == 0 || previous_tail.len() < crossfade || current.len() < crossfade {
+        return 0;
+    }
+    let prev = &previous_tail[previous_tail.len() - crossfade..];
+    let mut prev_energy = 0.0_f32;
+    for &v in prev {
+        prev_energy += v * v;
+    }
+    if prev_energy <= 1.0e-12 {
+        return 0;
+    }
+
+    let mut best_offset = 0usize;
+    let mut best_score = f32::MIN;
+    for offset in 0..=search_limit {
+        if offset + crossfade > current.len() {
+            break;
+        }
+        let seg = &current[offset..offset + crossfade];
+        let mut dot = 0.0_f32;
+        let mut seg_energy = 0.0_f32;
+        for i in 0..crossfade {
+            dot += prev[i] * seg[i];
+            seg_energy += seg[i] * seg[i];
+        }
+        if seg_energy <= 1.0e-12 {
+            continue;
+        }
+        let score = dot / (prev_energy * seg_energy).sqrt().max(1.0e-8);
+        if score > best_score {
+            best_score = score;
+            best_offset = offset;
+        }
+    }
+    best_offset
 }
 
 fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {

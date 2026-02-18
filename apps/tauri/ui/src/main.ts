@@ -157,6 +157,11 @@ function intAtLeast(value: number, min: number, fallback: number): number {
   return Math.round(atLeast(value, min, fallback));
 }
 
+function clamp(value: number, min: number, max: number, fallback: number): number {
+  const v = finiteOr(value, fallback);
+  return Math.min(max, Math.max(min, v));
+}
+
 function selectedDevice(select: HTMLSelectElement): NullableString {
   const value = select.value.trim();
   return value.length > 0 ? value : null;
@@ -193,10 +198,11 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     protect: atLeast(raw.protect, 0.0, 0.33),
     rmvpe_threshold: atLeast(raw.rmvpe_threshold, 0.0, 0.03),
     pitch_smooth_alpha: atLeast(raw.pitch_smooth_alpha, 0.0, 0.12),
-    rms_mix_rate: atLeast(raw.rms_mix_rate, 0.0, 0.25),
+    // 0.0 = strongest input envelope inheritance, 1.0 = almost disabled.
+    rms_mix_rate: clamp(raw.rms_mix_rate, 0.0, 1.0, 0.2),
     f0_median_filter_radius: intAtLeast(raw.f0_median_filter_radius, 0, 3),
     extra_inference_ms: intAtLeast(raw.extra_inference_ms, 0, 0),
-    response_threshold: finiteOr(raw.response_threshold, 0.02),
+    response_threshold: finiteOr(raw.response_threshold, -50.0),
     fade_in_ms: intAtLeast(raw.fade_in_ms, 0, 15),
     fade_out_ms: intAtLeast(raw.fade_out_ms, 0, 80),
     speaker_id: Math.round(finiteOr(raw.speaker_id, 0)),
@@ -323,6 +329,9 @@ async function saveAll(): Promise<void> {
   if (JSON.stringify(runtimeRaw) !== JSON.stringify(runtime)) {
     log("WARN", "runtime values adjusted", { before: runtimeRaw, after: runtime });
     applyRuntime(runtime);
+  }
+  if (runtime.ort_provider === "cpu") {
+    log("WARN", "CPU provider is not recommended for realtime RVC. Prefer CUDA or DirectML when available.");
   }
   log("INFO", "saveAll begin", { model, runtime });
   await invoke("set_model_config_cmd", { model });
