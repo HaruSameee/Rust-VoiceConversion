@@ -585,6 +585,16 @@ pub fn rmvpe_mel_from_audio_with_resampler(
                     seen
                 );
             }
+        } else if audio_16k_peak >= 0.2 && prelog_max < 0.2 {
+            eprintln!(
+                "[vc-signal] warning: rmvpe mel max seems low for input peak. peak={:.3} rms={:.3e} prelog_max={:.3e} prelog_mean={:.3e} bins={} frames={} (check frontend gain/normalization parity with Python)",
+                audio_16k_peak,
+                audio_16k_rms,
+                prelog_max,
+                prelog_mean,
+                RMVPE_MEL_BINS,
+                frames
+            );
         } else if RMVPE_MEL_SCALE_LOGGED.set(()).is_ok() {
             eprintln!(
                 "[vc-signal] rmvpe mel scale (power): prelog(min={:.3e} max={:.3e} mean={:.3e}) log(min={:.3} max={:.3}) bins={} frames={} rms={:.3e} peak={:.3e}",

@@ -29,6 +29,7 @@ use vc_signal::{
 
 const DEFAULT_HUBERT_CONTEXT_SAMPLES_16K: usize = 4_000;
 const MAX_HUBERT_CONTEXT_SAMPLES_16K: usize = 64_000;
+const HUBERT_SOURCE_LEN_ALIGN: usize = 320;
 const DEFAULT_RMVPE_THRESHOLD: f32 = 0.03;
 static ORT_INIT_FAILED: OnceLock<String> = OnceLock::new();
 static HUBERT_LEN_FIX_CACHE: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
@@ -454,6 +455,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         source[pad_left..].copy_from_slice(
             &self.hubert_source_history_16k[self.hubert_source_history_16k.len() - hist_len..],
         );
+        let (source, pad_left) = align_hubert_source_window(source, pad_left);
 
         let phone = match run_hubert_session_with_len_fallback(
             self.hubert_session
@@ -1552,10 +1554,18 @@ fn hubert_fallback_candidates(requested_len: usize) -> Vec<usize> {
     candidates.push(DEFAULT_HUBERT_CONTEXT_SAMPLES_16K);
     candidates.push(4_096);
     candidates.push(5_201);
-    candidates
-        .into_iter()
-        .filter(|&v| v >= 1_600 && v <= MAX_HUBERT_CONTEXT_SAMPLES_16K)
-        .collect()
+    let mut seen = HashSet::<usize>::new();
+    let mut out = Vec::<usize>::new();
+    for candidate in candidates {
+        let aligned = align_hubert_source_len(candidate);
+        if aligned < 1_600 || aligned > MAX_HUBERT_CONTEXT_SAMPLES_16K {
+            continue;
+        }
+        if seen.insert(aligned) {
+            out.push(aligned);
+        }
+    }
+    out
 }
 
 fn get_global_hubert_len_fix(requested_len: usize) -> Option<usize> {
@@ -1582,7 +1592,7 @@ fn remap_hubert_source_len(
     pad_left: usize,
     target_len: usize,
 ) -> (Vec<f32>, usize) {
-    let target_len = target_len.max(1);
+    let target_len = align_hubert_source_len(target_len.max(1));
     let source_len = source.len().max(1);
     if target_len == source_len {
         return (source.to_vec(), pad_left.min(target_len));
@@ -1598,6 +1608,27 @@ fn remap_hubert_source_len(
     let mut out = vec![0.0_f32; target_len];
     out.copy_from_slice(&source[drop..]);
     (out, pad_left.saturating_sub(drop))
+}
+
+fn align_hubert_source_len(len: usize) -> usize {
+    if len == 0 {
+        return HUBERT_SOURCE_LEN_ALIGN;
+    }
+    len.div_ceil(HUBERT_SOURCE_LEN_ALIGN) * HUBERT_SOURCE_LEN_ALIGN
+}
+
+fn align_hubert_source_window(source: Vec<f32>, pad_left: usize) -> (Vec<f32>, usize) {
+    if source.is_empty() {
+        return (vec![0.0; HUBERT_SOURCE_LEN_ALIGN], HUBERT_SOURCE_LEN_ALIGN);
+    }
+    let aligned_len = align_hubert_source_len(source.len());
+    if aligned_len == source.len() {
+        return (source, pad_left.min(aligned_len));
+    }
+    let prepend = aligned_len - source.len();
+    let mut out = vec![0.0_f32; aligned_len];
+    out[prepend..].copy_from_slice(&source);
+    (out, (pad_left + prepend).min(aligned_len))
 }
 
 fn is_hubert_length_compat_error(err: &VcError) -> bool {
