@@ -5,7 +5,10 @@ use std::{
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -34,6 +37,7 @@ static ORT_CUDA_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_DML_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_AUTO_CPU_WARN_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_CUDA_TUNE_LOGGED: OnceLock<()> = OnceLock::new();
+static RMVPE_ZERO_F0_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 enum OrtProvider {
@@ -350,6 +354,53 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             VcError::Inference(format!("failed to extract rmvpe output tensor<f32>: {e}"))
         })?;
         let mut f0 = decode_rmvpe_output(shape, data, threshold)?;
+        if !f0.is_empty() && f0.iter().all(|&v| v <= 0.0) && threshold > 0.0 {
+            // Avoid forcing voiced F0 from pure noise floor.
+            // Keep fallback floor at 0.01 instead of 0.0.
+            let fallback_floor = 0.01_f32;
+            let retry_thresholds = [
+                (threshold * 0.5).max(fallback_floor),
+                (threshold * 0.25).max(fallback_floor),
+                fallback_floor,
+            ];
+            let total = f0.len().max(1);
+            let min_voiced = (total / 16).max(2);
+            let mut best_f0: Option<Vec<f32>> = None;
+            let mut best_voiced = 0usize;
+            let mut best_th = threshold;
+            for &retry_th in &retry_thresholds {
+                if retry_th >= threshold {
+                    continue;
+                }
+                let retry = decode_rmvpe_output(shape, data, retry_th)?;
+                let voiced = retry.iter().filter(|&&v| v > 0.0).count();
+                if voiced > best_voiced {
+                    best_voiced = voiced;
+                    best_th = retry_th;
+                    best_f0 = Some(retry);
+                }
+            }
+            if best_voiced >= min_voiced {
+                if let Some(best) = best_f0 {
+                    eprintln!(
+                        "[vc-inference] rmvpe threshold fallback: {:.3} -> {:.3} (voiced frames recovered: {} / {}, min_required={})",
+                        threshold,
+                        best_th,
+                        best_voiced,
+                        total,
+                        min_voiced
+                    );
+                    f0 = best;
+                }
+            } else if best_voiced > 0 {
+                eprintln!(
+                    "[vc-inference] rmvpe threshold fallback skipped: sparse voiced recovery {} / {} (< min_required={})",
+                    best_voiced,
+                    total,
+                    min_voiced
+                );
+            }
+        }
         if valid_frames > 0 && f0.len() > valid_frames {
             f0.truncate(valid_frames);
         }
@@ -780,10 +831,10 @@ impl InferenceEngine for RvcOrtEngine {
     fn infer_frame(&mut self, frame: &[f32], config: &RuntimeConfig) -> Result<Vec<f32>> {
         let mut infer = || -> Result<Vec<f32>> {
             let normalized = normalize_for_onnx_input(frame, 0.95);
-            let rmvpe_pad = pad_for_rmvpe(&normalized, RVC_HOP_LENGTH);
+            let rmvpe_hop_at_input = rvc_hop_samples_at_input_rate(config.sample_rate);
+            let rmvpe_pad = pad_for_rmvpe(&normalized, rmvpe_hop_at_input);
             let fallback_frames =
-                (normalized.len() as u64).div_ceil(RVC_HOP_LENGTH as u64) as usize;
-            let fallback_frames = fallback_frames.max(1);
+                rvc_frame_count_from_input_samples(normalized.len(), config.sample_rate);
             let hubert_target_frames =
                 if self.hubert_upsample_factor > 1 && self.hubert_session.is_some() {
                     fallback_frames.div_ceil(self.hubert_upsample_factor)
@@ -802,6 +853,27 @@ impl InferenceEngine for RvcOrtEngine {
                 fallback_frames,
                 rmvpe_threshold,
             )?;
+            let voiced_frames = f0.iter().filter(|&&v| v > 0.0).count();
+            if voiced_frames == 0 {
+                let (in_rms, in_peak) = signal_rms_peak(&normalized);
+                let (pad_rms, pad_peak) = signal_rms_peak(&rmvpe_pad.padded);
+                // Only flag if input energy is non-trivial; pure silence is expected to be unvoiced.
+                if in_rms >= 5.0e-4 || in_peak >= 2.0e-3 {
+                    let seen = RMVPE_ZERO_F0_WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if seen <= 8 || seen % 64 == 0 {
+                        eprintln!(
+                            "[vc-inference] warning: RMVPE returned all-unvoiced frames with non-silent input. in_rms={:.3e} in_peak={:.3e} pad_rms={:.3e} pad_peak={:.3e} frames={} sr={} thr={:.3}",
+                            in_rms,
+                            in_peak,
+                            pad_rms,
+                            pad_peak,
+                            fallback_frames,
+                            config.sample_rate,
+                            rmvpe_threshold
+                        );
+                    }
+                }
+            }
 
             let mut phone =
                 self.extract_phone_features(&normalized, config.sample_rate, hubert_target_frames)?;
@@ -824,6 +896,7 @@ impl InferenceEngine for RvcOrtEngine {
             }
 
             let mut pitchf = align_pitch_frames_to_target(&f0, frame_count);
+            stabilize_sparse_pitch_track(&mut pitchf);
             apply_pitch_shift_inplace(&mut pitchf, config.pitch_shift_semitones);
             let f0_median_radius = config.f0_median_filter_radius;
             if f0_median_radius > 0 {
@@ -908,6 +981,26 @@ fn match_output_length(samples: &[f32], target_len: usize) -> Vec<f32> {
         out.push(samples[left] * (1.0 - frac) + samples[right] * frac);
     }
     out
+}
+
+fn rvc_hop_samples_at_input_rate(input_sample_rate: u32) -> usize {
+    if input_sample_rate == 0 {
+        return RVC_HOP_LENGTH;
+    }
+    let num = (input_sample_rate as u128) * (RVC_HOP_LENGTH as u128);
+    let den = RMVPE_SAMPLE_RATE as u128;
+    (((num + (den / 2)) / den) as usize).max(1)
+}
+
+fn rvc_frame_count_from_input_samples(input_samples: usize, input_sample_rate: u32) -> usize {
+    if input_samples == 0 || input_sample_rate == 0 {
+        return 1;
+    }
+    // RVC hop is defined at 16kHz:
+    // frames = ceil((samples_in * 16000) / (sample_rate_in * hop_16k)).
+    let num = (input_samples as u128) * (RMVPE_SAMPLE_RATE as u128);
+    let den = (input_sample_rate as u128) * (RVC_HOP_LENGTH as u128);
+    (((num + den - 1) / den) as usize).max(1)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2026,6 +2119,73 @@ fn apply_pitch_shift_inplace(f0: &mut [f32], semitones: f32) {
     }
 }
 
+fn stabilize_sparse_pitch_track(pitchf: &mut [f32]) {
+    if pitchf.len() < 3 {
+        return;
+    }
+
+    // Remove isolated 1-frame voiced spikes that tend to produce metallic artifacts.
+    let mut i = 0usize;
+    while i < pitchf.len() {
+        if pitchf[i] <= 0.0 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < pitchf.len() && pitchf[i] > 0.0 {
+            i += 1;
+        }
+        let end = i;
+        let run_len = end - start;
+        if run_len <= 1 {
+            let left_unvoiced = start == 0 || pitchf[start - 1] <= 0.0;
+            let right_unvoiced = end >= pitchf.len() || pitchf[end] <= 0.0;
+            if left_unvoiced && right_unvoiced {
+                pitchf[start] = 0.0;
+            }
+        }
+    }
+
+    // Interpolate tiny unvoiced holes between voiced frames to reduce crackling.
+    let mut j = 0usize;
+    while j < pitchf.len() {
+        if pitchf[j] > 0.0 {
+            j += 1;
+            continue;
+        }
+        let gap_start = j;
+        while j < pitchf.len() && pitchf[j] <= 0.0 {
+            j += 1;
+        }
+        let gap_end = j;
+        if gap_start == 0 || gap_end >= pitchf.len() {
+            continue;
+        }
+        let gap_len = gap_end - gap_start;
+        if gap_len == 0 || gap_len > 2 {
+            continue;
+        }
+        let left = pitchf[gap_start - 1];
+        let right = pitchf[gap_end];
+        if left <= 0.0 || right <= 0.0 {
+            continue;
+        }
+        let ratio = if left > right {
+            left / right.max(1.0e-6)
+        } else {
+            right / left.max(1.0e-6)
+        };
+        if ratio > 2.2 {
+            continue;
+        }
+        let denom = (gap_len + 1) as f32;
+        for k in 0..gap_len {
+            let t = (k + 1) as f32 / denom;
+            pitchf[gap_start + k] = left * (1.0 - t) + right * t;
+        }
+    }
+}
+
 fn smooth_pitch_track(pitchf: &mut [f32], last_pitch_hz: &mut f32, alpha: f32) {
     let a = if alpha.is_finite() && alpha > 0.0 {
         alpha / (1.0 + alpha)
@@ -2345,4 +2505,37 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
         return s.clone();
     }
     "unknown panic payload".to_string()
+}
+
+fn signal_rms_peak(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum_sq = 0.0_f32;
+    let mut peak = 0.0_f32;
+    for &s in samples {
+        sum_sq += s * s;
+        peak = peak.max(s.abs());
+    }
+    ((sum_sq / samples.len() as f32).sqrt(), peak)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rvc_frame_count_from_input_samples, rvc_hop_samples_at_input_rate};
+
+    #[test]
+    fn frame_count_uses_16k_hop_basis_for_48k_input() {
+        // 48k input with 16k-hop(160) equivalence -> 480 samples / frame.
+        assert_eq!(rvc_hop_samples_at_input_rate(48_000), 480);
+        assert_eq!(rvc_frame_count_from_input_samples(8_192, 48_000), 18);
+        assert_eq!(rvc_frame_count_from_input_samples(16_000, 48_000), 34);
+    }
+
+    #[test]
+    fn frame_count_uses_16k_hop_basis_for_44k1_input() {
+        // 44.1k input -> 441 samples / 10ms frame.
+        assert_eq!(rvc_hop_samples_at_input_rate(44_100), 441);
+        assert_eq!(rvc_frame_count_from_input_samples(8_192, 44_100), 19);
+    }
 }

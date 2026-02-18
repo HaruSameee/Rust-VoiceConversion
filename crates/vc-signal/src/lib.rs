@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 use ndarray::{Array2, Array3};
@@ -20,6 +23,8 @@ const HQ_RESAMPLE_PHASES: usize = 512;
 const HQ_DOWNSAMPLE_CUTOFF_GUARD: f32 = 0.96;
 static HQ_RESAMPLE_BANK_CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<HqResampleBank>>>> =
     OnceLock::new();
+static RMVPE_MEL_SCALE_LOGGED: OnceLock<()> = OnceLock::new();
+static RMVPE_MEL_FLOOR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct RmvpeMelInput {
@@ -519,6 +524,7 @@ pub fn rmvpe_mel_from_audio_with_resampler(
             valid_frames: 0,
         };
     }
+    let (audio_16k_rms, audio_16k_peak) = signal_rms_peak(&audio_16k);
 
     let spec = stft_magnitude(&audio_16k, RVC_N_FFT, RVC_HOP_LENGTH);
     let frames = spec.ncols();
@@ -538,13 +544,60 @@ pub fn rmvpe_mel_from_audio_with_resampler(
         8_000.0_f32,
     );
     let mut mel = Array2::<f32>::zeros((RMVPE_MEL_BINS, frames));
+    let mut prelog_min = f32::INFINITY;
+    let mut prelog_max = 0.0_f32;
+    let mut prelog_sum = 0.0_f64;
+    let mut log_min = f32::INFINITY;
+    let mut log_max = f32::NEG_INFINITY;
+    let mut mel_count: usize = 0;
     for m in 0..RMVPE_MEL_BINS {
         for t in 0..frames {
             let mut acc = 0.0_f32;
             for b in 0..bins {
-                acc += mel_bank[(m, b)] * spec[(b, t)];
+                let mag = spec[(b, t)];
+                let power = mag * mag;
+                acc += mel_bank[(m, b)] * power;
             }
-            mel[(m, t)] = acc.max(1e-5).ln();
+            let clamped = acc.max(1e-5);
+            prelog_min = prelog_min.min(clamped);
+            prelog_max = prelog_max.max(clamped);
+            prelog_sum += clamped as f64;
+            let logged = clamped.ln();
+            log_min = log_min.min(logged);
+            log_max = log_max.max(logged);
+            mel_count += 1;
+            mel[(m, t)] = logged;
+        }
+    }
+    if mel_count > 0 {
+        let prelog_mean = (prelog_sum / mel_count as f64) as f32;
+        let all_floor = prelog_max <= 1.0001e-5;
+        if all_floor {
+            let seen = RMVPE_MEL_FLOOR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if seen <= 8 || seen % 64 == 0 {
+                eprintln!(
+                    "[vc-signal] warning: rmvpe mel is floor-only (all {:.1e}); likely near-silence or gated input. src_rate={} len_16k={} rms={:.3e} peak={:.3e} count={}",
+                    1.0e-5_f32,
+                    src_rate,
+                    audio_16k.len(),
+                    audio_16k_rms,
+                    audio_16k_peak,
+                    seen
+                );
+            }
+        } else if RMVPE_MEL_SCALE_LOGGED.set(()).is_ok() {
+            eprintln!(
+                "[vc-signal] rmvpe mel scale (power): prelog(min={:.3e} max={:.3e} mean={:.3e}) log(min={:.3} max={:.3}) bins={} frames={} rms={:.3e} peak={:.3e}",
+                prelog_min,
+                prelog_max,
+                prelog_mean,
+                log_min,
+                log_max,
+                RMVPE_MEL_BINS,
+                frames,
+                audio_16k_rms,
+                audio_16k_peak
+            );
         }
     }
 
@@ -670,49 +723,72 @@ fn mel_filter_bank(
 ) -> Array2<f32> {
     let n_fft = (stft_bins.saturating_sub(1)) * 2;
     let sr = sample_rate as f32;
-    let mel_min = hz_to_mel(fmin.max(0.0));
-    let mel_max = hz_to_mel(fmax.min(sr * 0.5));
+    let mel_min = hz_to_mel_slaney(fmin.max(0.0));
+    let mel_max = hz_to_mel_slaney(fmax.min(sr * 0.5));
 
     let mut mel_points = vec![0.0_f32; mel_bins + 2];
     for (i, v) in mel_points.iter_mut().enumerate() {
         let frac = i as f32 / (mel_bins + 1) as f32;
-        *v = mel_to_hz(mel_min + frac * (mel_max - mel_min));
-    }
-
-    let mut bins = vec![0usize; mel_bins + 2];
-    for (i, hz) in mel_points.iter().copied().enumerate() {
-        let b = ((n_fft + 1) as f32 * hz / sr).floor() as usize;
-        bins[i] = b.min(stft_bins.saturating_sub(1));
+        *v = mel_to_hz_slaney(mel_min + frac * (mel_max - mel_min));
     }
 
     let mut fb = Array2::<f32>::zeros((mel_bins, stft_bins));
+    let mut fft_freqs = vec![0.0_f32; stft_bins];
+    for (i, f) in fft_freqs.iter_mut().enumerate() {
+        *f = sr * (i as f32) / (n_fft as f32);
+    }
     for m in 0..mel_bins {
-        let left = bins[m];
-        let center = bins[m + 1];
-        let right = bins[m + 2];
-        if left >= right {
+        let left_hz = mel_points[m];
+        let center_hz = mel_points[m + 1];
+        let right_hz = mel_points[m + 2];
+        let left_width = (center_hz - left_hz).max(1.0e-12);
+        let right_width = (right_hz - center_hz).max(1.0e-12);
+        if right_hz <= left_hz {
             continue;
         }
-        if center > left {
-            for b in left..center {
-                fb[(m, b)] = (b - left) as f32 / (center - left) as f32;
-            }
+
+        for (b, &freq) in fft_freqs.iter().enumerate() {
+            let lower = (freq - left_hz) / left_width;
+            let upper = (right_hz - freq) / right_width;
+            fb[(m, b)] = lower.min(upper).max(0.0);
         }
-        if right > center {
-            for b in center..right {
-                fb[(m, b)] = (right - b) as f32 / (right - center) as f32;
-            }
+
+        // Match librosa(norm="slaney"):
+        // scale each triangular filter by 2 / (f_right - f_left).
+        let enorm = 2.0_f32 / (right_hz - left_hz).max(1.0e-12);
+        for b in 0..stft_bins {
+            fb[(m, b)] *= enorm;
         }
     }
     fb
 }
 
-fn hz_to_mel(hz: f32) -> f32 {
-    2595.0_f32 * (1.0_f32 + hz / 700.0_f32).log10()
+fn hz_to_mel_slaney(hz: f32) -> f32 {
+    // librosa default (htk=False) / Slaney Auditory Toolbox scale.
+    // piecewise-linear below 1kHz, logarithmic above.
+    let f_sp = 200.0_f32 / 3.0_f32;
+    let min_log_hz = 1_000.0_f32;
+    let min_log_mel = min_log_hz / f_sp;
+    let logstep = (6.4_f32).ln() / 27.0_f32;
+
+    if hz < min_log_hz {
+        hz / f_sp
+    } else {
+        min_log_mel + (hz / min_log_hz).ln() / logstep
+    }
 }
 
-fn mel_to_hz(mel: f32) -> f32 {
-    700.0_f32 * (10.0_f32.powf(mel / 2595.0_f32) - 1.0_f32)
+fn mel_to_hz_slaney(mel: f32) -> f32 {
+    let f_sp = 200.0_f32 / 3.0_f32;
+    let min_log_hz = 1_000.0_f32;
+    let min_log_mel = min_log_hz / f_sp;
+    let logstep = (6.4_f32).ln() / 27.0_f32;
+
+    if mel < min_log_mel {
+        mel * f_sp
+    } else {
+        min_log_hz * ((mel - min_log_mel) * logstep).exp()
+    }
 }
 
 fn align_up(value: usize, align: usize) -> usize {
@@ -720,6 +796,19 @@ fn align_up(value: usize, align: usize) -> usize {
         return value;
     }
     value.div_ceil(align) * align
+}
+
+fn signal_rms_peak(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum_sq = 0.0_f32;
+    let mut peak = 0.0_f32;
+    for &s in samples {
+        sum_sq += s * s;
+        peak = peak.max(s.abs());
+    }
+    ((sum_sq / samples.len() as f32).sqrt(), peak)
 }
 
 fn reflect_pad_center(signal: &[f32], pad: usize) -> Vec<f32> {
@@ -820,5 +909,15 @@ mod tests {
         let f0 = vec![0.0_f32, 50.0, 220.0, 880.0];
         let coarse = coarse_pitch_from_f0(&f0);
         assert!(coarse.iter().all(|v| (1..=255).contains(v)));
+    }
+
+    #[test]
+    fn slaney_mel_known_points_match_librosa_definition() {
+        // librosa(hkt=False) reference points:
+        // 1000 Hz <-> 15 mel
+        let mel_1k = hz_to_mel_slaney(1_000.0);
+        assert!((mel_1k - 15.0).abs() < 1e-4);
+        let hz_15 = mel_to_hz_slaney(15.0);
+        assert!((hz_15 - 1_000.0).abs() < 1e-3);
     }
 }

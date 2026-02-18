@@ -428,6 +428,7 @@ fn worker_loop<E>(
     let mut processed_blocks: u64 = 0;
     let mut silence_skips: u64 = 0;
     let mut last_heartbeat = Instant::now();
+    let mut last_low_queue_warn = Instant::now();
     let block_budget = Duration::from_secs_f64(io_block_size as f64 / model_sample_rate as f64);
     let block_duration_sec = io_block_size as f32 / model_sample_rate.max(1) as f32;
     let silence_hold_blocks = ((fade_out_ms as f32 / 1000.0) / block_duration_sec)
@@ -674,11 +675,28 @@ fn worker_loop<E>(
                     model_input_queue.len()
                 );
             }
+            let queue_ms =
+                model_input_queue.len() as f64 / model_sample_rate.max(1) as f64 * 1000.0;
+            let expected_steady_queue = process_window_samples.saturating_sub(io_block_size);
+            if model_input_queue.len() + 64 < expected_steady_queue
+                && last_low_queue_warn.elapsed() >= Duration::from_secs(1)
+            {
+                eprintln!(
+                    "[vc-audio] low input queue headroom: queue={} (~{:.2}ms) expected_steady={} (~{:.2}ms)",
+                    model_input_queue.len(),
+                    queue_ms,
+                    expected_steady_queue,
+                    expected_steady_queue as f64 / model_sample_rate.max(1) as f64 * 1000.0
+                );
+                last_low_queue_warn = Instant::now();
+            }
             if last_heartbeat.elapsed() >= Duration::from_secs(1) {
                 eprintln!(
-                    "[vc-audio] heartbeat blocks={} queue={} rms={:.4} peak={:.4} silence_skips={}",
+                    "[vc-audio] heartbeat blocks={} queue={} queue_ms={:.2} budget_ms={:.2} rms={:.4} peak={:.4} silence_skips={}",
                     processed_blocks,
                     model_input_queue.len(),
+                    queue_ms,
+                    budget_ms,
                     level_meter.rms(),
                     level_meter.peak(),
                     silence_skips
