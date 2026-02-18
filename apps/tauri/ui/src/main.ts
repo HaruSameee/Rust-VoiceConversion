@@ -35,6 +35,18 @@ interface RuntimeConfig {
   ort_provider: string;
   ort_device_id: number;
   ort_gpu_mem_limit_mb: number;
+  ort_intra_threads: number;
+  ort_inter_threads: number;
+  ort_parallel_execution: boolean;
+  hubert_context_samples_16k: number;
+  hubert_output_layer: number;
+  hubert_upsample_factor: number;
+  cuda_conv_algo: string;
+  cuda_conv_max_workspace: boolean;
+  cuda_conv1d_pad_to_nc1d: boolean;
+  cuda_tf32: boolean;
+  index_bin_dim: number;
+  index_max_vectors: number;
 }
 
 interface AudioDevicesPayload {
@@ -103,6 +115,7 @@ const ui = {
 let statusTimer: number | null = null;
 let lastStatusLogAt = 0;
 let statusPollErrorStreak = 0;
+let runtimeCache: RuntimeConfig | null = null;
 
 function now(): string {
   return new Date().toISOString();
@@ -190,7 +203,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     output_gain: atLeast(raw.output_gain, 0.0, 1.0),
     input_device_name: raw.input_device_name,
     output_device_name: raw.output_device_name,
-    pitch_shift_semitones: finiteOr(raw.pitch_shift_semitones, 0.0),
+    pitch_shift_semitones: clamp(raw.pitch_shift_semitones, -24.0, 24.0, 0.0),
     index_rate: atLeast(raw.index_rate, 0.0, 0.3),
     index_smooth_alpha: atLeast(raw.index_smooth_alpha, 0.0, 0.85),
     index_top_k: intAtLeast(raw.index_top_k, 1, 8),
@@ -212,7 +225,21 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
       ? raw.ort_provider.toLowerCase()
       : "auto",
     ort_device_id: intAtLeast(raw.ort_device_id, 0, 0),
-    ort_gpu_mem_limit_mb: intAtLeast(raw.ort_gpu_mem_limit_mb, 0, 0)
+    ort_gpu_mem_limit_mb: intAtLeast(raw.ort_gpu_mem_limit_mb, 0, 0),
+    ort_intra_threads: Math.round(clamp(raw.ort_intra_threads, 1, 4, 4)),
+    ort_inter_threads: intAtLeast(raw.ort_inter_threads, 1, 1),
+    ort_parallel_execution: Boolean(raw.ort_parallel_execution),
+    hubert_context_samples_16k: intAtLeast(raw.hubert_context_samples_16k, 1600, 4000),
+    hubert_output_layer: Math.round(finiteOr(raw.hubert_output_layer, 12)),
+    hubert_upsample_factor: intAtLeast(raw.hubert_upsample_factor, 1, 2),
+    cuda_conv_algo: ["default", "heuristic", "exhaustive"].includes((raw.cuda_conv_algo ?? "").toLowerCase())
+      ? raw.cuda_conv_algo.toLowerCase()
+      : "default",
+    cuda_conv_max_workspace: Boolean(raw.cuda_conv_max_workspace),
+    cuda_conv1d_pad_to_nc1d: Boolean(raw.cuda_conv1d_pad_to_nc1d),
+    cuda_tf32: Boolean(raw.cuda_tf32),
+    index_bin_dim: intAtLeast(raw.index_bin_dim, 1, 768),
+    index_max_vectors: intAtLeast(raw.index_max_vectors, 0, 0)
   };
 }
 
@@ -226,6 +253,7 @@ function modelFromInputs(): ModelConfig {
 }
 
 function runtimeFromInputs(): RuntimeConfig {
+  const base = runtimeCache;
   return {
     input_gain: Number(ui.inputGain.value),
     output_gain: Number(ui.outputGain.value),
@@ -250,7 +278,19 @@ function runtimeFromInputs(): RuntimeConfig {
     block_size: Number(ui.blockSize.value),
     ort_provider: ui.ortProvider.value,
     ort_device_id: Number(ui.ortDeviceId.value),
-    ort_gpu_mem_limit_mb: Number(ui.ortGpuMemLimitMb.value)
+    ort_gpu_mem_limit_mb: Number(ui.ortGpuMemLimitMb.value),
+    ort_intra_threads: base?.ort_intra_threads ?? 4,
+    ort_inter_threads: base?.ort_inter_threads ?? 1,
+    ort_parallel_execution: base?.ort_parallel_execution ?? false,
+    hubert_context_samples_16k: base?.hubert_context_samples_16k ?? 4000,
+    hubert_output_layer: base?.hubert_output_layer ?? 12,
+    hubert_upsample_factor: base?.hubert_upsample_factor ?? 2,
+    cuda_conv_algo: base?.cuda_conv_algo ?? "default",
+    cuda_conv_max_workspace: base?.cuda_conv_max_workspace ?? false,
+    cuda_conv1d_pad_to_nc1d: base?.cuda_conv1d_pad_to_nc1d ?? false,
+    cuda_tf32: base?.cuda_tf32 ?? false,
+    index_bin_dim: base?.index_bin_dim ?? 768,
+    index_max_vectors: base?.index_max_vectors ?? 0
   };
 }
 
@@ -262,6 +302,7 @@ function applyModel(model: ModelConfig): void {
 }
 
 function applyRuntime(config: RuntimeConfig): void {
+  runtimeCache = config;
   ui.inputGain.value = String(config.input_gain);
   ui.outputGain.value = String(config.output_gain);
   ui.inputDevice.value = config.input_device_name ?? "";
@@ -304,7 +345,7 @@ async function loadAll(): Promise<void> {
   renderDeviceSelect(ui.inputDevice, devices.input_devices, runtime.input_device_name);
   renderDeviceSelect(ui.outputDevice, devices.output_devices, runtime.output_device_name);
   applyModel(model);
-  applyRuntime(runtime);
+  applyRuntime(sanitizeRuntime(runtime));
   applyStatus(status);
   log("INFO", "loadAll done", {
     running: status.running,

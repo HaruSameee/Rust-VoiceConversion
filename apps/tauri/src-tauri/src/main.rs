@@ -78,7 +78,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             inner: Mutex::new(RuntimeState {
-                config: RuntimeConfig::default(),
+                config: default_runtime_config(),
                 model: default_model_config(),
                 running: false,
                 input_level_rms: 0.0,
@@ -124,8 +124,34 @@ fn get_runtime_config_cmd(state: State<'_, AppState>) -> Result<RuntimeConfig, S
 
 #[tauri::command]
 fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> Result<(), String> {
+    let mut config = config;
+    if !config.pitch_shift_semitones.is_finite() {
+        config.pitch_shift_semitones = 0.0;
+    }
+    let clamped_pitch_shift = config.pitch_shift_semitones.clamp(-24.0, 24.0);
+    if (clamped_pitch_shift - config.pitch_shift_semitones).abs() > f32::EPSILON {
+        log_debug(&format!(
+            "set_runtime_config_cmd pitch_shift_semitones clamped: {} -> {}",
+            config.pitch_shift_semitones, clamped_pitch_shift
+        ));
+        config.pitch_shift_semitones = clamped_pitch_shift;
+    }
+    if config.pitch_shift_semitones.abs() >= 6.0 {
+        log_debug(&format!(
+            "warning: large pitch_shift_semitones={:.2} may sound unnatural/high-pitched",
+            config.pitch_shift_semitones
+        ));
+    }
+    let clamped_intra = config.ort_intra_threads.clamp(1, 4);
+    if clamped_intra != config.ort_intra_threads {
+        log_debug(&format!(
+            "set_runtime_config_cmd ort_intra_threads clamped: {} -> {}",
+            config.ort_intra_threads, clamped_intra
+        ));
+        config.ort_intra_threads = clamped_intra;
+    }
     log_debug(&format!(
-        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={}",
+        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
         config.sample_rate,
         config.block_size,
         config.input_device_name,
@@ -134,6 +160,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.response_threshold,
         config.fade_in_ms,
         config.fade_out_ms,
+        config.pitch_shift_semitones,
         config.index_rate,
         config.index_smooth_alpha,
         config.index_top_k,
@@ -145,7 +172,19 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.f0_median_filter_radius,
         config.ort_provider,
         config.ort_device_id,
-        config.ort_gpu_mem_limit_mb
+        config.ort_gpu_mem_limit_mb,
+        config.ort_intra_threads,
+        config.ort_inter_threads,
+        config.ort_parallel_execution,
+        config.hubert_context_samples_16k,
+        config.hubert_output_layer,
+        config.hubert_upsample_factor,
+        config.cuda_conv_algo,
+        config.cuda_conv_max_workspace,
+        config.cuda_conv1d_pad_to_nc1d,
+        config.cuda_tf32,
+        config.index_bin_dim,
+        config.index_max_vectors
     ));
     let mut guard = state.lock_runtime();
     guard.config = config;
@@ -196,7 +235,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             std::env::var("ORT_DYLIB_PATH").ok()
         ));
         log_debug(&format!(
-            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={}",
+            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
             model.model_path,
             model.hubert_path,
             model.pitch_extractor_path,
@@ -209,6 +248,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.response_threshold,
             runtime_config.fade_in_ms,
             runtime_config.fade_out_ms,
+            runtime_config.pitch_shift_semitones,
             runtime_config.index_rate,
             runtime_config.index_smooth_alpha,
             runtime_config.index_top_k,
@@ -220,7 +260,19 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.f0_median_filter_radius,
             runtime_config.ort_provider,
             runtime_config.ort_device_id,
-            runtime_config.ort_gpu_mem_limit_mb
+            runtime_config.ort_gpu_mem_limit_mb,
+            runtime_config.ort_intra_threads,
+            runtime_config.ort_inter_threads,
+            runtime_config.ort_parallel_execution,
+            runtime_config.hubert_context_samples_16k,
+            runtime_config.hubert_output_layer,
+            runtime_config.hubert_upsample_factor,
+            runtime_config.cuda_conv_algo,
+            runtime_config.cuda_conv_max_workspace,
+            runtime_config.cuda_conv1d_pad_to_nc1d,
+            runtime_config.cuda_tf32,
+            runtime_config.index_bin_dim,
+            runtime_config.index_max_vectors
         ));
         let infer_engine = RvcOrtEngine::new(model, &runtime_config).map_err(|e| e.to_string())?;
         let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());
@@ -340,6 +392,115 @@ fn default_model_config() -> ModelConfig {
         "default_model_config model={} hubert={:?} rmvpe={:?} index={:?}",
         cfg.model_path, cfg.hubert_path, cfg.pitch_extractor_path, cfg.index_path
     ));
+    cfg
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.trim().parse::<usize>().ok()
+}
+
+fn env_i64(key: &str) -> Option<i64> {
+    std::env::var(key).ok()?.trim().parse::<i64>().ok()
+}
+
+fn env_i32(key: &str) -> Option<i32> {
+    std::env::var(key).ok()?.trim().parse::<i32>().ok()
+}
+
+fn env_u32(key: &str) -> Option<u32> {
+    std::env::var(key).ok()?.trim().parse::<u32>().ok()
+}
+
+fn env_f32(key: &str) -> Option<f32> {
+    std::env::var(key).ok()?.trim().parse::<f32>().ok()
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn default_runtime_config() -> RuntimeConfig {
+    let mut cfg = RuntimeConfig::default();
+
+    if let Some(v) = std::env::var("RUST_VC_ORT_PROVIDER").ok() {
+        let lc = v.trim().to_ascii_lowercase();
+        if !lc.is_empty() {
+            cfg.ort_provider = lc;
+        }
+    }
+    if let Some(v) = env_i32("RUST_VC_ORT_DEVICE_ID") {
+        cfg.ort_device_id = v.max(0);
+    }
+    if let Some(v) = env_u32("RUST_VC_ORT_GPU_MEM_LIMIT_MB") {
+        cfg.ort_gpu_mem_limit_mb = v;
+    }
+    if let Some(v) = env_usize("RUST_VC_ORT_INTRA_THREADS") {
+        cfg.ort_intra_threads = v.clamp(1, 4);
+    }
+    if let Some(v) = env_usize("RUST_VC_ORT_INTER_THREADS") {
+        cfg.ort_inter_threads = v.max(1);
+    }
+    if let Some(v) = env_bool("RUST_VC_ORT_PARALLEL") {
+        cfg.ort_parallel_execution = v;
+    }
+    if let Some(v) = env_usize("RUST_VC_HUBERT_CONTEXT_16K") {
+        cfg.hubert_context_samples_16k = v.max(1_600);
+    }
+    if let Some(v) = env_i64("RUST_VC_HUBERT_OUTPUT_LAYER") {
+        cfg.hubert_output_layer = v;
+    }
+    if let Some(v) = env_usize("RUST_VC_HUBERT_UPSAMPLE_FACTOR") {
+        cfg.hubert_upsample_factor = v.clamp(1, 4);
+    }
+    if let Some(v) = std::env::var("RUST_VC_CUDA_CONV_ALGO").ok() {
+        let lc = v.trim().to_ascii_lowercase();
+        if !lc.is_empty() {
+            cfg.cuda_conv_algo = lc;
+        }
+    }
+    if let Some(v) = env_bool("RUST_VC_CUDA_CONV_MAX_WORKSPACE") {
+        cfg.cuda_conv_max_workspace = v;
+    }
+    if let Some(v) = env_bool("RUST_VC_CUDA_CONV1D_PAD_TO_NC1D") {
+        cfg.cuda_conv1d_pad_to_nc1d = v;
+    }
+    if let Some(v) = env_bool("RUST_VC_CUDA_TF32") {
+        cfg.cuda_tf32 = v;
+    }
+    if let Some(v) = env_usize("RUST_VC_INDEX_BIN_DIM") {
+        cfg.index_bin_dim = v.max(1);
+    }
+    if let Some(v) = env_usize("RUST_VC_INDEX_MAX_VECTORS") {
+        cfg.index_max_vectors = v;
+    }
+    if let Some(v) = env_f32("RUST_VC_PITCH_SMOOTH_ALPHA") {
+        cfg.pitch_smooth_alpha = v.max(0.0);
+    }
+
+    log_debug(&format!(
+        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+        cfg.ort_provider,
+        cfg.ort_device_id,
+        cfg.ort_gpu_mem_limit_mb,
+        cfg.ort_intra_threads,
+        cfg.ort_inter_threads,
+        cfg.ort_parallel_execution,
+        cfg.hubert_context_samples_16k,
+        cfg.hubert_output_layer,
+        cfg.hubert_upsample_factor,
+        cfg.cuda_conv_algo,
+        cfg.cuda_conv_max_workspace,
+        cfg.cuda_conv1d_pad_to_nc1d,
+        cfg.cuda_tf32,
+        cfg.index_bin_dim,
+        cfg.index_max_vectors
+    ));
+
     cfg
 }
 

@@ -12,7 +12,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use vc_core::{InferenceEngine, VoiceChanger};
-use vc_signal::resample_hq_into;
+use vc_signal::{resample_hq_into, HqResampler};
 
 const MIN_INFERENCE_BLOCK: usize = 8_192;
 const MIN_OUTPUT_CROSSFADE_SAMPLES: usize = 256;
@@ -423,6 +423,8 @@ fn worker_loop<E>(
     let mut model_block = Vec::<f32>::with_capacity(inference_block_size);
     let mut output_rate_buf = Vec::<f32>::new();
     let mut previous_output_tail = Vec::<f32>::new();
+    let input_to_model_resampler = HqResampler::new(input_rate, model_sample_rate);
+    let model_to_output_resampler = HqResampler::new(model_sample_rate, output_rate);
     let mut processed_blocks: u64 = 0;
     let mut silence_skips: u64 = 0;
     let mut last_heartbeat = Instant::now();
@@ -484,8 +486,8 @@ fn worker_loop<E>(
         };
         gate.process_block(&mut mono);
 
-        if input_rate != model_sample_rate {
-            resample_hq_into(&mono, input_rate, model_sample_rate, &mut model_rate_buf);
+        if !input_to_model_resampler.is_identity() {
+            resample_hq_into(&input_to_model_resampler, &mono, &mut model_rate_buf);
             model_input_queue.extend(model_rate_buf.iter().copied());
         } else {
             model_input_queue.extend(mono.iter().copied());
@@ -545,12 +547,7 @@ fn worker_loop<E>(
                 padded
             };
             let output_mono: &[f32] = if model_sample_rate != output_rate {
-                resample_hq_into(
-                    &output_source,
-                    model_sample_rate,
-                    output_rate,
-                    &mut output_rate_buf,
-                );
+                resample_hq_into(&model_to_output_resampler, &output_source, &mut output_rate_buf);
                 &output_rate_buf
             } else {
                 &output_source
@@ -590,11 +587,15 @@ fn worker_loop<E>(
                 .min(previous_output_tail.len());
             if crossfade > 0 {
                 let prev_start = previous_output_tail.len() - crossfade;
+                let inv = 1.0_f32 / (crossfade + 1) as f32;
                 for i in 0..crossfade {
                     let a = previous_output_tail[prev_start + i];
                     let b = smoothed_output[i];
-                    let t = (i + 1) as f32 / (crossfade + 1) as f32;
-                    smoothed_output[i] = a * (1.0 - t) + b * t;
+                    let t = (i + 1) as f32 * inv;
+                    // Equal-power curve (sin/cos) avoids perceived dip at segment seams.
+                    let theta = t * std::f32::consts::FRAC_PI_2;
+                    let (w_b, w_a) = theta.sin_cos();
+                    smoothed_output[i] = a * w_a + b * w_b;
                 }
             }
             let keep = crossfade_samples.min(smoothed_output.len());

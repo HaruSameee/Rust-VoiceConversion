@@ -35,6 +35,18 @@ pub struct RuntimeConfig {
     pub ort_provider: String,
     pub ort_device_id: i32,
     pub ort_gpu_mem_limit_mb: u32,
+    pub ort_intra_threads: usize,
+    pub ort_inter_threads: usize,
+    pub ort_parallel_execution: bool,
+    pub hubert_context_samples_16k: usize,
+    pub hubert_output_layer: i64,
+    pub hubert_upsample_factor: usize,
+    pub cuda_conv_algo: String,
+    pub cuda_conv_max_workspace: bool,
+    pub cuda_conv1d_pad_to_nc1d: bool,
+    pub cuda_tf32: bool,
+    pub index_bin_dim: usize,
+    pub index_max_vectors: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -64,6 +76,25 @@ impl Default for RuntimeConfig {
             ort_provider: "auto".to_string(),
             ort_device_id: 0,
             ort_gpu_mem_limit_mb: 0,
+            ort_intra_threads: default_ort_intra_threads(),
+            ort_inter_threads: 1,
+            ort_parallel_execution: false,
+            hubert_context_samples_16k: 4_000,
+            hubert_output_layer: 12,
+            hubert_upsample_factor: 2,
+            cuda_conv_algo: "default".to_string(),
+            cuda_conv_max_workspace: false,
+            cuda_conv1d_pad_to_nc1d: false,
+            cuda_tf32: false,
+            index_bin_dim: 768,
+            index_max_vectors: 0,
         }
     }
+}
+
+fn default_ort_intra_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(4)
+        .max(1)
 }

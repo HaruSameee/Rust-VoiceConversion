@@ -1,3 +1,8 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
+
 use ndarray::{Array2, Array3};
 use rustfft::{num_complex::Complex32, FftPlanner};
 
@@ -8,6 +13,13 @@ pub const RMVPE_SAMPLE_RATE: u32 = 16_000;
 pub const RMVPE_MEL_BINS: usize = 128;
 pub const RMVPE_MIN_FRAMES: usize = 32;
 pub const RMVPE_FRAME_ALIGN: usize = 32;
+// Favor stopband attenuation in 48k->16k downsampling for HuBERT/RMVPE input quality,
+// while keeping realtime CPU usage reasonable.
+const HQ_RESAMPLE_HALF_TAPS: isize = 60;
+const HQ_RESAMPLE_PHASES: usize = 512;
+const HQ_DOWNSAMPLE_CUTOFF_GUARD: f32 = 0.96;
+static HQ_RESAMPLE_BANK_CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<HqResampleBank>>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct RmvpeMelInput {
@@ -21,6 +33,23 @@ pub struct RmvpePaddedInput {
     pub left_pad: usize,
     pub right_pad: usize,
     pub original_len: usize,
+}
+
+#[derive(Debug)]
+struct HqResampleBank {
+    phases: usize,
+    half_taps: isize,
+    kernel_len: usize,
+    kernels: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HqResampler {
+    src_rate: u32,
+    dst_rate: u32,
+    ratio: f64,
+    integer_downsample_step: Option<usize>,
+    bank: Option<Arc<HqResampleBank>>,
 }
 
 pub fn normalize_peak(samples: &mut [f32], target_peak: f32) {
@@ -138,15 +167,31 @@ pub fn apply_rms_mix(input: &[f32], output: &[f32], rms_mix_rate: f32) -> Vec<f3
     let mut out = output.to_vec();
     let in_last = (in_len - 1) as f32;
     let out_last = (out_len - 1).max(1) as f32;
+    let src_scale = in_last / out_last;
     let gain_exp = 1.0 - mix;
+    let gain_mode = if gain_exp <= 1.0e-6 {
+        0_u8
+    } else if (gain_exp - 1.0).abs() <= 1.0e-6 {
+        1_u8
+    } else if (gain_exp - 0.5).abs() <= 1.0e-6 {
+        2_u8
+    } else {
+        3_u8
+    };
     for (i, sample) in out.iter_mut().enumerate() {
-        let src_pos = i as f32 * in_last / out_last;
+        let src_pos = i as f32 * src_scale;
         let left = src_pos.floor() as usize;
         let right = (left + 1).min(in_len - 1);
         let frac = src_pos - left as f32;
         let in_rms = in_env[left] * (1.0 - frac) + in_env[right] * frac;
         let out_rms = out_env[i].max(1e-4);
-        let gain = (in_rms / out_rms).clamp(0.1, 10.0).powf(gain_exp);
+        let ratio = (in_rms / out_rms).clamp(0.1, 10.0);
+        let gain = match gain_mode {
+            0 => 1.0,
+            1 => ratio,
+            2 => ratio.sqrt(),
+            _ => ratio.powf(gain_exp),
+        };
         *sample *= gain;
     }
     out
@@ -253,44 +298,162 @@ pub fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32
     out
 }
 
-pub fn resample_hq_into(samples: &[f32], src_rate: u32, dst_rate: u32, out: &mut Vec<f32>) {
-    out.clear();
-    if samples.is_empty() || src_rate == 0 || dst_rate == 0 {
-        return;
+impl HqResampler {
+    pub fn new(src_rate: u32, dst_rate: u32) -> Self {
+        let ratio = if src_rate == 0 {
+            1.0
+        } else {
+            dst_rate as f64 / src_rate as f64
+        };
+        let integer_downsample_step =
+            if src_rate > dst_rate && dst_rate > 0 && src_rate % dst_rate == 0 {
+                Some((src_rate / dst_rate) as usize)
+            } else {
+                None
+            };
+        let bank = if src_rate == 0 || dst_rate == 0 || src_rate == dst_rate {
+            None
+        } else {
+            Some(get_hq_resample_bank(src_rate, dst_rate))
+        };
+        Self {
+            src_rate,
+            dst_rate,
+            ratio,
+            integer_downsample_step,
+            bank,
+        }
     }
-    if src_rate == dst_rate {
-        out.extend_from_slice(samples);
-        return;
-    }
-    // Small blocks are cheaper with linear interpolation and practically indistinguishable.
-    if samples.len() < 64 {
-        resample_linear_into(samples, src_rate, dst_rate, out);
-        return;
+
+    pub fn src_rate(&self) -> u32 {
+        self.src_rate
     }
 
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((samples.len() as f64) * ratio).round().max(1.0) as usize;
-    out.reserve(out_len.saturating_sub(out.capacity()));
+    pub fn dst_rate(&self) -> u32 {
+        self.dst_rate
+    }
 
-    // Windowed-sinc resampling. This is significantly cleaner than linear interpolation,
-    // especially in downsampling paths (e.g. 48k -> 16k for HuBERT/RMVPE).
-    const HALF_TAPS: isize = 16;
-    let cutoff = (dst_rate.min(src_rate) as f32 / src_rate as f32).clamp(0.01, 1.0);
-    let denom = (HALF_TAPS as f32 + 1.0).max(1.0);
-    let pi = std::f32::consts::PI;
+    pub fn is_identity(&self) -> bool {
+        self.src_rate == self.dst_rate
+    }
 
-    for i in 0..out_len {
-        let src_pos = i as f64 / ratio;
-        let center = src_pos.floor() as isize;
-        let frac = (src_pos - center as f64) as f32;
+    fn output_len(&self, input_len: usize) -> usize {
+        ((input_len as f64) * self.ratio).round().max(1.0) as usize
+    }
 
-        let mut acc = 0.0_f32;
-        let mut wsum = 0.0_f32;
-        for k in -HALF_TAPS..=HALF_TAPS {
-            let idx = center + k;
-            if idx < 0 || idx >= samples.len() as isize {
-                continue;
+    pub fn resample_into(&self, samples: &[f32], out: &mut Vec<f32>) {
+        out.clear();
+        if samples.is_empty() || self.src_rate == 0 || self.dst_rate == 0 {
+            return;
+        }
+        if self.is_identity() {
+            out.extend_from_slice(samples);
+            return;
+        }
+        // Never use linear path for downsampling; it aliases without a low-pass.
+        // For tiny upsampling blocks, linear is still acceptable and cheaper.
+        if samples.len() < 64 && self.dst_rate >= self.src_rate {
+            resample_linear_into(samples, self.src_rate, self.dst_rate, out);
+            return;
+        }
+
+        let out_len = self.output_len(samples.len());
+        out.reserve(out_len.saturating_sub(out.capacity()));
+        let bank = self
+            .bank
+            .as_ref()
+            .expect("non-identity resampler should have a filter bank");
+
+        if let Some(step) = self.integer_downsample_step {
+            let phase_base = 0usize;
+            for i in 0..out_len {
+                let center = i.saturating_mul(step) as isize;
+                let mut acc = 0.0_f32;
+                let mut wsum = 0.0_f32;
+                for tap in 0..bank.kernel_len {
+                    let k = tap as isize - bank.half_taps;
+                    let idx = center + k;
+                    if idx < 0 || idx >= samples.len() as isize {
+                        continue;
+                    }
+                    let w = bank.kernels[phase_base + tap];
+                    acc += samples[idx as usize] * w;
+                    wsum += w;
+                }
+                out.push(if wsum.abs() > 1.0e-8 { acc / wsum } else { 0.0 });
             }
+            return;
+        }
+
+        for i in 0..out_len {
+            let src_pos = i as f64 / self.ratio;
+            let center = src_pos.floor() as isize;
+            let frac = (src_pos - center as f64) as f32;
+            let mut phase_idx = (frac * bank.phases as f32).round() as usize;
+            if phase_idx >= bank.phases {
+                phase_idx = bank.phases - 1;
+            }
+            let phase_base = phase_idx * bank.kernel_len;
+
+            let mut acc = 0.0_f32;
+            let mut wsum = 0.0_f32;
+            for tap in 0..bank.kernel_len {
+                let k = tap as isize - bank.half_taps;
+                let idx = center + k;
+                if idx < 0 || idx >= samples.len() as isize {
+                    continue;
+                }
+                let w = bank.kernels[phase_base + tap];
+                acc += samples[idx as usize] * w;
+                wsum += w;
+            }
+            out.push(if wsum.abs() > 1.0e-8 { acc / wsum } else { 0.0 });
+        }
+    }
+}
+
+pub fn resample_hq_into(resampler: &HqResampler, samples: &[f32], out: &mut Vec<f32>) {
+    resampler.resample_into(samples, out);
+}
+
+fn get_hq_resample_bank(src_rate: u32, dst_rate: u32) -> Arc<HqResampleBank> {
+    let cache = HQ_RESAMPLE_BANK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(bank) = guard.get(&(src_rate, dst_rate)) {
+            return Arc::clone(bank);
+        }
+    }
+
+    let built = Arc::new(build_hq_resample_bank(src_rate, dst_rate));
+    if let Ok(mut guard) = cache.lock() {
+        let entry = guard
+            .entry((src_rate, dst_rate))
+            .or_insert_with(|| Arc::clone(&built));
+        return Arc::clone(entry);
+    }
+    built
+}
+
+fn build_hq_resample_bank(src_rate: u32, dst_rate: u32) -> HqResampleBank {
+    let phases = HQ_RESAMPLE_PHASES;
+    let half_taps = HQ_RESAMPLE_HALF_TAPS;
+    let kernel_len = (half_taps * 2 + 1) as usize;
+    let ratio = dst_rate as f32 / src_rate as f32;
+    let cutoff = if ratio < 1.0 {
+        (ratio * HQ_DOWNSAMPLE_CUTOFF_GUARD).clamp(0.01, 1.0)
+    } else {
+        1.0
+    };
+    let denom = (half_taps as f32 + 1.0).max(1.0);
+    let pi = std::f32::consts::PI;
+    let mut kernels = vec![0.0_f32; phases * kernel_len];
+
+    for phase in 0..phases {
+        let frac = phase as f32 / phases as f32;
+        let base = phase * kernel_len;
+        let mut wsum = 0.0_f32;
+        for tap in 0..kernel_len {
+            let k = tap as isize - half_taps;
             let x = (k as f32 - frac) * cutoff;
             let sinc = if x.abs() < 1.0e-6 {
                 1.0
@@ -299,16 +462,39 @@ pub fn resample_hq_into(samples: &[f32], src_rate: u32, dst_rate: u32, out: &mut
                 pix.sin() / pix
             };
             let win_pos = ((k as f32 - frac) / denom).clamp(-1.0, 1.0);
-            let window = 0.5 * (1.0 + (pi * win_pos).cos());
+            // Blackman window: stronger stopband attenuation than Hann.
+            // win_pos is normalized to [-1, 1].
+            let window =
+                0.42 + 0.5 * (pi * win_pos).cos() + 0.08 * (2.0 * pi * win_pos).cos();
             let w = cutoff * sinc * window;
-            acc += samples[idx as usize] * w;
+            kernels[base + tap] = w;
             wsum += w;
         }
-        out.push(if wsum.abs() > 1.0e-8 { acc / wsum } else { 0.0 });
+        if wsum.abs() > 1.0e-8 {
+            for tap in 0..kernel_len {
+                kernels[base + tap] /= wsum;
+            }
+        }
+    }
+
+    HqResampleBank {
+        phases,
+        half_taps,
+        kernel_len,
+        kernels,
     }
 }
 
 pub fn rmvpe_mel_from_audio(samples: &[f32], src_rate: u32) -> RmvpeMelInput {
+    let resampler = HqResampler::new(src_rate, RMVPE_SAMPLE_RATE);
+    rmvpe_mel_from_audio_with_resampler(samples, src_rate, &resampler)
+}
+
+pub fn rmvpe_mel_from_audio_with_resampler(
+    samples: &[f32],
+    src_rate: u32,
+    resampler: &HqResampler,
+) -> RmvpeMelInput {
     if samples.is_empty() {
         return RmvpeMelInput {
             mel: Array3::zeros((1, RMVPE_MEL_BINS, RMVPE_MIN_FRAMES)),
@@ -320,7 +506,12 @@ pub fn rmvpe_mel_from_audio(samples: &[f32], src_rate: u32) -> RmvpeMelInput {
     if src_rate == RMVPE_SAMPLE_RATE {
         audio_16k.extend_from_slice(samples);
     } else {
-        resample_hq_into(samples, src_rate, RMVPE_SAMPLE_RATE, &mut audio_16k);
+        if resampler.src_rate() == src_rate && resampler.dst_rate() == RMVPE_SAMPLE_RATE {
+            resample_hq_into(resampler, samples, &mut audio_16k);
+        } else {
+            let local = HqResampler::new(src_rate, RMVPE_SAMPLE_RATE);
+            resample_hq_into(&local, samples, &mut audio_16k);
+        }
     }
     if audio_16k.is_empty() {
         return RmvpeMelInput {
@@ -369,49 +560,6 @@ pub fn rmvpe_mel_from_audio(samples: &[f32], src_rate: u32) -> RmvpeMelInput {
         mel: out,
         valid_frames: frames,
     }
-}
-
-pub fn frame_features_for_rvc(
-    signal: &[f32],
-    hop_length: usize,
-    feature_dim: usize,
-) -> Array3<f32> {
-    let channels = feature_dim.max(1);
-    if signal.is_empty() || hop_length == 0 {
-        return Array3::zeros((1, 1, channels));
-    }
-
-    let frames = signal.len().div_ceil(hop_length).max(1);
-    let mut out = Array3::<f32>::zeros((1, frames, channels));
-
-    for t in 0..frames {
-        let start = t * hop_length;
-        let end = (start + hop_length).min(signal.len());
-        let frame = &signal[start..end];
-        if frame.is_empty() {
-            continue;
-        }
-
-        let mean_abs = frame.iter().map(|v| v.abs()).sum::<f32>() / frame.len() as f32;
-        let rms = (frame.iter().map(|v| v * v).sum::<f32>() / frame.len() as f32).sqrt();
-        let zcr = frame
-            .windows(2)
-            .filter(|w| (w[0] >= 0.0 && w[1] < 0.0) || (w[0] < 0.0 && w[1] >= 0.0))
-            .count() as f32
-            / frame.len() as f32;
-
-        for c in 0..channels {
-            let v = match c % 4 {
-                0 => mean_abs,
-                1 => rms,
-                2 => zcr,
-                _ => frame[(c / 4) % frame.len()],
-            };
-            out[(0, t, c)] = v;
-        }
-    }
-
-    out
 }
 
 pub fn resize_pitch_to_frames(pitch: &[f32], frames: usize) -> Vec<f32> {
@@ -631,16 +779,18 @@ mod tests {
     #[test]
     fn resample_hq_identity_when_same_rate() {
         let x = vec![0.0_f32, 1.0, 0.0, -1.0];
+        let resampler = HqResampler::new(16_000, 16_000);
         let mut y = Vec::new();
-        resample_hq_into(&x, 16_000, 16_000, &mut y);
+        resample_hq_into(&resampler, &x, &mut y);
         assert_eq!(x, y);
     }
 
     #[test]
     fn resample_hq_changes_length_by_ratio() {
         let x = vec![0.0_f32; 160];
+        let resampler = HqResampler::new(16_000, 48_000);
         let mut y = Vec::new();
-        resample_hq_into(&x, 16_000, 48_000, &mut y);
+        resample_hq_into(&resampler, &x, &mut y);
         assert_eq!(y.len(), 480);
     }
 

@@ -20,14 +20,13 @@ use vc_core::{InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::{
     apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace, normalize_for_onnx_input,
     pad_for_rmvpe, postprocess_generated_audio, resample_hq_into,
-    resize_pitch_to_frames, rmvpe_mel_from_audio, RMVPE_SAMPLE_RATE, RVC_HOP_LENGTH,
+    resize_pitch_to_frames, rmvpe_mel_from_audio, rmvpe_mel_from_audio_with_resampler,
+    HqResampler, RMVPE_SAMPLE_RATE, RVC_HOP_LENGTH,
 };
 
 const DEFAULT_HUBERT_CONTEXT_SAMPLES_16K: usize = 4_000;
 const MAX_HUBERT_CONTEXT_SAMPLES_16K: usize = 64_000;
-const DEFAULT_HUBERT_OUTPUT_LAYER: i64 = 12;
 const DEFAULT_RMVPE_THRESHOLD: f32 = 0.03;
-const DEFAULT_BIN_INDEX_DIM: usize = 768;
 static ORT_INIT_FAILED: OnceLock<String> = OnceLock::new();
 static HUBERT_LEN_FIX_CACHE: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
 static ORT_PROVIDER_AVAIL_LOGGED: OnceLock<()> = OnceLock::new();
@@ -59,6 +58,14 @@ struct OrtProviderAvailability {
 }
 
 #[derive(Debug, Clone)]
+struct OrtCudaTuning {
+    conv_algo: ep::cuda::ConvAlgorithmSearch,
+    conv_max_workspace: bool,
+    conv1d_pad_to_nc1d: bool,
+    tf32: bool,
+}
+
+#[derive(Debug, Clone)]
 struct FeatureIndex {
     vectors: Array2<f32>,
 }
@@ -75,6 +82,11 @@ pub struct RvcOrtEngine {
     hubert_context_samples_16k: usize,
     hubert_output_layer: i64,
     hubert_upsample_factor: usize,
+    input_to_16k_resampler: HqResampler,
+    ort_intra_threads: usize,
+    ort_inter_threads: usize,
+    ort_parallel_execution: bool,
+    ort_cuda_tuning: OrtCudaTuning,
     hubert_runtime_cpu_fallback_tried: bool,
     rvc_runtime_cpu_fallback_tried: bool,
     default_pitch_smooth_alpha: f32,
@@ -101,26 +113,23 @@ impl RvcOrtEngine {
 
         let build_res = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<Self> {
             ort::init().commit();
-            let ort_intra_threads = read_env_usize("RUST_VC_ORT_INTRA_THREADS")
-                .unwrap_or_else(default_ort_intra_threads)
-                .max(1);
-            let ort_inter_threads = read_env_usize("RUST_VC_ORT_INTER_THREADS")
-                .unwrap_or(1)
-                .max(1);
-            let ort_parallel_execution = read_env_bool("RUST_VC_ORT_PARALLEL").unwrap_or(false);
+            let ort_intra_threads = runtime_config.ort_intra_threads.max(1);
+            let ort_inter_threads = runtime_config.ort_inter_threads.max(1);
+            let ort_parallel_execution = runtime_config.ort_parallel_execution;
             let ort_ep = resolve_ort_execution_config(runtime_config);
-            let hubert_context_samples_16k = read_env_usize("RUST_VC_HUBERT_CONTEXT_16K")
-                .unwrap_or(DEFAULT_HUBERT_CONTEXT_SAMPLES_16K)
+            let ort_cuda_tuning = resolve_ort_cuda_tuning(runtime_config);
+            let hubert_context_samples_16k = runtime_config
+                .hubert_context_samples_16k
+                .max(DEFAULT_HUBERT_CONTEXT_SAMPLES_16K)
                 .max(1_600);
-            let hubert_output_layer =
-                read_env_i64("RUST_VC_HUBERT_OUTPUT_LAYER").unwrap_or(DEFAULT_HUBERT_OUTPUT_LAYER);
-            let hubert_upsample_factor = read_env_usize("RUST_VC_HUBERT_UPSAMPLE_FACTOR")
-                .unwrap_or(2)
+            let hubert_output_layer = runtime_config.hubert_output_layer;
+            let hubert_upsample_factor = runtime_config
+                .hubert_upsample_factor
                 .clamp(1, 4);
             let pitch_smooth_alpha = if runtime_config.pitch_smooth_alpha.is_finite() {
                 runtime_config.pitch_smooth_alpha
             } else {
-                read_env_f32("RUST_VC_PITCH_SMOOTH_ALPHA").unwrap_or(0.12)
+                0.12
             }
             .max(0.0);
             eprintln!(
@@ -147,6 +156,7 @@ impl RvcOrtEngine {
                 ort_inter_threads,
                 ort_parallel_execution,
                 &ort_ep,
+                &ort_cuda_tuning,
             )?;
 
             let rmvpe_session = if let Some(path) = model.pitch_extractor_path.as_deref() {
@@ -163,6 +173,7 @@ impl RvcOrtEngine {
                     ort_inter_threads,
                     ort_parallel_execution,
                     &ort_ep,
+                    &ort_cuda_tuning,
                 )?)
             } else {
                 None
@@ -182,6 +193,7 @@ impl RvcOrtEngine {
                     ort_inter_threads,
                     ort_parallel_execution,
                     &ort_ep,
+                    &ort_cuda_tuning,
                 )?)
             } else {
                 None
@@ -218,7 +230,12 @@ impl RvcOrtEngine {
                         eprintln!("[vc-inference] index file not found, disable index: {path}");
                         None
                     } else {
-                        match load_feature_index(path, phone_feature_dim) {
+                        match load_feature_index(
+                            path,
+                            phone_feature_dim,
+                            runtime_config.index_bin_dim.max(1),
+                            runtime_config.index_max_vectors,
+                        ) {
                             Ok(index) => Some(index),
                             Err(e) => {
                                 eprintln!("index disabled: {e}");
@@ -242,6 +259,14 @@ impl RvcOrtEngine {
                 hubert_context_samples_16k,
                 hubert_output_layer,
                 hubert_upsample_factor,
+                input_to_16k_resampler: HqResampler::new(
+                    runtime_config.sample_rate.max(1),
+                    RMVPE_SAMPLE_RATE,
+                ),
+                ort_intra_threads,
+                ort_inter_threads,
+                ort_parallel_execution,
+                ort_cuda_tuning,
                 hubert_runtime_cpu_fallback_tried: false,
                 rvc_runtime_cpu_fallback_tried: false,
                 default_pitch_smooth_alpha: pitch_smooth_alpha,
@@ -292,7 +317,15 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let rank = input_shape.len();
         let expects_mel = rank == 3 && input_shape.get(1).map(|v| *v == 128).unwrap_or(false);
         let (input_tensor, valid_frames) = if expects_mel {
-            let mel_input = rmvpe_mel_from_audio(padded_input, input_sample_rate);
+            let mel_input = if input_sample_rate == self.input_to_16k_resampler.src_rate() {
+                rmvpe_mel_from_audio_with_resampler(
+                    padded_input,
+                    input_sample_rate,
+                    &self.input_to_16k_resampler,
+                )
+            } else {
+                rmvpe_mel_from_audio(padded_input, input_sample_rate)
+            };
             let tensor = Tensor::from_array(mel_input.mel.clone()).map_err(|e| {
                 VcError::Inference(format!("failed to create rmvpe mel tensor [1,128,T]: {e}"))
             })?;
@@ -340,12 +373,14 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         if input_sample_rate == RMVPE_SAMPLE_RATE {
             chunk_16k.extend_from_slice(normalized);
         } else {
-            resample_hq_into(
-                normalized,
-                input_sample_rate,
-                RMVPE_SAMPLE_RATE,
-                &mut chunk_16k,
-            );
+            if input_sample_rate == self.input_to_16k_resampler.src_rate()
+                && self.input_to_16k_resampler.dst_rate() == RMVPE_SAMPLE_RATE
+            {
+                resample_hq_into(&self.input_to_16k_resampler, normalized, &mut chunk_16k);
+            } else {
+                let local = HqResampler::new(input_sample_rate, RMVPE_SAMPLE_RATE);
+                resample_hq_into(&local, normalized, &mut chunk_16k);
+            }
         }
         if chunk_16k.is_empty() {
             chunk_16k.push(0.0);
@@ -417,13 +452,6 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             cause
         );
 
-        let ort_intra_threads = read_env_usize("RUST_VC_ORT_INTRA_THREADS")
-            .unwrap_or_else(default_ort_intra_threads)
-            .max(1);
-        let ort_inter_threads = read_env_usize("RUST_VC_ORT_INTER_THREADS")
-            .unwrap_or(1)
-            .max(1);
-        let ort_parallel_execution = read_env_bool("RUST_VC_ORT_PARALLEL").unwrap_or(false);
         let cpu_execution = OrtExecutionConfig {
             provider: OrtProvider::Cpu,
             device_id: 0,
@@ -433,10 +461,11 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let cpu_session = build_ort_session(
             path,
             "hubert(cpu-fallback)",
-            ort_intra_threads,
-            ort_inter_threads,
-            ort_parallel_execution,
+            self.ort_intra_threads,
+            self.ort_inter_threads,
+            self.ort_parallel_execution,
             &cpu_execution,
+            &self.ort_cuda_tuning,
         )
         .map_err(|e| {
             VcError::Inference(format!(
@@ -506,6 +535,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         };
         let stride = (rows / search_rows.max(1)).max(1);
         let mut retrieved = vec![0.0_f32; dims];
+        let mut best = Vec::<(f32, usize)>::with_capacity(top_k);
         let mut prev_vec = if self.index_prev_vector.len() == dims {
             self.index_prev_vector.clone()
         } else {
@@ -522,7 +552,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
                 }
                 continue;
             }
-            let mut best = Vec::<(f32, usize)>::with_capacity(top_k);
+            best.clear();
             let mut scanned = 0usize;
             let mut row = 0usize;
             while row < rows && scanned < search_rows {
@@ -541,7 +571,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
 
             retrieved.fill(0.0);
             let mut weight_sum = 0.0_f32;
-            for (dist, row) in best {
+            for &(dist, row) in &best {
                 let d = dist.max(1e-12);
                 let w = (1.0 / d) * (1.0 / d);
                 weight_sum += w;
@@ -720,13 +750,6 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             cause
         );
 
-        let ort_intra_threads = read_env_usize("RUST_VC_ORT_INTRA_THREADS")
-            .unwrap_or_else(default_ort_intra_threads)
-            .max(1);
-        let ort_inter_threads = read_env_usize("RUST_VC_ORT_INTER_THREADS")
-            .unwrap_or(1)
-            .max(1);
-        let ort_parallel_execution = read_env_bool("RUST_VC_ORT_PARALLEL").unwrap_or(false);
         let cpu_execution = OrtExecutionConfig {
             provider: OrtProvider::Cpu,
             device_id: 0,
@@ -736,10 +759,11 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let cpu_session = build_ort_session(
             &self.model.model_path,
             "rvc(cpu-fallback)",
-            ort_intra_threads,
-            ort_inter_threads,
-            ort_parallel_execution,
+            self.ort_intra_threads,
+            self.ort_inter_threads,
+            self.ort_parallel_execution,
             &cpu_execution,
+            &self.ort_cuda_tuning,
         )
         .map_err(|e| {
             VcError::Inference(format!(
@@ -1601,7 +1625,12 @@ fn decode_rmvpe_salience_row(row: &[f32], threshold: f32) -> f32 {
     10.0_f32 * 2.0_f32.powf(cents / 1200.0_f32)
 }
 
-fn load_feature_index(path: &str, target_dim: usize) -> Result<FeatureIndex> {
+fn load_feature_index(
+    path: &str,
+    target_dim: usize,
+    bin_index_dim: usize,
+    index_max_vectors: usize,
+) -> Result<FeatureIndex> {
     let ext = Path::new(path)
         .extension()
         .and_then(|s| s.to_str())
@@ -1624,7 +1653,7 @@ fn load_feature_index(path: &str, target_dim: usize) -> Result<FeatureIndex> {
             }
         }
 
-        let (rows, dims, flat) = extract_faiss_vectors_with_python(path)?;
+        let (rows, dims, flat) = extract_faiss_vectors_with_python(path, index_max_vectors)?;
         let index = feature_index_from_flat(rows, dims, flat.clone(), path, target_dim)?;
         if let Err(e) = write_feature_index_cache(&cache_path, rows, dims, &flat) {
             eprintln!(
@@ -1640,13 +1669,17 @@ fn load_feature_index(path: &str, target_dim: usize) -> Result<FeatureIndex> {
         return Ok(index);
     }
     if ext == "bin" || ext == "f32" {
-        return load_feature_index_from_bin(path, target_dim);
+        return load_feature_index_from_bin(path, target_dim, bin_index_dim);
     }
 
     load_feature_index_from_text(path, target_dim)
 }
 
-fn load_feature_index_from_bin(path: &str, target_dim: usize) -> Result<FeatureIndex> {
+fn load_feature_index_from_bin(
+    path: &str,
+    target_dim: usize,
+    bin_index_dim: usize,
+) -> Result<FeatureIndex> {
     let raw = fs::read(path)
         .map_err(|e| VcError::Config(format!("failed to read binary index file ({path}): {e}")))?;
     let flat = decode_f32_le(&raw).map_err(|e| {
@@ -1662,11 +1695,11 @@ fn load_feature_index_from_bin(path: &str, target_dim: usize) -> Result<FeatureI
     let dim = if target_dim > 0 {
         target_dim
     } else {
-        read_env_usize("RUST_VC_INDEX_BIN_DIM").unwrap_or(DEFAULT_BIN_INDEX_DIM)
+        bin_index_dim.max(1)
     };
     if dim == 0 {
         return Err(VcError::Config(
-            "binary index dimension is 0; check RUST_VC_INDEX_BIN_DIM".to_string(),
+            "binary index dimension is 0; check runtime config `index_bin_dim`".to_string(),
         ));
     }
     if flat.len() % dim != 0 {
@@ -1841,8 +1874,10 @@ fn decode_f32_le(raw: &[u8]) -> io::Result<Vec<f32>> {
     Ok(out)
 }
 
-fn extract_faiss_vectors_with_python(index_path: &str) -> Result<(usize, usize, Vec<f32>)> {
-    let max_vectors = read_env_usize("RUST_VC_INDEX_MAX_VECTORS").unwrap_or(0);
+fn extract_faiss_vectors_with_python(
+    index_path: &str,
+    max_vectors: usize,
+) -> Result<(usize, usize, Vec<f32>)> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2014,39 +2049,6 @@ fn smooth_pitch_track(pitchf: &mut [f32], last_pitch_hz: &mut f32, alpha: f32) {
     *last_pitch_hz = last;
 }
 
-fn read_env_usize(key: &str) -> Option<usize> {
-    std::env::var(key).ok()?.trim().parse::<usize>().ok()
-}
-
-fn read_env_i64(key: &str) -> Option<i64> {
-    std::env::var(key).ok()?.trim().parse::<i64>().ok()
-}
-
-fn read_env_i32(key: &str) -> Option<i32> {
-    std::env::var(key).ok()?.trim().parse::<i32>().ok()
-}
-
-fn read_env_f32(key: &str) -> Option<f32> {
-    std::env::var(key).ok()?.trim().parse::<f32>().ok()
-}
-
-fn read_env_bool(key: &str) -> Option<bool> {
-    let raw = std::env::var(key).ok()?;
-    let v = raw.trim().to_ascii_lowercase();
-    match v.as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn default_ort_intra_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4)
-        .max(1)
-}
-
 fn parse_ort_provider(raw: &str) -> OrtProvider {
     match raw.trim().to_ascii_lowercase().as_str() {
         "cpu" => OrtProvider::Cpu,
@@ -2058,13 +2060,9 @@ fn parse_ort_provider(raw: &str) -> OrtProvider {
 }
 
 fn resolve_ort_execution_config(runtime: &RuntimeConfig) -> OrtExecutionConfig {
-    let provider_raw = std::env::var("RUST_VC_ORT_PROVIDER")
-        .ok()
-        .unwrap_or_else(|| runtime.ort_provider.clone());
-    let provider = parse_ort_provider(&provider_raw);
-    let device_id = read_env_i32("RUST_VC_ORT_DEVICE_ID").unwrap_or(runtime.ort_device_id);
-    let gpu_mem_limit_mb = read_env_usize("RUST_VC_ORT_GPU_MEM_LIMIT_MB")
-        .unwrap_or(runtime.ort_gpu_mem_limit_mb as usize);
+    let provider = parse_ort_provider(&runtime.ort_provider);
+    let device_id = runtime.ort_device_id.max(0);
+    let gpu_mem_limit_mb = runtime.ort_gpu_mem_limit_mb as usize;
     let gpu_mem_limit_bytes = if gpu_mem_limit_mb == 0 {
         None
     } else {
@@ -2077,27 +2075,47 @@ fn resolve_ort_execution_config(runtime: &RuntimeConfig) -> OrtExecutionConfig {
     }
 }
 
-fn build_execution_providers(config: &OrtExecutionConfig) -> Vec<ExecutionProviderDispatch> {
+fn resolve_cuda_conv_algorithm(raw: &str) -> ep::cuda::ConvAlgorithmSearch {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "exhaustive" | "exh" => ep::cuda::ConvAlgorithmSearch::Exhaustive,
+        "heuristic" | "heu" => ep::cuda::ConvAlgorithmSearch::Heuristic,
+        "default" | "def" | "" => ep::cuda::ConvAlgorithmSearch::Default,
+        _ => ep::cuda::ConvAlgorithmSearch::Default,
+    }
+}
+
+fn resolve_ort_cuda_tuning(runtime: &RuntimeConfig) -> OrtCudaTuning {
+    OrtCudaTuning {
+        conv_algo: resolve_cuda_conv_algorithm(&runtime.cuda_conv_algo),
+        conv_max_workspace: runtime.cuda_conv_max_workspace,
+        conv1d_pad_to_nc1d: runtime.cuda_conv1d_pad_to_nc1d,
+        tf32: runtime.cuda_tf32,
+    }
+}
+
+fn build_execution_providers(
+    config: &OrtExecutionConfig,
+    cuda_tuning: &OrtCudaTuning,
+) -> Vec<ExecutionProviderDispatch> {
     let cuda_ep = || {
         let mut cuda = ep::CUDA::default().with_device_id(config.device_id);
         if let Some(limit) = config.gpu_mem_limit_bytes {
             cuda = cuda.with_memory_limit(limit);
         }
-        let conv_algo = resolve_cuda_conv_algorithm();
-        let conv_max_workspace = read_env_bool("RUST_VC_CUDA_CONV_MAX_WORKSPACE").unwrap_or(false);
-        let conv1d_pad_to_nc1d = read_env_bool("RUST_VC_CUDA_CONV1D_PAD_TO_NC1D").unwrap_or(false);
-        let tf32 = read_env_bool("RUST_VC_CUDA_TF32").unwrap_or(false);
         if ORT_CUDA_TUNE_LOGGED.set(()).is_ok() {
             eprintln!(
-                "[vc-inference] cuda ep tuning: conv_algo={:?} conv_max_workspace={} conv1d_pad_to_nc1d={} tf32={} (env: RUST_VC_CUDA_CONV_ALGO / RUST_VC_CUDA_CONV_MAX_WORKSPACE / RUST_VC_CUDA_CONV1D_PAD_TO_NC1D / RUST_VC_CUDA_TF32)",
-                conv_algo, conv_max_workspace, conv1d_pad_to_nc1d, tf32
+                "[vc-inference] cuda ep tuning: conv_algo={:?} conv_max_workspace={} conv1d_pad_to_nc1d={} tf32={} (from RuntimeConfig)",
+                cuda_tuning.conv_algo,
+                cuda_tuning.conv_max_workspace,
+                cuda_tuning.conv1d_pad_to_nc1d,
+                cuda_tuning.tf32
             );
         }
         cuda = cuda
-            .with_conv_algorithm_search(conv_algo)
-            .with_conv_max_workspace(conv_max_workspace)
-            .with_conv1d_pad_to_nc1d(conv1d_pad_to_nc1d)
-            .with_tf32(tf32);
+            .with_conv_algorithm_search(cuda_tuning.conv_algo.clone())
+            .with_conv_max_workspace(cuda_tuning.conv_max_workspace)
+            .with_conv1d_pad_to_nc1d(cuda_tuning.conv1d_pad_to_nc1d)
+            .with_tf32(cuda_tuning.tf32);
         cuda.build()
     };
     let dml_ep = || {
@@ -2164,19 +2182,6 @@ fn detect_ort_provider_availability() -> OrtProviderAvailability {
     OrtProviderAvailability { cuda, dml, cpu }
 }
 
-fn resolve_cuda_conv_algorithm() -> ep::cuda::ConvAlgorithmSearch {
-    let raw = std::env::var("RUST_VC_CUDA_CONV_ALGO")
-        .ok()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "default".to_string());
-    match raw.as_str() {
-        "exhaustive" | "exh" => ep::cuda::ConvAlgorithmSearch::Exhaustive,
-        "heuristic" | "heu" => ep::cuda::ConvAlgorithmSearch::Heuristic,
-        "default" | "def" | "" => ep::cuda::ConvAlgorithmSearch::Default,
-        _ => ep::cuda::ConvAlgorithmSearch::Default,
-    }
-}
-
 fn build_ort_session(
     path: &str,
     label: &str,
@@ -2184,6 +2189,7 @@ fn build_ort_session(
     inter_threads: usize,
     parallel_execution: bool,
     execution: &OrtExecutionConfig,
+    cuda_tuning: &OrtCudaTuning,
 ) -> Result<Session> {
     let mut builder = Session::builder()
         .map_err(|e| VcError::Inference(format!("failed to create {label} session builder: {e}")))?
@@ -2195,7 +2201,7 @@ fn build_ort_session(
         .map_err(|e| VcError::Inference(format!("failed to set {label} inter threads: {e}")))?
         .with_parallel_execution(parallel_execution)
         .map_err(|e| VcError::Inference(format!("failed to set {label} execution mode: {e}")))?;
-    let eps = build_execution_providers(execution);
+    let eps = build_execution_providers(execution, cuda_tuning);
     builder = builder.with_execution_providers(eps).map_err(|e| {
         let raw = e.to_string();
         let raw_lc = raw.to_ascii_lowercase();
@@ -2255,6 +2261,7 @@ fn build_aux_session_with_cpu_fallback(
     inter_threads: usize,
     parallel_execution: bool,
     execution: &OrtExecutionConfig,
+    cuda_tuning: &OrtCudaTuning,
 ) -> Result<Session> {
     match build_ort_session(
         path,
@@ -2263,6 +2270,7 @@ fn build_aux_session_with_cpu_fallback(
         inter_threads,
         parallel_execution,
         execution,
+        cuda_tuning,
     ) {
         Ok(session) => Ok(session),
         Err(primary_err) => {
@@ -2287,6 +2295,7 @@ fn build_aux_session_with_cpu_fallback(
                 inter_threads,
                 parallel_execution,
                 &cpu_execution,
+                cuda_tuning,
             ) {
                 Ok(session) => {
                     eprintln!("[vc-inference] {label} session fallback: using CPU EP");
