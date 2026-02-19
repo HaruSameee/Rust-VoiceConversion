@@ -555,8 +555,7 @@ pub fn rmvpe_mel_from_audio_with_resampler(
             let mut acc = 0.0_f32;
             for b in 0..bins {
                 let mag = spec[(b, t)];
-                let power = mag * mag;
-                acc += mel_bank[(m, b)] * power;
+                acc += mel_bank[(m, b)] * mag;
             }
             let clamped = acc.max(1e-5);
             prelog_min = prelog_min.min(clamped);
@@ -597,7 +596,7 @@ pub fn rmvpe_mel_from_audio_with_resampler(
             );
         } else if RMVPE_MEL_SCALE_LOGGED.set(()).is_ok() {
             eprintln!(
-                "[vc-signal] rmvpe mel scale (power): prelog(min={:.3e} max={:.3e} mean={:.3e}) log(min={:.3} max={:.3}) bins={} frames={} rms={:.3e} peak={:.3e}",
+                "[vc-signal] rmvpe mel scale (magnitude): prelog(min={:.3e} max={:.3e} mean={:.3e}) log(min={:.3} max={:.3}) bins={} frames={} rms={:.3e} peak={:.3e}",
                 prelog_min,
                 prelog_max,
                 prelog_mean,

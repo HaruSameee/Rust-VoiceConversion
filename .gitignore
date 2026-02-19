@@ -34,6 +34,7 @@ models/*.dll
 
 # Local references / dumps
 Mangio-RVC-v23.7.0/
+obs-rvc-master/
 
 # Logs and env
 *.log
