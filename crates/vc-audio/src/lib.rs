@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use vc_core::{InferenceEngine, VoiceChanger};
 use vc_signal::{resample_hq_into, HqResampler};
 
@@ -425,6 +426,7 @@ fn worker_loop<E>(
     let mut previous_output_tail = Vec::<f32>::new();
     let input_to_model_resampler = HqResampler::new(input_rate, model_sample_rate);
     let model_to_output_resampler = HqResampler::new(model_sample_rate, output_rate);
+    let mut sola_correlator = SolaFftCorrelator::default();
     let mut processed_blocks: u64 = 0;
     let mut silence_skips: u64 = 0;
     let mut last_heartbeat = Instant::now();
@@ -550,7 +552,11 @@ fn worker_loop<E>(
                 padded
             };
             let output_mono: &[f32] = if model_sample_rate != output_rate {
-                resample_hq_into(&model_to_output_resampler, &output_source, &mut output_rate_buf);
+                resample_hq_into(
+                    &model_to_output_resampler,
+                    &output_source,
+                    &mut output_rate_buf,
+                );
                 &output_rate_buf
             } else {
                 &output_source
@@ -572,7 +578,7 @@ fn worker_loop<E>(
                 .min(tail.len());
             let mut offset = 0usize;
             if search_limit > 0 && crossfade_for_search >= 16 {
-                offset = find_best_sola_offset(
+                offset = sola_correlator.find_best_offset(
                     &previous_output_tail,
                     tail,
                     crossfade_for_search,
@@ -822,7 +828,124 @@ fn default_output_crossfade_samples(output_rate: u32) -> usize {
     ) as usize
 }
 
-fn find_best_sola_offset(
+#[derive(Default)]
+struct SolaFftCorrelator {
+    fft_len: usize,
+    forward_fft: Option<Arc<dyn Fft<f32>>>,
+    inverse_fft: Option<Arc<dyn Fft<f32>>>,
+    fft_a: Vec<Complex32>,
+    fft_b: Vec<Complex32>,
+    fft_tmp: Vec<Complex32>,
+    energy_prefix: Vec<f32>,
+}
+
+impl SolaFftCorrelator {
+    fn ensure_plan(&mut self, fft_len: usize) {
+        if self.fft_len == fft_len {
+            return;
+        }
+        let mut planner = FftPlanner::<f32>::new();
+        self.forward_fft = Some(planner.plan_fft_forward(fft_len));
+        self.inverse_fft = Some(planner.plan_fft_inverse(fft_len));
+        self.fft_a = vec![Complex32::new(0.0, 0.0); fft_len];
+        self.fft_b = vec![Complex32::new(0.0, 0.0); fft_len];
+        self.fft_tmp = vec![Complex32::new(0.0, 0.0); fft_len];
+        self.fft_len = fft_len;
+    }
+
+    fn find_best_offset(
+        &mut self,
+        previous_tail: &[f32],
+        current: &[f32],
+        crossfade: usize,
+        search_limit: usize,
+    ) -> usize {
+        if crossfade == 0 || previous_tail.len() < crossfade || current.len() < crossfade {
+            return 0;
+        }
+        let prev = &previous_tail[previous_tail.len() - crossfade..];
+        let prev_energy = prev.iter().map(|v| v * v).sum::<f32>();
+        if prev_energy <= 1.0e-12 {
+            return 0;
+        }
+        let max_offset = search_limit.min(current.len().saturating_sub(crossfade));
+        let corr_input_len = crossfade + max_offset;
+        if corr_input_len == 0 {
+            return 0;
+        }
+
+        let conv_len = corr_input_len + crossfade - 1;
+        let fft_len = conv_len.next_power_of_two().max(1);
+        self.ensure_plan(fft_len);
+
+        self.fft_a.fill(Complex32::new(0.0, 0.0));
+        self.fft_b.fill(Complex32::new(0.0, 0.0));
+        self.fft_tmp.fill(Complex32::new(0.0, 0.0));
+
+        for i in 0..corr_input_len {
+            self.fft_a[i].re = current[i];
+        }
+        for i in 0..crossfade {
+            self.fft_b[i].re = prev[crossfade - 1 - i];
+        }
+
+        let Some(forward) = self.forward_fft.as_ref() else {
+            return find_best_sola_offset_time_domain(
+                previous_tail,
+                current,
+                crossfade,
+                max_offset,
+            );
+        };
+        forward.process(&mut self.fft_a);
+        forward.process(&mut self.fft_b);
+        for i in 0..self.fft_len {
+            self.fft_tmp[i] = self.fft_a[i] * self.fft_b[i];
+        }
+        let Some(inverse) = self.inverse_fft.as_ref() else {
+            return find_best_sola_offset_time_domain(
+                previous_tail,
+                current,
+                crossfade,
+                max_offset,
+            );
+        };
+        inverse.process(&mut self.fft_tmp);
+        let inv_fft_len = 1.0_f32 / self.fft_len as f32;
+
+        if self.energy_prefix.len() < corr_input_len + 1 {
+            self.energy_prefix.resize(corr_input_len + 1, 0.0);
+        }
+        self.energy_prefix[0] = 0.0;
+        for i in 0..corr_input_len {
+            self.energy_prefix[i + 1] = self.energy_prefix[i] + current[i] * current[i];
+        }
+
+        let mut best_offset = 0usize;
+        let mut best_score = f32::MIN;
+        for offset in 0..=max_offset {
+            let corr_idx = offset + crossfade - 1;
+            let nom = self.fft_tmp[corr_idx].re * inv_fft_len;
+            let seg_energy = self.energy_prefix[offset + crossfade] - self.energy_prefix[offset];
+            if seg_energy <= 1.0e-12 {
+                continue;
+            }
+            let score = nom / (prev_energy * seg_energy).sqrt().max(1.0e-8);
+            if score.is_finite() && score > best_score {
+                best_score = score;
+                best_offset = offset;
+            }
+        }
+
+        if best_score == f32::MIN {
+            find_best_sola_offset_time_domain(previous_tail, current, crossfade, max_offset)
+        } else {
+            best_offset
+        }
+    }
+}
+
+fn find_best_sola_offset_time_domain(
     previous_tail: &[f32],
     current: &[f32],
     crossfade: usize,
@@ -831,6 +954,7 @@ fn find_best_sola_offset(
     if crossfade == 0 || previous_tail.len() < crossfade || current.len() < crossfade {
         return 0;
     }
+    let max_offset = search_limit.min(current.len().saturating_sub(crossfade));
     let prev = &previous_tail[previous_tail.len() - crossfade..];
     let mut prev_energy = 0.0_f32;
     for &v in prev {
@@ -842,7 +966,7 @@ fn find_best_sola_offset(
 
     let mut best_offset = 0usize;
     let mut best_score = f32::MIN;
-    for offset in 0..=search_limit {
+    for offset in 0..=max_offset {
         if offset + crossfade > current.len() {
             break;
         }
@@ -936,5 +1060,47 @@ impl LevelMeter {
 
     pub fn peak(&self) -> f32 {
         self.peak
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sola_fft_matches_time_domain_offset() {
+        let crossfade = 256usize;
+        let search_limit = 64usize;
+        let known_offset = 23usize;
+
+        let mut previous_tail = vec![0.0_f32; 16];
+        for i in 0..crossfade {
+            let t = i as f32;
+            let s = (2.0 * std::f32::consts::PI * t / 37.0).sin() * 0.7
+                + (2.0 * std::f32::consts::PI * t / 19.0).cos() * 0.3;
+            previous_tail.push(s);
+        }
+
+        let mut current = vec![0.0_f32; crossfade + search_limit];
+        // Deterministic tiny noise floor
+        let mut x = 0x1234_5678_u32;
+        for v in &mut current {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            let n = ((x >> 9) as f32 / (u32::MAX >> 9) as f32) - 0.5;
+            *v = n * 0.02;
+        }
+
+        let prev = &previous_tail[previous_tail.len() - crossfade..];
+        for i in 0..crossfade {
+            current[known_offset + i] += prev[i];
+        }
+
+        let td =
+            find_best_sola_offset_time_domain(&previous_tail, &current, crossfade, search_limit);
+        let mut fft = SolaFftCorrelator::default();
+        let fd = fft.find_best_offset(&previous_tail, &current, crossfade, search_limit);
+
+        assert_eq!(td, known_offset);
+        assert_eq!(fd, td);
     }
 }

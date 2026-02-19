@@ -201,6 +201,21 @@
 
       <section class="card">
         <h2>エンジン操作</h2>
+        <div class="grid">
+          <div class="field">
+            <label for="presetSelect">プリセット</label>
+            <select id="presetSelect"></select>
+          </div>
+          <div class="field">
+            <label for="presetName">保存名</label>
+            <input id="presetName" type="text" placeholder="my-preset" />
+          </div>
+        </div>
+        <div class="actions">
+          <button id="presetSaveBtn">プリセット保存</button>
+          <button id="presetApplyBtn">プリセット適用</button>
+          <button id="presetDeleteBtn">プリセット削除</button>
+        </div>
         <div class="actions">
           <button id="reloadBtn">再読込</button>
           <button id="saveBtn">保存</button>

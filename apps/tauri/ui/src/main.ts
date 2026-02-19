@@ -49,6 +49,15 @@ interface RuntimeConfig {
   index_max_vectors: number;
 }
 
+interface PresetEntry {
+  model: ModelConfig;
+  runtime: RuntimeConfig;
+  created_at: string;
+  updated_at: string;
+}
+
+type PresetStore = Record<string, PresetEntry>;
+
 interface AudioDevicesPayload {
   input_devices: string[];
   output_devices: string[];
@@ -75,6 +84,11 @@ const ui = {
   hubertPath: $("hubertPath") as HTMLInputElement,
   rmvpePath: $("rmvpePath") as HTMLInputElement,
   indexPath: $("indexPath") as HTMLInputElement,
+  presetSelect: $("presetSelect") as HTMLSelectElement,
+  presetName: $("presetName") as HTMLInputElement,
+  presetSaveBtn: $("presetSaveBtn") as HTMLButtonElement,
+  presetApplyBtn: $("presetApplyBtn") as HTMLButtonElement,
+  presetDeleteBtn: $("presetDeleteBtn") as HTMLButtonElement,
   inputDevice: $("inputDevice") as HTMLSelectElement,
   outputDevice: $("outputDevice") as HTMLSelectElement,
   inputGain: $("inputGain") as HTMLInputElement,
@@ -116,6 +130,8 @@ let statusTimer: number | null = null;
 let lastStatusLogAt = 0;
 let statusPollErrorStreak = 0;
 let runtimeCache: RuntimeConfig | null = null;
+const PRESET_STORAGE_KEY = "rust_vc_presets_v1";
+let presetStore: PresetStore = {};
 
 function now(): string {
   return new Date().toISOString();
@@ -197,6 +213,107 @@ function renderDeviceSelect(select: HTMLSelectElement, devices: string[], select
   select.value = value;
 }
 
+function normalizePresetName(value: string): string {
+  return value.trim();
+}
+
+function readPresetStore(): PresetStore {
+  try {
+    const raw = localStorage.getItem(PRESET_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+    return parsed as PresetStore;
+  } catch (error) {
+    log("WARN", "failed to read preset store; reset", error);
+    return {};
+  }
+}
+
+function writePresetStore(store: PresetStore): void {
+  localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(store));
+}
+
+function sortedPresetNames(store: PresetStore): string[] {
+  return Object.keys(store).sort((a, b) => a.localeCompare(b, "ja"));
+}
+
+function renderPresetSelect(selected: string | null = null): void {
+  const names = sortedPresetNames(presetStore);
+  ui.presetSelect.innerHTML = "";
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = "(preset)";
+  ui.presetSelect.appendChild(empty);
+  for (const name of names) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    ui.presetSelect.appendChild(option);
+  }
+  const target = selected && presetStore[selected] ? selected : "";
+  ui.presetSelect.value = target;
+}
+
+function savePresetLocal(): void {
+  const name = normalizePresetName(ui.presetName.value || ui.presetSelect.value);
+  if (!name) {
+    throw new Error("preset name is required");
+  }
+  const timestamp = now();
+  const prev = presetStore[name];
+  presetStore[name] = {
+    model: modelFromInputs(),
+    runtime: sanitizeRuntime(runtimeFromInputs()),
+    created_at: prev?.created_at ?? timestamp,
+    updated_at: timestamp
+  };
+  writePresetStore(presetStore);
+  ui.presetName.value = name;
+  renderPresetSelect(name);
+  log("INFO", "preset saved", { name, updated_at: timestamp });
+}
+
+function applyPresetLocal(): void {
+  const name = normalizePresetName(ui.presetSelect.value || ui.presetName.value);
+  if (!name) {
+    throw new Error("preset selection is required");
+  }
+  const preset = presetStore[name];
+  if (!preset) {
+    throw new Error(`preset not found: ${name}`);
+  }
+  applyModel(preset.model);
+  applyRuntime(sanitizeRuntime(preset.runtime));
+  ui.presetName.value = name;
+  ui.presetSelect.value = name;
+  log("INFO", "preset applied", { name, updated_at: preset.updated_at });
+}
+
+function deletePresetLocal(): void {
+  const name = normalizePresetName(ui.presetSelect.value || ui.presetName.value);
+  if (!name) {
+    throw new Error("preset selection is required");
+  }
+  if (!presetStore[name]) {
+    throw new Error(`preset not found: ${name}`);
+  }
+  delete presetStore[name];
+  writePresetStore(presetStore);
+  ui.presetName.value = "";
+  renderPresetSelect();
+  log("INFO", "preset deleted", { name });
+}
+
+function initPresetUi(): void {
+  presetStore = readPresetStore();
+  renderPresetSelect();
+}
+
 function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
   return {
     input_gain: atLeast(raw.input_gain, 0.0, 1.0),
@@ -209,7 +326,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     index_top_k: intAtLeast(raw.index_top_k, 1, 8),
     index_search_rows: intAtLeast(raw.index_search_rows, 0, 2048),
     protect: atLeast(raw.protect, 0.0, 0.33),
-    rmvpe_threshold: atLeast(raw.rmvpe_threshold, 0.0, 0.03),
+    rmvpe_threshold: atLeast(raw.rmvpe_threshold, 0.0, 0.01),
     pitch_smooth_alpha: atLeast(raw.pitch_smooth_alpha, 0.0, 0.12),
     // 0.0 = strongest input envelope inheritance, 1.0 = almost disabled.
     rms_mix_rate: clamp(raw.rms_mix_rate, 0.0, 1.0, 0.2),
@@ -229,7 +346,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     ort_intra_threads: Math.round(clamp(raw.ort_intra_threads, 1, 4, 4)),
     ort_inter_threads: intAtLeast(raw.ort_inter_threads, 1, 1),
     ort_parallel_execution: Boolean(raw.ort_parallel_execution),
-    hubert_context_samples_16k: intAtLeast(raw.hubert_context_samples_16k, 1600, 4000),
+    hubert_context_samples_16k: intAtLeast(raw.hubert_context_samples_16k, 1600, 16000),
     hubert_output_layer: Math.round(finiteOr(raw.hubert_output_layer, 12)),
     hubert_upsample_factor: intAtLeast(raw.hubert_upsample_factor, 1, 2),
     cuda_conv_algo: ["default", "heuristic", "exhaustive"].includes((raw.cuda_conv_algo ?? "").toLowerCase())
@@ -282,7 +399,7 @@ function runtimeFromInputs(): RuntimeConfig {
     ort_intra_threads: base?.ort_intra_threads ?? 4,
     ort_inter_threads: base?.ort_inter_threads ?? 1,
     ort_parallel_execution: base?.ort_parallel_execution ?? false,
-    hubert_context_samples_16k: base?.hubert_context_samples_16k ?? 4000,
+    hubert_context_samples_16k: base?.hubert_context_samples_16k ?? 16000,
     hubert_output_layer: base?.hubert_output_layer ?? 12,
     hubert_upsample_factor: base?.hubert_upsample_factor ?? 2,
     cuda_conv_algo: base?.cuda_conv_algo ?? "default",
@@ -434,6 +551,27 @@ async function runAction(name: string, action: () => Promise<void>): Promise<voi
 ui.reloadBtn.addEventListener("click", () => {
   void runAction("reload", loadAll);
 });
+ui.presetSaveBtn.addEventListener("click", () => {
+  void runAction("preset_save", async () => {
+    savePresetLocal();
+  });
+});
+ui.presetApplyBtn.addEventListener("click", () => {
+  void runAction("preset_apply", async () => {
+    applyPresetLocal();
+  });
+});
+ui.presetDeleteBtn.addEventListener("click", () => {
+  void runAction("preset_delete", async () => {
+    deletePresetLocal();
+  });
+});
+ui.presetSelect.addEventListener("change", () => {
+  const selected = normalizePresetName(ui.presetSelect.value);
+  if (selected) {
+    ui.presetName.value = selected;
+  }
+});
 ui.saveBtn.addEventListener("click", () => {
   void runAction("save", saveAll);
 });
@@ -452,6 +590,7 @@ for (const btn of ui.tabButtons) {
   });
 }
 switchTab(ui.tabButtons[0]?.dataset.tab ?? "model");
+initPresetUi();
 
 void runAction("init", loadAll);
 statusTimer = window.setInterval(() => {

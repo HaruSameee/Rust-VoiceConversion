@@ -1,13 +1,12 @@
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
     fs, io,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
+        OnceLock,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,17 +21,15 @@ use ort::{
 use vc_core::{InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::{
     apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace, pad_for_rmvpe,
-    postprocess_generated_audio, resample_hq_into,
-    resize_pitch_to_frames, rmvpe_mel_from_audio, rmvpe_mel_from_audio_with_resampler,
-    HqResampler, RMVPE_SAMPLE_RATE, RVC_HOP_LENGTH,
+    postprocess_generated_audio, resample_hq_into, resize_pitch_to_frames, rmvpe_mel_from_audio,
+    rmvpe_mel_from_audio_with_resampler, HqResampler, RMVPE_SAMPLE_RATE, RVC_HOP_LENGTH,
 };
 
-const DEFAULT_HUBERT_CONTEXT_SAMPLES_16K: usize = 4_000;
+const DEFAULT_HUBERT_CONTEXT_SAMPLES_16K: usize = 16_000;
 const MAX_HUBERT_CONTEXT_SAMPLES_16K: usize = 64_000;
 const HUBERT_SOURCE_LEN_ALIGN: usize = 320;
-const DEFAULT_RMVPE_THRESHOLD: f32 = 0.03;
+const DEFAULT_RMVPE_THRESHOLD: f32 = 0.01;
 static ORT_INIT_FAILED: OnceLock<String> = OnceLock::new();
-static HUBERT_LEN_FIX_CACHE: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
 static ORT_PROVIDER_AVAIL_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_CUDA_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_DML_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
@@ -83,8 +80,6 @@ pub struct RvcOrtEngine {
     feature_index: Option<FeatureIndex>,
     phone_feature_dim: usize,
     hubert_source_history_16k: Vec<f32>,
-    hubert_source_len_fixes: HashMap<usize, usize>,
-    hubert_context_samples_16k: usize,
     hubert_output_layer: i64,
     hubert_upsample_factor: usize,
     input_to_16k_resampler: HqResampler,
@@ -123,14 +118,9 @@ impl RvcOrtEngine {
             let ort_parallel_execution = runtime_config.ort_parallel_execution;
             let ort_ep = resolve_ort_execution_config(runtime_config);
             let ort_cuda_tuning = resolve_ort_cuda_tuning(runtime_config);
-            let hubert_context_samples_16k = runtime_config
-                .hubert_context_samples_16k
-                .max(DEFAULT_HUBERT_CONTEXT_SAMPLES_16K)
-                .max(1_600);
+            let hubert_context_samples_16k = DEFAULT_HUBERT_CONTEXT_SAMPLES_16K;
             let hubert_output_layer = runtime_config.hubert_output_layer;
-            let hubert_upsample_factor = runtime_config
-                .hubert_upsample_factor
-                .clamp(1, 4);
+            let hubert_upsample_factor = runtime_config.hubert_upsample_factor.clamp(1, 4);
             let pitch_smooth_alpha = if runtime_config.pitch_smooth_alpha.is_finite() {
                 runtime_config.pitch_smooth_alpha
             } else {
@@ -260,8 +250,6 @@ impl RvcOrtEngine {
                 feature_index,
                 phone_feature_dim,
                 hubert_source_history_16k: Vec::with_capacity(hubert_context_samples_16k),
-                hubert_source_len_fixes: HashMap::new(),
-                hubert_context_samples_16k,
                 hubert_output_layer,
                 hubert_upsample_factor,
                 input_to_16k_resampler: HqResampler::new(
@@ -438,26 +426,18 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             chunk_16k.push(0.0);
         }
 
-        let chunk_len_16k = chunk_16k.len();
+        let fixed_ctx = DEFAULT_HUBERT_CONTEXT_SAMPLES_16K.min(MAX_HUBERT_CONTEXT_SAMPLES_16K);
         self.hubert_source_history_16k.extend(chunk_16k);
-        let dynamic_ctx = self
-            .hubert_context_samples_16k
-            .max(chunk_len_16k)
-            .min(MAX_HUBERT_CONTEXT_SAMPLES_16K);
-        if self.hubert_source_history_16k.len() > dynamic_ctx {
-            let drop_n = self.hubert_source_history_16k.len() - dynamic_ctx;
+        if self.hubert_source_history_16k.len() > fixed_ctx {
+            let drop_n = self.hubert_source_history_16k.len() - fixed_ctx;
             self.hubert_source_history_16k.drain(0..drop_n);
         }
 
-        let mut source = vec![0.0_f32; dynamic_ctx];
-        let hist_len = self.hubert_source_history_16k.len().min(dynamic_ctx);
-        let pad_left = dynamic_ctx - hist_len;
-        source[pad_left..].copy_from_slice(
-            &self.hubert_source_history_16k[self.hubert_source_history_16k.len() - hist_len..],
-        );
-        let (source, pad_left) = align_hubert_source_window(source, pad_left);
+        let source = build_hubert_reflect_window(&self.hubert_source_history_16k, fixed_ctx);
+        // Reflect-padding is synthetic context, so keep mask offset at zero.
+        let pad_left = 0usize;
 
-        let phone = match run_hubert_session_with_len_fallback(
+        let phone = match run_hubert_session(
             self.hubert_session
                 .as_mut()
                 .expect("hubert_session checked above"),
@@ -465,14 +445,13 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             pad_left,
             self.phone_feature_dim,
             self.hubert_output_layer,
-            &mut self.hubert_source_len_fixes,
         ) {
             Ok(phone) => phone,
             Err(err) => {
                 if !self.try_hubert_runtime_cpu_fallback(&err)? {
                     return Err(err);
                 }
-                run_hubert_session_with_len_fallback(
+                run_hubert_session(
                     self.hubert_session
                         .as_mut()
                         .expect("hubert_session fallback should exist"),
@@ -480,7 +459,6 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
                     pad_left,
                     self.phone_feature_dim,
                     self.hubert_output_layer,
-                    &mut self.hubert_source_len_fixes,
                 )?
             }
         };
@@ -526,7 +504,6 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             ))
         })?;
         self.hubert_session = Some(cpu_session);
-        self.hubert_source_len_fixes.clear();
         eprintln!("[vc-inference] hubert session fallback: using CPU EP");
         Ok(true)
     }
@@ -945,7 +922,7 @@ impl InferenceEngine for RvcOrtEngine {
                     )?
                 }
             };
-            let mixed = apply_rms_mix(&normalized, &out, config.rms_mix_rate);
+            let mixed = apply_rms_mix(&normalized, &out, config.rms_mix_rate, config.sample_rate);
             let processed = postprocess_generated_audio(&mixed);
             Ok(match_output_length(&processed, frame.len()))
         };
@@ -1042,11 +1019,7 @@ fn classify_rvc_input(name: &str) -> Option<RvcInputKind> {
     None
 }
 
-fn fallback_rvc_input_kind(
-    rank: usize,
-    ty: Option<TensorElementType>,
-    name: &str,
-) -> RvcInputKind {
+fn fallback_rvc_input_kind(rank: usize, ty: Option<TensorElementType>, name: &str) -> RvcInputKind {
     if rank == 3 && ty == Some(TensorElementType::Float32) {
         return RvcInputKind::Phone;
     }
@@ -1409,206 +1382,46 @@ fn run_hubert_session(
     phone_from_hubert_tensor(&shape_vec, &data_vec, phone_feature_dim)
 }
 
-fn run_hubert_session_with_len_fallback(
-    session: &mut Session,
-    source: &[f32],
-    pad_left: usize,
-    phone_feature_dim: usize,
-    hubert_output_layer: i64,
-    len_fixes: &mut HashMap<usize, usize>,
-) -> Result<Array3<f32>> {
-    let requested_len = source.len().max(1);
-    if !len_fixes.contains_key(&requested_len) {
-        if let Some(fixed_len) = get_global_hubert_len_fix(requested_len) {
-            len_fixes.insert(requested_len, fixed_len);
-        }
+fn build_hubert_reflect_window(history: &[f32], target_len: usize) -> Vec<f32> {
+    let target_len = align_hubert_source_len(target_len.max(1));
+    if history.is_empty() {
+        return vec![0.0_f32; target_len];
+    }
+    if history.len() >= target_len {
+        return history[history.len() - target_len..].to_vec();
     }
 
-    if let Some(&fixed_len) = len_fixes.get(&requested_len) {
-        let (patched_source, patched_pad_left) =
-            remap_hubert_source_len(source, pad_left, fixed_len.max(1));
-        match run_hubert_session(
-            session,
-            &patched_source,
-            patched_pad_left,
-            phone_feature_dim,
-            hubert_output_layer,
-        ) {
-            Ok(phone) => return Ok(phone),
-            Err(err) => {
-                if !is_hubert_length_compat_error(&err) {
-                    return Err(err);
-                }
-                len_fixes.remove(&requested_len);
-                remove_global_hubert_len_fix(requested_len);
-            }
-        }
+    let hist_len = history.len();
+    let pad = target_len - hist_len;
+    let mut out = vec![0.0_f32; target_len];
+    out[pad..].copy_from_slice(history);
+    if hist_len == 1 {
+        out[..pad].fill(history[0]);
+        return out;
     }
-
-    let candidates = hubert_fallback_candidates(requested_len);
-    let mut tried = HashSet::<usize>::new();
-    let precheck_candidates = requested_len >= 6_000;
-    if precheck_candidates {
-        for &candidate_len in &candidates {
-            if candidate_len == requested_len {
-                continue;
-            }
-            tried.insert(candidate_len);
-            let (patched_source, patched_pad_left) =
-                remap_hubert_source_len(source, pad_left, candidate_len);
-            match run_hubert_session(
-                session,
-                &patched_source,
-                patched_pad_left,
-                phone_feature_dim,
-                hubert_output_layer,
-            ) {
-                Ok(phone) => {
-                    len_fixes.insert(requested_len, candidate_len);
-                    set_global_hubert_len_fix(requested_len, candidate_len);
-                    eprintln!(
-                        "[vc-inference] hubert source_len adjusted (precheck): requested={} -> {} (pad_left={} -> {})",
-                        requested_len, candidate_len, pad_left, patched_pad_left
-                    );
-                    return Ok(phone);
-                }
-                Err(err) => {
-                    if !is_hubert_length_compat_error(&err) {
-                        return Err(err);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut last_err = match run_hubert_session(
-        session,
-        source,
-        pad_left,
-        phone_feature_dim,
-        hubert_output_layer,
-    ) {
-        Ok(phone) => return Ok(phone),
-        Err(err) if !is_hubert_length_compat_error(&err) => return Err(err),
-        Err(err) => Some(err),
-    };
-
-    for candidate_len in candidates {
-        if candidate_len == requested_len || tried.contains(&candidate_len) {
-            continue;
-        }
-        let (patched_source, patched_pad_left) =
-            remap_hubert_source_len(source, pad_left, candidate_len);
-        match run_hubert_session(
-            session,
-            &patched_source,
-            patched_pad_left,
-            phone_feature_dim,
-            hubert_output_layer,
-        ) {
-            Ok(phone) => {
-                len_fixes.insert(requested_len, candidate_len);
-                set_global_hubert_len_fix(requested_len, candidate_len);
-                eprintln!(
-                    "[vc-inference] hubert source_len adjusted: requested={} -> {} (pad_left={} -> {})",
-                    requested_len, candidate_len, pad_left, patched_pad_left
-                );
-                return Ok(phone);
-            }
-            Err(err) => {
-                if !is_hubert_length_compat_error(&err) {
-                    return Err(err);
-                }
-                last_err = Some(err);
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        VcError::Inference(format!(
-            "hubert inference failed and no compatible source length found (requested_len={requested_len})"
-        ))
-    }))
-}
-
-fn hubert_fallback_candidates(requested_len: usize) -> Vec<usize> {
-    let mut candidates = Vec::<usize>::new();
-    let positive_offsets: &[usize] = if requested_len >= 6_000 {
-        &[
-            320, 640, 160, 80, 256, 128, 384, 512, 768, 1024, 64, 32, 16, 8, 1, 96, 192,
-        ]
-    } else {
-        &[
-            80, 320, 160, 64, 128, 256, 384, 512, 768, 1024, 32, 16, 8, 1, 96, 192,
-        ]
-    };
-    for &off in positive_offsets {
-        if let Some(v) = requested_len.checked_add(off) {
-            candidates.push(v);
-        }
-    }
-    for off in [80usize, 160, 64, 32, 16, 8, 1, 96, 128, 192] {
-        if requested_len > off {
-            candidates.push(requested_len - off);
-        }
-    }
-    candidates.push(DEFAULT_HUBERT_CONTEXT_SAMPLES_16K);
-    candidates.push(4_096);
-    candidates.push(5_201);
-    let mut seen = HashSet::<usize>::new();
-    let mut out = Vec::<usize>::new();
-    for candidate in candidates {
-        let aligned = align_hubert_source_len(candidate);
-        if aligned < 1_600 || aligned > MAX_HUBERT_CONTEXT_SAMPLES_16K {
-            continue;
-        }
-        if seen.insert(aligned) {
-            out.push(aligned);
-        }
+    for i in 0..pad {
+        // i is from far-left to near-left. dist=1 should map to history[1].
+        let dist = pad - i;
+        let idx = reflect_left_index(dist, hist_len);
+        out[i] = history[idx];
     }
     out
 }
 
-fn get_global_hubert_len_fix(requested_len: usize) -> Option<usize> {
-    let cache = HUBERT_LEN_FIX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    cache.lock().ok()?.get(&requested_len).copied()
-}
-
-fn set_global_hubert_len_fix(requested_len: usize, fixed_len: usize) {
-    let cache = HUBERT_LEN_FIX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(requested_len, fixed_len.max(1));
+fn reflect_left_index(dist: usize, len: usize) -> usize {
+    if len <= 1 {
+        return 0;
     }
-}
-
-fn remove_global_hubert_len_fix(requested_len: usize) {
-    let cache = HUBERT_LEN_FIX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = cache.lock() {
-        guard.remove(&requested_len);
+    let period = 2 * (len - 1);
+    let mut m = dist % period;
+    if m == 0 {
+        m = period;
     }
-}
-
-fn remap_hubert_source_len(
-    source: &[f32],
-    pad_left: usize,
-    target_len: usize,
-) -> (Vec<f32>, usize) {
-    let target_len = align_hubert_source_len(target_len.max(1));
-    let source_len = source.len().max(1);
-    if target_len == source_len {
-        return (source.to_vec(), pad_left.min(target_len));
+    if m <= (len - 1) {
+        m
+    } else {
+        period - m
     }
-    if target_len > source_len {
-        let add = target_len - source_len;
-        let mut out = vec![0.0_f32; target_len];
-        out[add..].copy_from_slice(source);
-        return (out, (pad_left + add).min(target_len));
-    }
-
-    let drop = source_len - target_len;
-    let mut out = vec![0.0_f32; target_len];
-    out.copy_from_slice(&source[drop..]);
-    (out, pad_left.saturating_sub(drop))
 }
 
 fn align_hubert_source_len(len: usize) -> usize {
@@ -1616,30 +1429,6 @@ fn align_hubert_source_len(len: usize) -> usize {
         return HUBERT_SOURCE_LEN_ALIGN;
     }
     len.div_ceil(HUBERT_SOURCE_LEN_ALIGN) * HUBERT_SOURCE_LEN_ALIGN
-}
-
-fn align_hubert_source_window(source: Vec<f32>, pad_left: usize) -> (Vec<f32>, usize) {
-    if source.is_empty() {
-        return (vec![0.0; HUBERT_SOURCE_LEN_ALIGN], HUBERT_SOURCE_LEN_ALIGN);
-    }
-    let aligned_len = align_hubert_source_len(source.len());
-    if aligned_len == source.len() {
-        return (source, pad_left.min(aligned_len));
-    }
-    let prepend = aligned_len - source.len();
-    let mut out = vec![0.0_f32; aligned_len];
-    out[prepend..].copy_from_slice(&source);
-    (out, (pad_left + prepend).min(aligned_len))
-}
-
-fn is_hubert_length_compat_error(err: &VcError) -> bool {
-    let VcError::Inference(msg) = err else {
-        return false;
-    };
-    msg.contains("hubert inference failed")
-        && (msg.contains("Where node")
-            || msg.contains("Broadcast")
-            || msg.contains("Invalid input shape"))
 }
 
 fn is_hubert_cuda_runtime_failure(err: &VcError) -> bool {

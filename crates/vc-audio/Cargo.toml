@@ -8,5 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 cpal.workspace = true
 ringbuf.workspace = true
+rustfft.workspace = true
 vc-core = { path = "../vc-core" }
 vc-signal = { path = "../vc-signal" }

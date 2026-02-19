@@ -21,7 +21,8 @@ pub const RMVPE_FRAME_ALIGN: usize = 32;
 const HQ_RESAMPLE_HALF_TAPS: isize = 60;
 const HQ_RESAMPLE_PHASES: usize = 512;
 const HQ_DOWNSAMPLE_CUTOFF_GUARD: f32 = 0.96;
-const RMVPE_MEL_MAG_GAIN: f32 = 10.0;
+const RMVPE_MEL_MAG_GAIN_BASE: f32 = 10.0;
+const RMVPE_MEL_MAG_GAIN_MAX: f32 = 20.0;
 static HQ_RESAMPLE_BANK_CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<HqResampleBank>>>> =
     OnceLock::new();
 static RMVPE_MEL_SCALE_LOGGED: OnceLock<()> = OnceLock::new();
@@ -153,7 +154,12 @@ pub fn postprocess_generated_audio(samples: &[f32]) -> Vec<f32> {
     out
 }
 
-pub fn apply_rms_mix(input: &[f32], output: &[f32], rms_mix_rate: f32) -> Vec<f32> {
+pub fn apply_rms_mix(
+    input: &[f32],
+    output: &[f32],
+    rms_mix_rate: f32,
+    sample_rate: u32,
+) -> Vec<f32> {
     if output.is_empty() {
         return Vec::new();
     }
@@ -162,18 +168,14 @@ pub fn apply_rms_mix(input: &[f32], output: &[f32], rms_mix_rate: f32) -> Vec<f3
         return output.to_vec();
     }
 
-    let in_env = rms_envelope(input);
-    let out_env = rms_envelope(output);
-    let in_len = in_env.len();
-    let out_len = out_env.len();
-    if in_len == 0 || out_len == 0 {
+    let out_len = output.len();
+    let in_env = rms_envelope_resampled(input, sample_rate, out_len);
+    let out_env = rms_envelope_resampled(output, sample_rate, out_len);
+    if in_env.is_empty() || out_env.is_empty() {
         return output.to_vec();
     }
 
     let mut out = output.to_vec();
-    let in_last = (in_len - 1) as f32;
-    let out_last = (out_len - 1).max(1) as f32;
-    let src_scale = in_last / out_last;
     let gain_exp = 1.0 - mix;
     let gain_mode = if gain_exp <= 1.0e-6 {
         0_u8
@@ -184,21 +186,20 @@ pub fn apply_rms_mix(input: &[f32], output: &[f32], rms_mix_rate: f32) -> Vec<f3
     } else {
         3_u8
     };
+    let mut smoothed_gain = 1.0_f32;
+    let gain_smooth = 0.2_f32;
     for (i, sample) in out.iter_mut().enumerate() {
-        let src_pos = i as f32 * src_scale;
-        let left = src_pos.floor() as usize;
-        let right = (left + 1).min(in_len - 1);
-        let frac = src_pos - left as f32;
-        let in_rms = in_env[left] * (1.0 - frac) + in_env[right] * frac;
+        let in_rms = in_env[i];
         let out_rms = out_env[i].max(1e-4);
-        let ratio = (in_rms / out_rms).clamp(0.1, 10.0);
-        let gain = match gain_mode {
+        let ratio = (in_rms / out_rms).clamp(0.1, 8.0);
+        let raw_gain = match gain_mode {
             0 => 1.0,
             1 => ratio,
             2 => ratio.sqrt(),
             _ => ratio.powf(gain_exp),
         };
-        *sample *= gain;
+        smoothed_gain += (raw_gain - smoothed_gain) * gain_smooth;
+        *sample *= smoothed_gain;
     }
     out
 }
@@ -229,48 +230,55 @@ pub fn median_filter_pitch_track_inplace(pitch: &mut [f32], radius: usize) {
     }
 }
 
-fn rms_envelope(samples: &[f32]) -> Vec<f32> {
-    if samples.is_empty() {
+fn rms_envelope_resampled(samples: &[f32], sample_rate: u32, target_len: usize) -> Vec<f32> {
+    if target_len == 0 {
         return Vec::new();
     }
+    if samples.is_empty() {
+        return vec![0.0; target_len];
+    }
     if samples.len() == 1 {
-        return vec![samples[0].abs()];
+        return vec![samples[0].abs(); target_len];
     }
 
-    let frame = samples.len().clamp(256, 1024);
-    let hop = (frame / 4).max(1);
-    let mut points = Vec::<(usize, f32)>::new();
-    let mut start = 0usize;
-    while start < samples.len() {
-        let end = (start + frame).min(samples.len());
-        let seg = &samples[start..end];
-        let rms = (seg.iter().map(|v| v * v).sum::<f32>() / seg.len().max(1) as f32).sqrt();
-        points.push((start + (seg.len() / 2), rms));
-        if end == samples.len() {
-            break;
+    // Follow obs-rvc style envelope windows: ~40 ms frame, ~10 ms hop.
+    let sr = sample_rate.max(1) as usize;
+    let mut frame = (sr * 4 / 100).max(64);
+    frame = frame.min(samples.len().max(1));
+    let hop = (sr / 100).max(1);
+    let pad = frame / 2;
+
+    let mut padded = vec![0.0_f32; samples.len() + pad * 2];
+    padded[pad..pad + samples.len()].copy_from_slice(samples);
+
+    let mut points = Vec::<f32>::new();
+    if padded.len() < frame {
+        let rms = (padded.iter().map(|v| v * v).sum::<f32>() / padded.len().max(1) as f32).sqrt();
+        points.push(rms);
+    } else {
+        let mut start = 0usize;
+        while start + frame <= padded.len() {
+            let seg = &padded[start..start + frame];
+            let rms = (seg.iter().map(|v| v * v).sum::<f32>() / frame as f32).sqrt();
+            points.push(rms);
+            start = start.saturating_add(hop);
         }
-        start += hop;
     }
-
+    if points.is_empty() {
+        return vec![0.0; target_len];
+    }
     if points.len() == 1 {
-        return vec![points[0].1; samples.len()];
+        return vec![points[0]; target_len];
     }
 
-    let mut env = vec![0.0_f32; samples.len()];
-    let mut p = 0usize;
+    let mut env = vec![0.0_f32; target_len];
+    let scale = (points.len() - 1) as f64 / (target_len - 1).max(1) as f64;
     for (i, slot) in env.iter_mut().enumerate() {
-        while p + 1 < points.len() && points[p + 1].0 <= i {
-            p += 1;
-        }
-        if p + 1 >= points.len() {
-            *slot = points[p].1;
-        } else {
-            let (x0, y0) = points[p];
-            let (x1, y1) = points[p + 1];
-            let denom = (x1.saturating_sub(x0)).max(1) as f32;
-            let t = (i.saturating_sub(x0)) as f32 / denom;
-            *slot = y0 * (1.0 - t) + y1 * t;
-        }
+        let src = i as f64 * scale;
+        let left = src.floor() as usize;
+        let right = (left + 1).min(points.len() - 1);
+        let frac = (src - left as f64) as f32;
+        *slot = points[left] * (1.0 - frac) + points[right] * frac;
     }
     env
 }
@@ -470,8 +478,7 @@ fn build_hq_resample_bank(src_rate: u32, dst_rate: u32) -> HqResampleBank {
             let win_pos = ((k as f32 - frac) / denom).clamp(-1.0, 1.0);
             // Blackman window: stronger stopband attenuation than Hann.
             // win_pos is normalized to [-1, 1].
-            let window =
-                0.42 + 0.5 * (pi * win_pos).cos() + 0.08 * (2.0 * pi * win_pos).cos();
+            let window = 0.42 + 0.5 * (pi * win_pos).cos() + 0.08 * (2.0 * pi * win_pos).cos();
             let w = cutoff * sinc * window;
             kernels[base + tap] = w;
             wsum += w;
@@ -526,6 +533,7 @@ pub fn rmvpe_mel_from_audio_with_resampler(
         };
     }
     let (audio_16k_rms, audio_16k_peak) = signal_rms_peak(&audio_16k);
+    let mel_mag_gain = rmvpe_mel_mag_gain(audio_16k_rms, audio_16k_peak);
 
     let spec = stft_magnitude(&audio_16k, RVC_N_FFT, RVC_HOP_LENGTH);
     let frames = spec.ncols();
@@ -556,7 +564,7 @@ pub fn rmvpe_mel_from_audio_with_resampler(
             let mut acc = 0.0_f32;
             for b in 0..bins {
                 let mag = spec[(b, t)];
-                let scaled_mag = mag * RMVPE_MEL_MAG_GAIN;
+                let scaled_mag = mag * mel_mag_gain;
                 acc += mel_bank[(m, b)] * scaled_mag;
             }
             let clamped = acc.max(1e-5);
@@ -588,9 +596,10 @@ pub fn rmvpe_mel_from_audio_with_resampler(
             }
         } else if audio_16k_peak >= 0.2 && prelog_max < 0.2 {
             eprintln!(
-                "[vc-signal] warning: rmvpe mel max seems low for input peak. peak={:.3} rms={:.3e} prelog_max={:.3e} prelog_mean={:.3e} bins={} frames={} (check frontend gain/normalization parity with Python)",
+                "[vc-signal] warning: rmvpe mel max seems low for input peak. peak={:.3} rms={:.3e} mel_gain={:.2} prelog_max={:.3e} prelog_mean={:.3e} bins={} frames={} (check frontend gain/normalization parity with Python)",
                 audio_16k_peak,
                 audio_16k_rms,
+                mel_mag_gain,
                 prelog_max,
                 prelog_mean,
                 RMVPE_MEL_BINS,
@@ -598,7 +607,7 @@ pub fn rmvpe_mel_from_audio_with_resampler(
             );
         } else if RMVPE_MEL_SCALE_LOGGED.set(()).is_ok() {
             eprintln!(
-                "[vc-signal] rmvpe mel scale (magnitude): prelog(min={:.3e} max={:.3e} mean={:.3e}) log(min={:.3} max={:.3}) bins={} frames={} rms={:.3e} peak={:.3e}",
+                "[vc-signal] rmvpe mel scale (magnitude): prelog(min={:.3e} max={:.3e} mean={:.3e}) log(min={:.3} max={:.3}) bins={} frames={} rms={:.3e} peak={:.3e} mel_gain={:.2}",
                 prelog_min,
                 prelog_max,
                 prelog_mean,
@@ -607,7 +616,8 @@ pub fn rmvpe_mel_from_audio_with_resampler(
                 RMVPE_MEL_BINS,
                 frames,
                 audio_16k_rms,
-                audio_16k_peak
+                audio_16k_peak,
+                mel_mag_gain
             );
         }
     }
@@ -822,6 +832,24 @@ fn signal_rms_peak(samples: &[f32]) -> (f32, f32) {
         peak = peak.max(s.abs());
     }
     ((sum_sq / samples.len() as f32).sqrt(), peak)
+}
+
+fn rmvpe_mel_mag_gain(rms: f32, peak: f32) -> f32 {
+    // Keep base gain at 10x and allow up to 20x for low-energy inputs.
+    // This improves voiced detection in whisper/decay regions without
+    // permanently over-amplifying already-strong frames.
+    let peak_boost = if peak > 1.0e-4 {
+        (0.2 / peak).clamp(1.0, 2.0)
+    } else {
+        2.0
+    };
+    let rms_boost = if rms > 1.0e-5 {
+        (0.02 / rms).clamp(1.0, 2.0)
+    } else {
+        2.0
+    };
+    let boost = peak_boost.max(rms_boost);
+    (RMVPE_MEL_MAG_GAIN_BASE * boost).clamp(RMVPE_MEL_MAG_GAIN_BASE, RMVPE_MEL_MAG_GAIN_MAX)
 }
 
 fn reflect_pad_center(signal: &[f32], pad: usize) -> Vec<f32> {
