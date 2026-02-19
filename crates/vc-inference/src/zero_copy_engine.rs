@@ -12,7 +12,7 @@ use ort::{
     value::{DynTensorValueType, Tensor},
 };
 use vc_core::{ModelConfig, Result, RuntimeConfig, VcError};
-use vc_signal::coarse_pitch_from_f0;
+use vc_signal::{coarse_pitch_from_f0, resize_pitch_to_frames};
 
 const DEFAULT_INPUT_SAMPLES: usize = 16_000;
 const DEFAULT_FRAME_COUNT: usize = 50;
@@ -332,63 +332,32 @@ impl ZeroCopyInferenceEngine {
         }
         if src_frames < self.frame_count {
             eprintln!(
-                "[vc-inference] warning: HuBERT returned {} frames (<{}); tail will be linearly extrapolated",
+                "[vc-inference] warning: HuBERT returned {} frames (<{}); features will be resampled to decoder contract",
                 src_frames, self.frame_count
             );
         } else if src_frames > self.frame_count {
             eprintln!(
-                "[vc-inference] HuBERT returned {} frames; slicing first {} for decoder contract",
+                "[vc-inference] HuBERT returned {} frames; features will be resampled to decoder contract ({})",
                 src_frames, self.frame_count
             );
         }
-        let copy_frames = src_frames.min(self.frame_count);
         let copy_dims = src_dim.min(self.phone_feature_dim);
         {
             self.features_workspace.fill(0.0);
-            if copy_frames > 0 {
-                if copy_dims > 0 {
-                    let src = ArrayView3::from_shape((1, src_frames, src_dim), hubert_data)
-                        .map_err(|e| {
-                            VcError::Inference(format!(
-                                "failed to view HuBERT tensor as [1,T,C] on zero-copy path: {e}"
-                            ))
-                        })?;
-                    self.features_workspace
-                        .slice_mut(s![.., ..copy_frames, ..copy_dims])
-                        .assign(&src.slice(s![.., ..copy_frames, ..copy_dims]));
-                }
-                if copy_frames < self.frame_count {
-                    if copy_dims == 0 {
-                        // no-op
-                    } else if copy_frames >= 2 {
-                        let last = self
-                            .features_workspace
-                            .slice(s![0, copy_frames - 1, ..copy_dims])
-                            .to_owned();
-                        let prev = self
-                            .features_workspace
-                            .slice(s![0, copy_frames - 2, ..copy_dims])
-                            .to_owned();
-                        let delta = &last - &prev;
-                        for t in copy_frames..self.frame_count {
-                            let step = (t - copy_frames + 1) as f32;
-                            let mut row = self.features_workspace.slice_mut(s![0, t, ..copy_dims]);
-                            for c in 0..copy_dims {
-                                row[c] = last[c] + delta[c] * step;
-                            }
-                        }
-                    } else {
-                        let tail = self
-                            .features_workspace
-                            .slice(s![0, copy_frames - 1, ..copy_dims])
-                            .to_owned();
-                        for t in copy_frames..self.frame_count {
-                            self.features_workspace
-                                .slice_mut(s![0, t, ..copy_dims])
-                                .assign(&tail);
-                        }
-                    }
-                }
+            if src_frames > 0 && copy_dims > 0 {
+                let src = ArrayView3::from_shape((1, src_frames, src_dim), hubert_data).map_err(
+                    |e| {
+                        VcError::Inference(format!(
+                            "failed to view HuBERT tensor as [1,T,C] on zero-copy path: {e}"
+                        ))
+                    },
+                )?;
+                resample_feature_frames_linear_into(
+                    &mut self.features_workspace,
+                    src,
+                    self.frame_count,
+                    copy_dims,
+                );
             }
         }
         self.update_features_buf_from_workspace()?;
@@ -432,10 +401,9 @@ impl ZeroCopyInferenceEngine {
         } else {
             self.rmvpe_threshold
         };
-        let pitchf = force_frame_count_1d_tail_pad(
-            decode_rmvpe_output(rmvpe_shape, rmvpe_data, threshold)?,
-            self.frame_count,
-        );
+        let mut pitchf =
+            resize_pitch_to_frames(&decode_rmvpe_output(rmvpe_shape, rmvpe_data, threshold)?, self.frame_count);
+        smooth_pitch_track_gaussian_inplace(&mut pitchf, 2);
         let pitch = coarse_pitch_from_f0(&pitchf);
         if pitch.len() != self.frame_count {
             return Err(VcError::Inference(format!(
@@ -685,6 +653,71 @@ fn update_features_buf_from_ndarray_impl(
         "failed to copy features host->CUDA",
         features_buf_host.copy_into(features_buf),
     )
+}
+
+fn resample_feature_frames_linear_into(
+    dst: &mut Array3<f32>,
+    src: ArrayView3<'_, f32>,
+    target_frames: usize,
+    copy_dims: usize,
+) {
+    if target_frames == 0 || copy_dims == 0 {
+        return;
+    }
+    let src_frames = src.shape()[1];
+    if src_frames == 0 {
+        return;
+    }
+    if src_frames == 1 || target_frames == 1 {
+        for t in 0..target_frames {
+            dst.slice_mut(s![0, t, ..copy_dims])
+                .assign(&src.slice(s![0, 0, ..copy_dims]));
+        }
+        return;
+    }
+    let scale = (src_frames - 1) as f32 / (target_frames - 1) as f32;
+    for t in 0..target_frames {
+        let pos = t as f32 * scale;
+        let left = pos.floor() as usize;
+        let right = (left + 1).min(src_frames - 1);
+        let frac = pos - left as f32;
+        let w_left = 1.0 - frac;
+        for c in 0..copy_dims {
+            let a = src[(0, left, c)];
+            let b = src[(0, right, c)];
+            dst[(0, t, c)] = a * w_left + b * frac;
+        }
+    }
+}
+
+fn smooth_pitch_track_gaussian_inplace(pitchf: &mut [f32], radius: usize) {
+    if radius == 0 || pitchf.len() < 3 {
+        return;
+    }
+    let src = pitchf.to_vec();
+    for i in 0..pitchf.len() {
+        if src[i] <= 0.0 {
+            continue;
+        }
+        let mut num = 0.0_f32;
+        let mut den = 0.0_f32;
+        let lo = i.saturating_sub(radius);
+        let hi = (i + radius + 1).min(src.len());
+        for j in lo..hi {
+            let v = src[j];
+            if v <= 0.0 {
+                continue;
+            }
+            let d = i.abs_diff(j) as f32;
+            let sigma = radius.max(1) as f32 * 0.75;
+            let w = (-0.5 * (d / sigma).powi(2)).exp();
+            num += v * w;
+            den += w;
+        }
+        if den > 1.0e-8 {
+            pitchf[i] = num / den;
+        }
+    }
 }
 
 fn next_u64(state: &mut u64) -> u64 {
@@ -1101,27 +1134,6 @@ fn env_bool_default_true(key: &str) -> bool {
             !(s == "0" || s == "false" || s == "no" || s == "off")
         })
         .unwrap_or(true)
-}
-
-fn force_frame_count_1d_tail_pad(values: Vec<f32>, target_frames: usize) -> Vec<f32> {
-    if values.len() == target_frames {
-        return values;
-    }
-    if values.len() > target_frames {
-        let mut out = values;
-        out.truncate(target_frames);
-        return out;
-    }
-    if target_frames == 0 {
-        return Vec::new();
-    }
-    if values.is_empty() {
-        return vec![0.0; target_frames];
-    }
-    let mut out = values;
-    let tail = *out.last().unwrap_or(&0.0);
-    out.resize(target_frames, tail);
-    out
 }
 
 fn decode_rmvpe_output(shape: &[i64], data: &[f32], threshold: f32) -> Result<Vec<f32>> {

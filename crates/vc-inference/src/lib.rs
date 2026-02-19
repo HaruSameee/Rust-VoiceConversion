@@ -18,11 +18,13 @@ use ort::{
 use vc_core::{InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::{
     apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace,
-    normalize_for_onnx_input, postprocess_generated_audio, resample_hq_into, HqResampler,
+    normalize_for_onnx_input, postprocess_generated_audio, resize_pitch_to_frames,
+    resample_hq_into, HqResampler,
     RMVPE_SAMPLE_RATE,
 };
 
 pub mod zero_copy_engine;
+pub mod audio_pipeline;
 
 const STRICT_ONNX_INPUT_SAMPLES_16K: usize = 16_000;
 const STRICT_HUBERT_OUTPUT_FRAMES: usize = 50;
@@ -462,8 +464,8 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let rmvpe_raw_stats = tensor_stats_from_iter(data.iter().copied());
         maybe_log_tensor_stats("rmvpe_raw", rmvpe_raw_stats);
         ensure_tensor_finite("rmvpe_raw", rmvpe_raw_stats)?;
-        let f0 = force_frame_count_1d_tail_pad(
-            decode_rmvpe_output(shape, data, threshold)?,
+        let f0 = resize_pitch_to_frames(
+            &decode_rmvpe_output(shape, data, threshold)?,
             STRICT_HUBERT_OUTPUT_FRAMES,
         );
         let f0_stats = tensor_stats_from_iter(f0.iter().copied());
@@ -938,6 +940,7 @@ impl InferenceEngine for RvcOrtEngine {
 
             let mut pitchf = f0;
             stabilize_sparse_pitch_track(&mut pitchf);
+            smooth_pitch_track_gaussian_inplace(&mut pitchf, 2);
             apply_pitch_shift_inplace(&mut pitchf, config.pitch_shift_semitones);
             let f0_median_radius = config.f0_median_filter_radius;
             if f0_median_radius > 0 {
@@ -1068,58 +1071,37 @@ fn force_frame_count_3d_tail_pad(frames: Array3<f32>, target_frames: usize) -> A
     if frame_len == target_frames {
         return frames;
     }
-    if frame_len > target_frames {
-        return frames.slice_move(s![.., 0..target_frames, ..]);
-    }
     if target_frames == 0 {
         return Array3::<f32>::zeros((batch, 0, channels));
     }
     if frame_len == 0 {
         return Array3::<f32>::zeros((batch, target_frames, channels));
     }
-
-    let mut out = Array3::<f32>::zeros((batch, target_frames, channels));
-    out.slice_mut(s![.., 0..frame_len, ..]).assign(&frames);
-    if frame_len >= 2 {
-        for b in 0..batch {
-            for c in 0..channels {
-                let last = frames[(b, frame_len - 1, c)];
-                let prev = frames[(b, frame_len - 2, c)];
-                let delta = last - prev;
-                for t in frame_len..target_frames {
-                    let step = (t - frame_len + 1) as f32;
-                    out[(b, t, c)] = last + delta * step;
-                }
-            }
+    if frame_len == 1 || target_frames == 1 {
+        let mut out = Array3::<f32>::zeros((batch, target_frames, channels));
+        for t in 0..target_frames {
+            out.slice_mut(s![.., t, ..])
+                .assign(&frames.slice(s![.., 0, ..]));
         }
-    } else {
-        let last = frames.slice(s![.., frame_len - 1, ..]);
-        for t in frame_len..target_frames {
-            out.slice_mut(s![.., t, ..]).assign(&last);
-        }
-    }
-    out
-}
-
-fn force_frame_count_1d_tail_pad(values: Vec<f32>, target_frames: usize) -> Vec<f32> {
-    if values.len() == target_frames {
-        return values;
-    }
-    if values.len() > target_frames {
-        let mut out = values;
-        out.truncate(target_frames);
         return out;
     }
-    if target_frames == 0 {
-        return Vec::new();
-    }
-    if values.is_empty() {
-        return vec![0.0; target_frames];
-    }
 
-    let mut out = values;
-    let tail = *out.last().unwrap_or(&0.0);
-    out.resize(target_frames, tail);
+    let scale = (frame_len - 1) as f32 / (target_frames - 1) as f32;
+    let mut out = Array3::<f32>::zeros((batch, target_frames, channels));
+    for b in 0..batch {
+        for t in 0..target_frames {
+            let src = t as f32 * scale;
+            let left = src.floor() as usize;
+            let right = (left + 1).min(frame_len - 1);
+            let frac = src - left as f32;
+            let w_left = 1.0 - frac;
+            for c in 0..channels {
+                let a = frames[(b, left, c)];
+                let bval = frames[(b, right, c)];
+                out[(b, t, c)] = a * w_left + bval * frac;
+            }
+        }
+    }
     out
 }
 
@@ -1905,6 +1887,36 @@ fn stabilize_sparse_pitch_track(pitchf: &mut [f32]) {
         for k in 0..gap_len {
             let t = (k + 1) as f32 / denom;
             pitchf[gap_start + k] = left * (1.0 - t) + right * t;
+        }
+    }
+}
+
+fn smooth_pitch_track_gaussian_inplace(pitchf: &mut [f32], radius: usize) {
+    if radius == 0 || pitchf.len() < 3 {
+        return;
+    }
+    let src = pitchf.to_vec();
+    for i in 0..pitchf.len() {
+        if src[i] <= 0.0 {
+            continue;
+        }
+        let mut num = 0.0_f32;
+        let mut den = 0.0_f32;
+        let lo = i.saturating_sub(radius);
+        let hi = (i + radius + 1).min(src.len());
+        for j in lo..hi {
+            let v = src[j];
+            if v <= 0.0 {
+                continue;
+            }
+            let d = i.abs_diff(j) as f32;
+            let sigma = radius.max(1) as f32 * 0.75;
+            let w = (-0.5 * (d / sigma).powi(2)).exp();
+            num += v * w;
+            den += w;
+        }
+        if den > 1.0e-8 {
+            pitchf[i] = num / den;
         }
     }
 }

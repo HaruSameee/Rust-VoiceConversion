@@ -19,6 +19,8 @@ const MIN_INFERENCE_BLOCK: usize = 8_192;
 const MIN_OUTPUT_CROSSFADE_SAMPLES: usize = 256;
 const MAX_OUTPUT_CROSSFADE_SAMPLES: usize = 1_024;
 const SOLA_SEARCH_MS: f32 = 10.0;
+const OLA_MIN_OVERLAP_RATIO: f32 = 0.25;
+const OLA_MAX_OVERLAP_RATIO: f32 = 0.50;
 const BLOCK_ALIGN_SAMPLES: usize = 256;
 const WARMUP_BUDGET_HEADROOM: f64 = 1.25;
 const MAX_AUTO_BLOCK_SIZE: usize = 96_000;
@@ -661,6 +663,8 @@ fn worker_loop<E>(
                 &output_source
             };
             let expected_len = output_step_samples.min(output_mono.len().max(1));
+            let ola_overlap_samples =
+                compute_ola_overlap_samples(expected_len, crossfade_samples, extra_inference_ms);
             // Avoid using the very end of each block where non-causal generators are often unstable.
             let max_guard = output_mono.len().saturating_sub(expected_len);
             let applied_guard = edge_guard_samples.min(max_guard);
@@ -690,23 +694,11 @@ fn worker_loop<E>(
                 let pad = smoothed_output.last().copied().unwrap_or(0.0);
                 smoothed_output.resize(expected_len, pad);
             }
-            let crossfade = crossfade_samples
+            let overlap = ola_overlap_samples
                 .min(smoothed_output.len())
                 .min(previous_output_tail.len());
-            if crossfade > 0 {
-                let prev_start = previous_output_tail.len() - crossfade;
-                let inv = 1.0_f32 / (crossfade + 1) as f32;
-                for i in 0..crossfade {
-                    let a = previous_output_tail[prev_start + i];
-                    let b = smoothed_output[i];
-                    let t = (i + 1) as f32 * inv;
-                    // Equal-power curve (sin/cos) avoids perceived dip at segment seams.
-                    let theta = t * std::f32::consts::FRAC_PI_2;
-                    let (w_b, w_a) = theta.sin_cos();
-                    smoothed_output[i] = a * w_a + b * w_b;
-                }
-            }
-            let keep = crossfade_samples.min(smoothed_output.len());
+            apply_raised_cosine_overlap(&previous_output_tail, &mut smoothed_output, overlap);
+            let keep = ola_overlap_samples.min(smoothed_output.len());
             previous_output_tail.clear();
             if keep > 0 {
                 previous_output_tail
@@ -960,6 +952,41 @@ fn default_output_crossfade_samples(output_rate: u32) -> usize {
         MIN_OUTPUT_CROSSFADE_SAMPLES as f32,
         MAX_OUTPUT_CROSSFADE_SAMPLES as f32,
     ) as usize
+}
+
+fn compute_ola_overlap_samples(
+    expected_len: usize,
+    base_crossfade: usize,
+    extra_inference_ms: u32,
+) -> usize {
+    if expected_len == 0 {
+        return 0;
+    }
+    let floor = base_crossfade.min(expected_len).max(1);
+    let min_overlap = ((expected_len as f32) * OLA_MIN_OVERLAP_RATIO)
+        .round()
+        .max(floor as f32) as usize;
+    let max_overlap = (((expected_len as f32) * OLA_MAX_OVERLAP_RATIO)
+        .round()
+        .max(min_overlap as f32) as usize)
+        .min(expected_len);
+    let t = (extra_inference_ms as f32 / 300.0).clamp(0.0, 1.0);
+    min_overlap + (((max_overlap - min_overlap) as f32) * t).round() as usize
+}
+
+fn apply_raised_cosine_overlap(previous_tail: &[f32], current: &mut [f32], overlap: usize) {
+    if overlap == 0 || previous_tail.len() < overlap || current.len() < overlap {
+        return;
+    }
+    let prev_start = previous_tail.len() - overlap;
+    let inv = 1.0_f32 / (overlap + 1) as f32;
+    for i in 0..overlap {
+        let t = (i + 1) as f32 * inv;
+        // Raised-cosine overlap-add where weights always sum to 1.0.
+        let w_curr = 0.5_f32 - 0.5_f32 * (std::f32::consts::PI * t).cos();
+        let w_prev = 1.0_f32 - w_curr;
+        current[i] = previous_tail[prev_start + i] * w_prev + current[i] * w_curr;
+    }
 }
 
 #[derive(Default)]
