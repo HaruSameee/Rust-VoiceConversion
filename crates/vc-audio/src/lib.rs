@@ -485,7 +485,9 @@ fn worker_loop<E>(
                 break;
             }
         };
-        gate.process_block(&mut mono);
+        if response_threshold > 0.0 {
+            gate.process_block(&mut mono);
+        }
 
         if !input_to_model_resampler.is_identity() {
             resample_hq_into(&input_to_model_resampler, &mono, &mut model_rate_buf);
@@ -779,12 +781,12 @@ impl ReactionGate {
 
 fn normalize_response_threshold(raw: f32) -> f32 {
     if !raw.is_finite() {
-        return 0.02;
+        return 0.0;
     }
-    if raw < 0.0 {
-        // Support dBFS style input used by common VC tools (e.g. -50 dB).
-        let db = raw.clamp(-90.0, 0.0);
-        return 10.0_f32.powf(db / 20.0);
+    if raw <= 0.0 {
+        // 0.0 means gate disabled (fully open).
+        // Negative legacy dB-style values are treated as disabled as well.
+        return 0.0;
     }
     raw.clamp(0.0, 1.0)
 }

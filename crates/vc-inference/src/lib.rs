@@ -21,8 +21,8 @@ use ort::{
 };
 use vc_core::{InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::{
-    apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace, normalize_for_onnx_input,
-    pad_for_rmvpe, postprocess_generated_audio, resample_hq_into,
+    apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace, pad_for_rmvpe,
+    postprocess_generated_audio, resample_hq_into,
     resize_pitch_to_frames, rmvpe_mel_from_audio, rmvpe_mel_from_audio_with_resampler,
     HqResampler, RMVPE_SAMPLE_RATE, RVC_HOP_LENGTH,
 };
@@ -832,7 +832,8 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
 impl InferenceEngine for RvcOrtEngine {
     fn infer_frame(&mut self, frame: &[f32], config: &RuntimeConfig) -> Result<Vec<f32>> {
         let mut infer = || -> Result<Vec<f32>> {
-            let normalized = normalize_for_onnx_input(frame, 0.95);
+            // Keep HuBERT/RMVPE input as raw waveform (no per-block auto-normalization).
+            let normalized = frame.to_vec();
             let rmvpe_hop_at_input = rvc_hop_samples_at_input_rate(config.sample_rate);
             let rmvpe_pad = pad_for_rmvpe(&normalized, rmvpe_hop_at_input);
             let fallback_frames =

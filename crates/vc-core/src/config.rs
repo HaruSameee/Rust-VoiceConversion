@@ -67,7 +67,7 @@ impl Default for RuntimeConfig {
             rms_mix_rate: 0.2,
             f0_median_filter_radius: 3,
             extra_inference_ms: 0,
-            response_threshold: -50.0,
+            response_threshold: 0.0,
             fade_in_ms: 15,
             fade_out_ms: 80,
             speaker_id: 0,
