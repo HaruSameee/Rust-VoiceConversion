@@ -616,7 +616,9 @@ pub fn rmvpe_mel_from_audio_with_resampler(
     let mut out = Array3::<f32>::zeros((1, RMVPE_MEL_BINS, aligned_frames));
     for m in 0..RMVPE_MEL_BINS {
         for t in 0..aligned_frames {
-            let src_t = t.min(frames - 1);
+            // Keep temporal length aligned to 32 while avoiding hard edge repeats.
+            // Reflect padding tends to reduce boundary artifacts for CNN stacks.
+            let src_t = reflect_tail_index(t, frames);
             out[(0, m, t)] = mel[(m, src_t)];
         }
     }
@@ -850,6 +852,16 @@ fn reflect_index(index: isize, len: usize) -> usize {
     x as usize
 }
 
+fn reflect_tail_index(index: usize, len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    if index < len {
+        return index;
+    }
+    reflect_index(index as isize, len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,5 +942,21 @@ mod tests {
         assert!((mel_1k - 15.0).abs() < 1e-4);
         let hz_15 = mel_to_hz_slaney(15.0);
         assert!((hz_15 - 1_000.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn reflect_tail_index_mirrors_after_end() {
+        let got: Vec<usize> = (0..10).map(|i| reflect_tail_index(i, 5)).collect();
+        let expected = vec![0, 1, 2, 3, 4, 3, 2, 1, 0, 1];
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn rmvpe_mel_frames_are_32_aligned() {
+        let signal = vec![0.0_f32; 16_000];
+        let mel = rmvpe_mel_from_audio(&signal, RMVPE_SAMPLE_RATE);
+        let t = mel.mel.shape()[2];
+        assert_eq!(t % RMVPE_FRAME_ALIGN, 0);
+        assert!(t >= mel.valid_frames);
     }
 }
