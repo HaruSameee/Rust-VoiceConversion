@@ -21,6 +21,7 @@ pub const RMVPE_FRAME_ALIGN: usize = 32;
 const HQ_RESAMPLE_HALF_TAPS: isize = 60;
 const HQ_RESAMPLE_PHASES: usize = 512;
 const HQ_DOWNSAMPLE_CUTOFF_GUARD: f32 = 0.96;
+const RMVPE_MEL_MAG_GAIN: f32 = 10.0;
 static HQ_RESAMPLE_BANK_CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<HqResampleBank>>>> =
     OnceLock::new();
 static RMVPE_MEL_SCALE_LOGGED: OnceLock<()> = OnceLock::new();
@@ -555,7 +556,8 @@ pub fn rmvpe_mel_from_audio_with_resampler(
             let mut acc = 0.0_f32;
             for b in 0..bins {
                 let mag = spec[(b, t)];
-                acc += mel_bank[(m, b)] * mag;
+                let scaled_mag = mag * RMVPE_MEL_MAG_GAIN;
+                acc += mel_bank[(m, b)] * scaled_mag;
             }
             let clamped = acc.max(1e-5);
             prelog_min = prelog_min.min(clamped);
