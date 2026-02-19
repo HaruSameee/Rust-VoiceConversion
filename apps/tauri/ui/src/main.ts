@@ -49,6 +49,10 @@ interface RuntimeConfig {
   index_max_vectors: number;
 }
 
+type SetRuntimeConfigArgs = {
+  config: RuntimeConfig;
+};
+
 interface PresetEntry {
   model: ModelConfig;
   runtime: RuntimeConfig;
@@ -113,6 +117,8 @@ const ui = {
   ortProvider: $("ortProvider") as HTMLSelectElement,
   ortDeviceId: $("ortDeviceId") as HTMLInputElement,
   ortGpuMemLimitMb: $("ortGpuMemLimitMb") as HTMLInputElement,
+  ortIntraThreads: $("ortIntraThreads") as HTMLInputElement,
+  ortInterThreads: $("ortInterThreads") as HTMLInputElement,
   reloadBtn: $("reloadBtn") as HTMLButtonElement,
   saveBtn: $("saveBtn") as HTMLButtonElement,
   startBtn: $("startBtn") as HTMLButtonElement,
@@ -132,6 +138,7 @@ let statusPollErrorStreak = 0;
 let runtimeCache: RuntimeConfig | null = null;
 const PRESET_STORAGE_KEY = "rust_vc_presets_v1";
 let presetStore: PresetStore = {};
+const MAX_ORT_THREADS = Math.max(1, Math.round(Number(navigator.hardwareConcurrency) || 4));
 
 function now(): string {
   return new Date().toISOString();
@@ -333,8 +340,8 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     f0_median_filter_radius: intAtLeast(raw.f0_median_filter_radius, 0, 3),
     extra_inference_ms: intAtLeast(raw.extra_inference_ms, 0, 0),
     response_threshold: finiteOr(raw.response_threshold, -50.0),
-    fade_in_ms: intAtLeast(raw.fade_in_ms, 0, 15),
-    fade_out_ms: intAtLeast(raw.fade_out_ms, 0, 80),
+    fade_in_ms: intAtLeast(raw.fade_in_ms, 0, 12),
+    fade_out_ms: intAtLeast(raw.fade_out_ms, 0, 120),
     speaker_id: Math.round(finiteOr(raw.speaker_id, 0)),
     sample_rate: intAtLeast(raw.sample_rate, 1, 48000),
     block_size: intAtLeast(raw.block_size, 1, 8192),
@@ -343,8 +350,8 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
       : "auto",
     ort_device_id: intAtLeast(raw.ort_device_id, 0, 0),
     ort_gpu_mem_limit_mb: intAtLeast(raw.ort_gpu_mem_limit_mb, 0, 0),
-    ort_intra_threads: Math.round(clamp(raw.ort_intra_threads, 1, 4, 4)),
-    ort_inter_threads: intAtLeast(raw.ort_inter_threads, 1, 1),
+    ort_intra_threads: Math.round(clamp(raw.ort_intra_threads, 0, MAX_ORT_THREADS, 0)),
+    ort_inter_threads: Math.round(clamp(raw.ort_inter_threads, 1, MAX_ORT_THREADS, 1)),
     ort_parallel_execution: Boolean(raw.ort_parallel_execution),
     hubert_context_samples_16k: intAtLeast(raw.hubert_context_samples_16k, 1600, 16000),
     hubert_output_layer: Math.round(finiteOr(raw.hubert_output_layer, 12)),
@@ -396,8 +403,8 @@ function runtimeFromInputs(): RuntimeConfig {
     ort_provider: ui.ortProvider.value,
     ort_device_id: Number(ui.ortDeviceId.value),
     ort_gpu_mem_limit_mb: Number(ui.ortGpuMemLimitMb.value),
-    ort_intra_threads: base?.ort_intra_threads ?? 4,
-    ort_inter_threads: base?.ort_inter_threads ?? 1,
+    ort_intra_threads: Number(ui.ortIntraThreads.value),
+    ort_inter_threads: Number(ui.ortInterThreads.value),
     ort_parallel_execution: base?.ort_parallel_execution ?? false,
     hubert_context_samples_16k: base?.hubert_context_samples_16k ?? 16000,
     hubert_output_layer: base?.hubert_output_layer ?? 12,
@@ -444,6 +451,8 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.ortProvider.value = config.ort_provider;
   ui.ortDeviceId.value = String(config.ort_device_id);
   ui.ortGpuMemLimitMb.value = String(config.ort_gpu_mem_limit_mb);
+  ui.ortIntraThreads.value = String(config.ort_intra_threads);
+  ui.ortInterThreads.value = String(config.ort_inter_threads);
 }
 
 function applyStatus(status: EngineStatus): void {
@@ -493,7 +502,8 @@ async function saveAll(): Promise<void> {
   }
   log("INFO", "saveAll begin", { model, runtime });
   await invoke("set_model_config_cmd", { model });
-  await invoke("set_runtime_config_cmd", { config: runtime });
+  const runtimeArgs: SetRuntimeConfigArgs = { config: runtime };
+  await invoke("set_runtime_config_cmd", runtimeArgs);
   log("INFO", "saveAll done");
 }
 

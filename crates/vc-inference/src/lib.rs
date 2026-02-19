@@ -1,17 +1,14 @@
 use std::{
     any::Any,
-    fs, io,
+    env, fs, io,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        OnceLock,
-    },
+    sync::{Arc, Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{s, Array1, Array2, Array3};
 use ort::{
     ep::{self, ExecutionProvider, ExecutionProviderDispatch},
     session::{builder::GraphOptimizationLevel, Session, SessionInputValue},
@@ -20,16 +17,15 @@ use ort::{
 };
 use vc_core::{InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::{
-    apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace, pad_for_rmvpe,
-    postprocess_generated_audio, resample_hq_into, resize_pitch_to_frames, rmvpe_mel_from_audio,
-    rmvpe_mel_from_audio_with_resampler, HqResampler, RMVPE_SAMPLE_RATE, RVC_HOP_LENGTH,
+    apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace,
+    normalize_for_onnx_input, postprocess_generated_audio, resample_hq_into, HqResampler,
+    RMVPE_SAMPLE_RATE,
 };
 
-const MIN_HUBERT_CONTEXT_SAMPLES_16K: usize = 1_600;
-const MAX_HUBERT_CONTEXT_SAMPLES_16K: usize = 64_000;
-const HUBERT_SOURCE_LEN_ALIGN: usize = 320;
-const HUBERT_LEN_FALLBACK_STEP: usize = 32;
-const HUBERT_LEN_FALLBACK_MAX_TRIES: usize = 32;
+pub mod zero_copy_engine;
+
+const STRICT_ONNX_INPUT_SAMPLES_16K: usize = 16_000;
+const STRICT_HUBERT_OUTPUT_FRAMES: usize = 50;
 const DEFAULT_RMVPE_THRESHOLD: f32 = 0.01;
 static ORT_INIT_FAILED: OnceLock<String> = OnceLock::new();
 static ORT_PROVIDER_AVAIL_LOGGED: OnceLock<()> = OnceLock::new();
@@ -37,7 +33,131 @@ static ORT_CUDA_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_DML_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_AUTO_CPU_WARN_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_CUDA_TUNE_LOGGED: OnceLock<()> = OnceLock::new();
-static RMVPE_ZERO_F0_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
+static TENSOR_STATS_DEBUG: OnceLock<bool> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct TensorStats {
+    total_count: usize,
+    finite_count: usize,
+    nan_count: usize,
+    inf_count: usize,
+    min: f32,
+    max: f32,
+    mean: f32,
+    rms: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TensorStatsAccum {
+    total_count: usize,
+    finite_count: usize,
+    nan_count: usize,
+    inf_count: usize,
+    min: f32,
+    max: f32,
+    sum: f64,
+    sum_sq: f64,
+}
+
+impl TensorStatsAccum {
+    fn push(&mut self, v: f32) {
+        self.total_count += 1;
+        if v.is_nan() {
+            self.nan_count += 1;
+            return;
+        }
+        if v.is_infinite() {
+            self.inf_count += 1;
+            return;
+        }
+        if self.finite_count == 0 {
+            self.min = v;
+            self.max = v;
+        } else {
+            self.min = self.min.min(v);
+            self.max = self.max.max(v);
+        }
+        self.finite_count += 1;
+        let vf = v as f64;
+        self.sum += vf;
+        self.sum_sq += vf * vf;
+    }
+
+    fn finish(self) -> TensorStats {
+        if self.finite_count == 0 {
+            return TensorStats {
+                total_count: self.total_count,
+                finite_count: 0,
+                nan_count: self.nan_count,
+                inf_count: self.inf_count,
+                min: 0.0,
+                max: 0.0,
+                mean: 0.0,
+                rms: 0.0,
+            };
+        }
+        let denom = self.finite_count as f64;
+        TensorStats {
+            total_count: self.total_count,
+            finite_count: self.finite_count,
+            nan_count: self.nan_count,
+            inf_count: self.inf_count,
+            min: self.min,
+            max: self.max,
+            mean: (self.sum / denom) as f32,
+            rms: (self.sum_sq / denom).sqrt() as f32,
+        }
+    }
+}
+
+fn tensor_stats_enabled() -> bool {
+    *TENSOR_STATS_DEBUG.get_or_init(|| {
+        env::var("RUST_VC_DEBUG_TENSOR_STATS")
+            .map(|v| {
+                let s = v.trim().to_ascii_lowercase();
+                s == "1" || s == "true" || s == "yes" || s == "on"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn tensor_stats_from_iter<I>(iter: I) -> TensorStats
+where
+    I: IntoIterator<Item = f32>,
+{
+    let mut acc = TensorStatsAccum::default();
+    for v in iter {
+        acc.push(v);
+    }
+    acc.finish()
+}
+
+fn maybe_log_tensor_stats(label: &str, stats: TensorStats) {
+    if !tensor_stats_enabled() {
+        return;
+    }
+    eprintln!(
+        "[vc-inference] stats {label}: total={} finite={} nan={} inf={} min={:.6e} max={:.6e} mean={:.6e} rms={:.6e}",
+        stats.total_count,
+        stats.finite_count,
+        stats.nan_count,
+        stats.inf_count,
+        stats.min,
+        stats.max,
+        stats.mean,
+        stats.rms
+    );
+}
+
+fn ensure_tensor_finite(label: &str, stats: TensorStats) -> Result<()> {
+    if stats.nan_count > 0 || stats.inf_count > 0 {
+        return Err(VcError::Inference(format!(
+            "{label} contains non-finite values: nan={} inf={} total={}",
+            stats.nan_count, stats.inf_count, stats.total_count
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy)]
 enum OrtProvider {
@@ -81,17 +201,12 @@ pub struct RvcOrtEngine {
     hubert_session: Option<Session>,
     feature_index: Option<FeatureIndex>,
     phone_feature_dim: usize,
-    hubert_source_history_16k: Vec<f32>,
-    hubert_context_samples_16k: usize,
-    hubert_compatible_len_16k: Option<usize>,
-    hubert_output_layer: i64,
-    hubert_upsample_factor: usize,
     input_to_16k_resampler: HqResampler,
     ort_intra_threads: usize,
     ort_inter_threads: usize,
     ort_parallel_execution: bool,
     ort_cuda_tuning: OrtCudaTuning,
-    hubert_runtime_cpu_fallback_tried: bool,
+    zero_copy_engine: Option<Arc<Mutex<zero_copy_engine::ZeroCopyInferenceEngine>>>,
     rvc_runtime_cpu_fallback_tried: bool,
     default_pitch_smooth_alpha: f32,
     index_prev_vector: Vec<f32>,
@@ -117,17 +232,11 @@ impl RvcOrtEngine {
 
         let build_res = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<Self> {
             ort::init().commit();
-            let ort_intra_threads = runtime_config.ort_intra_threads.max(1);
-            let ort_inter_threads = runtime_config.ort_inter_threads.max(1);
+            let ort_intra_threads = runtime_config.intra_threads as usize;
+            let ort_inter_threads = runtime_config.inter_threads as usize;
             let ort_parallel_execution = runtime_config.ort_parallel_execution;
             let ort_ep = resolve_ort_execution_config(runtime_config);
             let ort_cuda_tuning = resolve_ort_cuda_tuning(runtime_config);
-            let hubert_context_samples_16k = runtime_config.hubert_context_samples_16k.clamp(
-                MIN_HUBERT_CONTEXT_SAMPLES_16K,
-                MAX_HUBERT_CONTEXT_SAMPLES_16K,
-            );
-            let hubert_output_layer = runtime_config.hubert_output_layer;
-            let hubert_upsample_factor = runtime_config.hubert_upsample_factor.clamp(1, 4);
             let pitch_smooth_alpha = if runtime_config.pitch_smooth_alpha.is_finite() {
                 runtime_config.pitch_smooth_alpha
             } else {
@@ -135,9 +244,17 @@ impl RvcOrtEngine {
             }
             .max(0.0);
             eprintln!(
-                "[vc-inference] ort intra_threads={} inter_threads={} parallel={} provider={:?} dev={} vram_limit_mb={} hubert_ctx_16k={} hubert_layer={} hubert_up={} pitch_smooth_alpha={:.2}",
-                ort_intra_threads,
-                ort_inter_threads,
+                "[vc-inference] ort intra_threads={} inter_threads={} parallel={} provider={:?} dev={} vram_limit_mb={} strict_input_16k={} strict_hubert_frames={} pitch_smooth_alpha={:.2}",
+                if ort_intra_threads == 0 {
+                    "auto".to_string()
+                } else {
+                    ort_intra_threads.to_string()
+                },
+                if ort_inter_threads == 0 {
+                    "auto".to_string()
+                } else {
+                    ort_inter_threads.to_string()
+                },
                 ort_parallel_execution,
                 ort_ep.provider,
                 ort_ep.device_id,
@@ -145,9 +262,8 @@ impl RvcOrtEngine {
                     .gpu_mem_limit_bytes
                     .map(|v| v / (1024 * 1024))
                     .unwrap_or(0),
-                hubert_context_samples_16k,
-                hubert_output_layer,
-                hubert_upsample_factor,
+                STRICT_ONNX_INPUT_SAMPLES_16K,
+                STRICT_HUBERT_OUTPUT_FRAMES,
                 pitch_smooth_alpha
             );
 
@@ -248,6 +364,23 @@ impl RvcOrtEngine {
                 }
                 None => None,
             };
+            let zero_copy_engine = match zero_copy_engine::ZeroCopyInferenceEngine::try_new_from_env(
+                &model,
+                runtime_config,
+            ) {
+                Ok(engine) => {
+                    if engine.is_some() {
+                        eprintln!("[vc-inference] zero-copy execution path enabled (experimental)");
+                    }
+                    engine
+                }
+                Err(e) => {
+                    eprintln!(
+                            "[vc-inference] warning: zero-copy init failed; fallback to standard path. cause={e}"
+                        );
+                    None
+                }
+            };
 
             Ok(Self {
                 model,
@@ -256,11 +389,6 @@ impl RvcOrtEngine {
                 hubert_session,
                 feature_index,
                 phone_feature_dim,
-                hubert_source_history_16k: Vec::with_capacity(hubert_context_samples_16k),
-                hubert_context_samples_16k,
-                hubert_compatible_len_16k: None,
-                hubert_output_layer,
-                hubert_upsample_factor,
                 input_to_16k_resampler: HqResampler::new(
                     runtime_config.sample_rate.max(1),
                     RMVPE_SAMPLE_RATE,
@@ -269,7 +397,7 @@ impl RvcOrtEngine {
                 ort_inter_threads,
                 ort_parallel_execution,
                 ort_cuda_tuning,
-                hubert_runtime_cpu_fallback_tried: false,
+                zero_copy_engine: zero_copy_engine.map(|engine| Arc::new(Mutex::new(engine))),
                 rvc_runtime_cpu_fallback_tried: false,
                 default_pitch_smooth_alpha: pitch_smooth_alpha,
                 index_prev_vector: Vec::new(),
@@ -296,48 +424,29 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         &self.model.model_path
     }
 
-    fn estimate_pitch(
-        &mut self,
-        padded_input: &[f32],
-        input_sample_rate: u32,
-        fallback_frames: usize,
-        threshold: f32,
-    ) -> Result<Vec<f32>> {
+    fn estimate_pitch(&mut self, source_16k: &[f32], threshold: f32) -> Result<Vec<f32>> {
         let Some(session) = self.rmvpe_session.as_mut() else {
-            return Ok(vec![0.0; fallback_frames]);
+            return Ok(vec![0.0; STRICT_HUBERT_OUTPUT_FRAMES]);
         };
+        if source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
+            return Err(VcError::Inference(format!(
+                "strict rmvpe input length mismatch: got={}, expected={}",
+                source_16k.len(),
+                STRICT_ONNX_INPUT_SAMPLES_16K
+            )));
+        }
 
-        let inlet = session
-            .inputs()
-            .first()
-            .ok_or_else(|| VcError::Inference("rmvpe model has no inputs".to_string()))?;
+        let inputs = session.inputs();
+        if inputs.len() != 1 {
+            return Err(VcError::Inference(format!(
+                "strict rmvpe expects exactly 1 input, got {}",
+                inputs.len()
+            )));
+        }
+        let inlet = &inputs[0];
         let input_name = inlet.name().to_string();
-        let input_shape = inlet
-            .dtype()
-            .tensor_shape()
-            .map_or_else(Vec::new, |s| s.to_vec());
-        let rank = input_shape.len();
-        let expects_mel = rank == 3 && input_shape.get(1).map(|v| *v == 128).unwrap_or(false);
-        let (input_tensor, valid_frames) = if expects_mel {
-            let mel_input = if input_sample_rate == self.input_to_16k_resampler.src_rate() {
-                rmvpe_mel_from_audio_with_resampler(
-                    padded_input,
-                    input_sample_rate,
-                    &self.input_to_16k_resampler,
-                )
-            } else {
-                rmvpe_mel_from_audio(padded_input, input_sample_rate)
-            };
-            let tensor = Tensor::from_array(mel_input.mel.clone()).map_err(|e| {
-                VcError::Inference(format!("failed to create rmvpe mel tensor [1,128,T]: {e}"))
-            })?;
-            (tensor, mel_input.valid_frames)
-        } else {
-            (
-                tensor_from_audio_rank_owned(rank.max(1), padded_input.to_vec())?,
-                fallback_frames,
-            )
-        };
+        let rank = inlet.dtype().tensor_shape().map_or(2, |shape| shape.len());
+        let input_tensor = tensor_from_audio_rank_owned(rank.max(2), source_16k.to_vec())?;
 
         let outputs = session
             .run(vec![(input_name, SessionInputValue::from(input_tensor))])
@@ -347,200 +456,85 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
                 "rmvpe model returned no outputs".to_string(),
             ));
         }
-
         let (shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(|e| {
             VcError::Inference(format!("failed to extract rmvpe output tensor<f32>: {e}"))
         })?;
-        let mut f0 = decode_rmvpe_output(shape, data, threshold)?;
-        if !f0.is_empty() && f0.iter().all(|&v| v <= 0.0) && threshold > 0.0 {
-            // Avoid forcing voiced F0 from pure noise floor.
-            // Keep fallback floor at 0.01 instead of 0.0.
-            let fallback_floor = 0.01_f32;
-            let retry_thresholds = [
-                (threshold * 0.5).max(fallback_floor),
-                (threshold * 0.25).max(fallback_floor),
-                fallback_floor,
-            ];
-            let total = f0.len().max(1);
-            let min_voiced = (total / 16).max(2);
-            let mut best_f0: Option<Vec<f32>> = None;
-            let mut best_voiced = 0usize;
-            let mut best_th = threshold;
-            for &retry_th in &retry_thresholds {
-                if retry_th >= threshold {
-                    continue;
-                }
-                let retry = decode_rmvpe_output(shape, data, retry_th)?;
-                let voiced = retry.iter().filter(|&&v| v > 0.0).count();
-                if voiced > best_voiced {
-                    best_voiced = voiced;
-                    best_th = retry_th;
-                    best_f0 = Some(retry);
-                }
-            }
-            if best_voiced >= min_voiced {
-                if let Some(best) = best_f0 {
-                    eprintln!(
-                        "[vc-inference] rmvpe threshold fallback: {:.3} -> {:.3} (voiced frames recovered: {} / {}, min_required={})",
-                        threshold,
-                        best_th,
-                        best_voiced,
-                        total,
-                        min_voiced
-                    );
-                    f0 = best;
-                }
-            } else if best_voiced > 0 {
-                eprintln!(
-                    "[vc-inference] rmvpe threshold fallback skipped: sparse voiced recovery {} / {} (< min_required={})",
-                    best_voiced,
-                    total,
-                    min_voiced
-                );
-            }
-        }
-        if valid_frames > 0 && f0.len() > valid_frames {
-            f0.truncate(valid_frames);
-        }
+        let rmvpe_raw_stats = tensor_stats_from_iter(data.iter().copied());
+        maybe_log_tensor_stats("rmvpe_raw", rmvpe_raw_stats);
+        ensure_tensor_finite("rmvpe_raw", rmvpe_raw_stats)?;
+        let f0 = force_frame_count_1d_tail_pad(
+            decode_rmvpe_output(shape, data, threshold)?,
+            STRICT_HUBERT_OUTPUT_FRAMES,
+        );
+        let f0_stats = tensor_stats_from_iter(f0.iter().copied());
+        maybe_log_tensor_stats("rmvpe_f0", f0_stats);
+        ensure_tensor_finite("rmvpe_f0", f0_stats)?;
         Ok(f0)
     }
 
-    fn extract_phone_features(
-        &mut self,
-        normalized: &[f32],
-        input_sample_rate: u32,
-        target_phone_frames: usize,
-    ) -> Result<Array3<f32>> {
-        if self.hubert_session.is_none() {
+    fn extract_phone_features(&mut self, source_16k: &[f32]) -> Result<Array3<f32>> {
+        let Some(session) = self.hubert_session.as_mut() else {
             return Err(VcError::Config(
-                "hubert session is unavailable. RVC requires HuBERT/ContentVec phone features; set `hubert_path` to a valid ONNX model."
-                    .to_string(),
+                "hubert session is unavailable. strict mode requires HuBERT ONNX.".to_string(),
+            ));
+        };
+        if source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
+            return Err(VcError::Inference(format!(
+                "strict hubert input length mismatch: got={}, expected={}",
+                source_16k.len(),
+                STRICT_ONNX_INPUT_SAMPLES_16K
+            )));
+        }
+
+        let inputs = session.inputs();
+        if inputs.len() != 1 {
+            return Err(VcError::Inference(format!(
+                "strict hubert expects exactly 1 input, got {}",
+                inputs.len()
+            )));
+        }
+        let inlet = &inputs[0];
+        let input_name = inlet.name().to_string();
+        let rank = inlet.dtype().tensor_shape().map_or(2, |shape| shape.len());
+        let input_tensor = tensor_from_audio_rank_owned(rank.max(2), source_16k.to_vec())?;
+
+        let outputs = session
+            .run(vec![(input_name, SessionInputValue::from(input_tensor))])
+            .map_err(|e| VcError::Inference(format!("hubert inference failed: {e}")))?;
+        if outputs.len() == 0 {
+            return Err(VcError::Inference(
+                "hubert model returned no outputs".to_string(),
             ));
         }
-
-        let mut chunk_16k = Vec::<f32>::new();
-        if input_sample_rate == RMVPE_SAMPLE_RATE {
-            chunk_16k.extend_from_slice(normalized);
-        } else {
-            if input_sample_rate == self.input_to_16k_resampler.src_rate()
-                && self.input_to_16k_resampler.dst_rate() == RMVPE_SAMPLE_RATE
-            {
-                resample_hq_into(&self.input_to_16k_resampler, normalized, &mut chunk_16k);
-            } else {
-                let local = HqResampler::new(input_sample_rate, RMVPE_SAMPLE_RATE);
-                resample_hq_into(&local, normalized, &mut chunk_16k);
-            }
-        }
-        if chunk_16k.is_empty() {
-            chunk_16k.push(0.0);
-        }
-
-        let requested_ctx = self
-            .hubert_compatible_len_16k
-            .unwrap_or(self.hubert_context_samples_16k)
-            .clamp(
-                MIN_HUBERT_CONTEXT_SAMPLES_16K,
-                MAX_HUBERT_CONTEXT_SAMPLES_16K,
-            );
-        self.hubert_source_history_16k.extend(chunk_16k);
-        if self.hubert_source_history_16k.len() > MAX_HUBERT_CONTEXT_SAMPLES_16K {
-            let drop_n = self.hubert_source_history_16k.len() - MAX_HUBERT_CONTEXT_SAMPLES_16K;
-            self.hubert_source_history_16k.drain(0..drop_n);
-        }
-
-        let phone = match self.run_hubert_with_length_recovery(requested_ctx) {
-            Ok(phone) => phone,
-            Err(err) => {
-                if !self.try_hubert_runtime_cpu_fallback(&err)? {
-                    return Err(err);
-                }
-                self.run_hubert_with_length_recovery(requested_ctx)?
-            }
-        };
-        let tail = tail_phone_frames(&phone, target_phone_frames.max(1));
-        Ok(tail)
-    }
-
-    fn run_hubert_with_length_recovery(&mut self, requested_ctx_16k: usize) -> Result<Array3<f32>> {
-        let candidates = hubert_source_len_candidates(requested_ctx_16k);
-        let mut first_err: Option<VcError> = None;
-        for candidate in candidates {
-            let source = build_hubert_reflect_window(&self.hubert_source_history_16k, candidate);
-            match run_hubert_session(
-                self.hubert_session
-                    .as_mut()
-                    .expect("hubert_session checked above"),
-                &source,
-                0,
-                self.phone_feature_dim,
-                self.hubert_output_layer,
-            ) {
-                Ok(phone) => {
-                    if candidate != requested_ctx_16k {
-                        eprintln!(
-                            "[vc-inference] hubert source_len adjusted: requested={} -> {}",
-                            requested_ctx_16k, candidate
-                        );
-                    }
-                    self.hubert_compatible_len_16k = Some(candidate);
-                    return Ok(phone);
-                }
-                Err(err) => {
-                    let retry = is_hubert_length_shape_mismatch(&err);
-                    if first_err.is_none() {
-                        first_err = Some(err);
-                    }
-                    if !retry {
-                        break;
-                    }
-                }
-            }
-        }
-        Err(first_err.unwrap_or_else(|| {
-            VcError::Inference("hubert inference failed without detailed error".to_string())
-        }))
-    }
-
-    fn try_hubert_runtime_cpu_fallback(&mut self, cause: &VcError) -> Result<bool> {
-        if self.hubert_runtime_cpu_fallback_tried {
-            return Ok(false);
-        }
-        if !is_hubert_cuda_runtime_failure(cause) {
-            return Ok(false);
-        }
-        let Some(path) = self.model.hubert_path.as_deref() else {
-            return Ok(false);
-        };
-        self.hubert_runtime_cpu_fallback_tried = true;
-
-        eprintln!(
-            "[vc-inference] warning: hubert runtime failed on GPU EP; switching hubert session to CPU EP. cause={}",
-            cause
-        );
-
-        let cpu_execution = OrtExecutionConfig {
-            provider: OrtProvider::Cpu,
-            device_id: 0,
-            gpu_mem_limit_bytes: None,
-        };
-
-        let cpu_session = build_ort_session(
-            path,
-            "hubert(cpu-fallback)",
-            self.ort_intra_threads,
-            self.ort_inter_threads,
-            self.ort_parallel_execution,
-            &cpu_execution,
-            &self.ort_cuda_tuning,
-        )
-        .map_err(|e| {
-            VcError::Inference(format!(
-                "hubert runtime GPU failure and CPU fallback session init failed: {e}"
-            ))
+        let (shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(|e| {
+            VcError::Inference(format!("failed to extract hubert output tensor<f32>: {e}"))
         })?;
-        self.hubert_session = Some(cpu_session);
-        eprintln!("[vc-inference] hubert session fallback: using CPU EP");
-        Ok(true)
+        let hubert_stats = tensor_stats_from_iter(data.iter().copied());
+        maybe_log_tensor_stats("hubert_raw", hubert_stats);
+        ensure_tensor_finite("hubert_raw", hubert_stats)?;
+        let phone = force_frame_count_3d_tail_pad(
+            phone_from_hubert_tensor(shape, data, self.phone_feature_dim)?,
+            STRICT_HUBERT_OUTPUT_FRAMES,
+        );
+        let phone_stats = tensor_stats_from_iter(phone.iter().copied());
+        maybe_log_tensor_stats("hubert_phone", phone_stats);
+        ensure_tensor_finite("hubert_phone", phone_stats)?;
+        Ok(phone)
+    }
+
+    fn prepare_strict_source_16k(&self, frame: &[f32], input_sample_rate: u32) -> Vec<f32> {
+        let mut source_16k = Vec::<f32>::new();
+        if input_sample_rate == RMVPE_SAMPLE_RATE {
+            source_16k.extend_from_slice(frame);
+        } else if input_sample_rate == self.input_to_16k_resampler.src_rate()
+            && self.input_to_16k_resampler.dst_rate() == RMVPE_SAMPLE_RATE
+        {
+            resample_hq_into(&self.input_to_16k_resampler, frame, &mut source_16k);
+        } else {
+            let local = HqResampler::new(input_sample_rate.max(1), RMVPE_SAMPLE_RATE);
+            resample_hq_into(&local, frame, &mut source_16k);
+        }
+        fit_waveform_to_len(&source_16k, STRICT_ONNX_INPUT_SAMPLES_16K)
     }
 
     fn blend_phone_with_index(&mut self, phone: &mut Array3<f32>, config: &RuntimeConfig) {
@@ -763,6 +757,9 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let (_, data) = outputs[0].try_extract_tensor::<f32>().map_err(|e| {
             VcError::Inference(format!("failed to extract rvc output tensor<f32>: {e}"))
         })?;
+        let rvc_out_stats = tensor_stats_from_iter(data.iter().copied());
+        maybe_log_tensor_stats("rvc_out", rvc_out_stats);
+        ensure_tensor_finite("rvc_out", rvc_out_stats)?;
         Ok(data.to_vec())
     }
 
@@ -839,78 +836,107 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         eprintln!("[vc-inference] rvc session fallback: using CPU EP");
         Ok(true)
     }
+
+    fn drop_zero_copy_engine_explicit(&mut self) {
+        if let Some(engine) = self.zero_copy_engine.take() {
+            match engine.lock() {
+                Ok(mut guard) => guard.prepare_for_drop(),
+                Err(_) => eprintln!(
+                    "[vc-inference] warning: zero-copy engine mutex poisoned during explicit drop"
+                ),
+            }
+            drop(engine);
+        }
+    }
 }
 
 impl InferenceEngine for RvcOrtEngine {
     fn infer_frame(&mut self, frame: &[f32], config: &RuntimeConfig) -> Result<Vec<f32>> {
         let mut infer = || -> Result<Vec<f32>> {
-            // Keep HuBERT/RMVPE input as raw waveform (no per-block auto-normalization).
-            let normalized = frame.to_vec();
-            let rmvpe_hop_at_input = rvc_hop_samples_at_input_rate(config.sample_rate);
-            let rmvpe_pad = pad_for_rmvpe(&normalized, rmvpe_hop_at_input);
-            let fallback_frames =
-                rvc_frame_count_from_input_samples(normalized.len(), config.sample_rate);
-            let hubert_target_frames =
-                if self.hubert_upsample_factor > 1 && self.hubert_session.is_some() {
-                    fallback_frames.div_ceil(self.hubert_upsample_factor)
-                } else {
-                    fallback_frames
-                }
-                .max(1);
+            let waveform = frame.to_vec();
+            let mut source_16k = self.prepare_strict_source_16k(&waveform, config.sample_rate);
+            if source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
+                return Err(VcError::Inference(format!(
+                    "strict source length mismatch: got={}, expected={}",
+                    source_16k.len(),
+                    STRICT_ONNX_INPUT_SAMPLES_16K
+                )));
+            }
+            let norm_stats = normalize_for_onnx_input(&mut source_16k);
+            if tensor_stats_enabled() {
+                eprintln!(
+                    "[vc-inference] stats source_16k_norm: rms_before={:.6e} peak_before={:.6e} rms_after={:.6e} peak_after={:.6e} gain={:.6e}",
+                    norm_stats.rms_before,
+                    norm_stats.peak_before,
+                    norm_stats.rms_after,
+                    norm_stats.peak_after,
+                    norm_stats.gain_applied
+                );
+            }
+            let source_stats = tensor_stats_from_iter(source_16k.iter().copied());
+            maybe_log_tensor_stats("source_16k", source_stats);
+            ensure_tensor_finite("source_16k", source_stats)?;
             let rmvpe_threshold = if config.rmvpe_threshold.is_finite() {
                 config.rmvpe_threshold
             } else {
                 DEFAULT_RMVPE_THRESHOLD
             };
-            let f0 = self.estimate_pitch(
-                &rmvpe_pad.padded,
-                config.sample_rate,
-                fallback_frames,
-                rmvpe_threshold,
-            )?;
-            let voiced_frames = f0.iter().filter(|&&v| v > 0.0).count();
-            if voiced_frames == 0 {
-                let (in_rms, in_peak) = signal_rms_peak(&normalized);
-                let (pad_rms, pad_peak) = signal_rms_peak(&rmvpe_pad.padded);
-                // Only flag if input energy is non-trivial; pure silence is expected to be unvoiced.
-                if in_rms >= 5.0e-4 || in_peak >= 2.0e-3 {
-                    let seen = RMVPE_ZERO_F0_WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                    if seen <= 8 || seen % 64 == 0 {
+            let finalize_output = |out: &[f32]| -> Result<Vec<f32>> {
+                let out_stats = tensor_stats_from_iter(out.iter().copied());
+                maybe_log_tensor_stats("rvc_wave", out_stats);
+                ensure_tensor_finite("rvc_wave", out_stats)?;
+                let mixed = apply_rms_mix(&waveform, out, config.rms_mix_rate, config.sample_rate);
+                let mixed_stats = tensor_stats_from_iter(mixed.iter().copied());
+                maybe_log_tensor_stats("mixed_wave", mixed_stats);
+                ensure_tensor_finite("mixed_wave", mixed_stats)?;
+                let processed = postprocess_generated_audio(&mixed);
+                let post_stats = tensor_stats_from_iter(processed.iter().copied());
+                maybe_log_tensor_stats("post_wave", post_stats);
+                ensure_tensor_finite("post_wave", post_stats)?;
+                Ok(match_output_length(&processed, frame.len()))
+            };
+            let zero_copy_result = if let Some(engine) = self.zero_copy_engine.as_ref() {
+                let run = engine
+                    .lock()
+                    .map_err(|_| VcError::Inference("zero-copy engine mutex poisoned".to_string()))
+                    .and_then(|mut guard| {
+                        guard.run(&source_16k, config.speaker_id, rmvpe_threshold)
+                    });
+                Some(run)
+            } else {
+                None
+            };
+            if let Some(result) = zero_copy_result {
+                match result {
+                    Ok(out) => return finalize_output(&out),
+                    Err(err) => {
                         eprintln!(
-                            "[vc-inference] warning: RMVPE returned all-unvoiced frames with non-silent input. in_rms={:.3e} in_peak={:.3e} pad_rms={:.3e} pad_peak={:.3e} frames={} sr={} thr={:.3}",
-                            in_rms,
-                            in_peak,
-                            pad_rms,
-                            pad_peak,
-                            fallback_frames,
-                            config.sample_rate,
-                            rmvpe_threshold
+                            "[vc-inference] warning: zero-copy path failed; disabling it for this session. cause={err}"
                         );
+                        self.zero_copy_engine = None;
                     }
                 }
             }
-
-            let mut phone =
-                self.extract_phone_features(&normalized, config.sample_rate, hubert_target_frames)?;
+            let mut phone = self.extract_phone_features(&source_16k)?;
+            let f0 = self.estimate_pitch(&source_16k, rmvpe_threshold)?;
             let mut phone_raw = None;
             if config.protect < 0.5 {
                 phone_raw = Some(phone.clone());
             }
             self.blend_phone_with_index(&mut phone, config);
-            if self.hubert_upsample_factor > 1 && self.hubert_session.is_some() {
-                phone = upsample_phone_frames(&phone, self.hubert_upsample_factor);
-                if let Some(raw) = phone_raw.as_mut() {
-                    *raw = upsample_phone_frames(raw, self.hubert_upsample_factor);
-                }
+            let frame_count = phone.shape()[1].max(1);
+            if f0.len() != frame_count {
+                return Err(VcError::Inference(format!(
+                    "strict frame contract mismatch: hubert_frames={} rmvpe_frames={}",
+                    frame_count,
+                    f0.len()
+                )));
             }
-            let frame_count = fallback_frames.max(1);
-            phone = align_phone_frames_to_target(&phone, frame_count);
             if let Some(raw) = phone_raw.take() {
-                let raw = align_phone_frames_to_target(&raw, frame_count);
                 apply_unvoiced_protect(&mut phone, &raw, &f0, config.protect);
             }
 
-            let mut pitchf = align_pitch_frames_to_target(&f0, frame_count);
+            let mut pitchf = f0;
             stabilize_sparse_pitch_track(&mut pitchf);
             apply_pitch_shift_inplace(&mut pitchf, config.pitch_shift_semitones);
             let f0_median_radius = config.f0_median_filter_radius;
@@ -927,8 +953,8 @@ impl InferenceEngine for RvcOrtEngine {
             }
             let pitch = coarse_pitch_from_f0(&pitchf);
             let rnd = self.make_rnd_tensor(frame_count);
-            let wave = Array3::from_shape_vec((1, 1, normalized.len()), normalized.clone())
-                .map_err(|e| {
+            let wave =
+                Array3::from_shape_vec((1, 1, waveform.len()), waveform.clone()).map_err(|e| {
                     VcError::Inference(format!("failed to shape waveform as [1,1,T]: {e}"))
                 })?;
 
@@ -957,18 +983,57 @@ impl InferenceEngine for RvcOrtEngine {
                     )?
                 }
             };
-            let mixed = apply_rms_mix(&normalized, &out, config.rms_mix_rate, config.sample_rate);
-            let processed = postprocess_generated_audio(&mixed);
-            Ok(match_output_length(&processed, frame.len()))
+            finalize_output(&out)
         };
+        infer()
+    }
 
-        match infer() {
-            Ok(out) => Ok(out),
-            Err(e) => {
-                eprintln!("inference failed, outputting silence: {e}");
-                Ok(vec![0.0; frame.len()])
-            }
-        }
+    fn prepare_for_shutdown(&mut self) -> Result<()> {
+        self.drop_zero_copy_engine_explicit();
+        Ok(())
+    }
+}
+
+impl Drop for RvcOrtEngine {
+    fn drop(&mut self) {
+        self.drop_zero_copy_engine_explicit();
+    }
+}
+
+fn fit_waveform_to_len(samples: &[f32], target_len: usize) -> Vec<f32> {
+    if target_len == 0 {
+        return Vec::new();
+    }
+    if samples.is_empty() {
+        return vec![0.0; target_len];
+    }
+    if samples.len() >= target_len {
+        return samples[samples.len() - target_len..].to_vec();
+    }
+    if samples.len() == 1 {
+        return vec![samples[0]; target_len];
+    }
+
+    let pad = target_len - samples.len();
+    let mut out = vec![0.0_f32; target_len];
+    for i in 0..pad {
+        let dist = pad - i;
+        out[i] = samples[reflect_left_pad_index(dist, samples.len())];
+    }
+    out[pad..].copy_from_slice(samples);
+    out
+}
+
+fn reflect_left_pad_index(dist: usize, len: usize) -> usize {
+    let period = 2 * (len - 1);
+    let mut m = dist % period;
+    if m == 0 {
+        m = period;
+    }
+    if m <= (len - 1) {
+        m
+    } else {
+        period - m
     }
 }
 
@@ -998,24 +1063,64 @@ fn match_output_length(samples: &[f32], target_len: usize) -> Vec<f32> {
     out
 }
 
-fn rvc_hop_samples_at_input_rate(input_sample_rate: u32) -> usize {
-    if input_sample_rate == 0 {
-        return RVC_HOP_LENGTH;
+fn force_frame_count_3d_tail_pad(frames: Array3<f32>, target_frames: usize) -> Array3<f32> {
+    let (batch, frame_len, channels) = frames.dim();
+    if frame_len == target_frames {
+        return frames;
     }
-    let num = (input_sample_rate as u128) * (RVC_HOP_LENGTH as u128);
-    let den = RMVPE_SAMPLE_RATE as u128;
-    (((num + (den / 2)) / den) as usize).max(1)
+    if frame_len > target_frames {
+        return frames.slice_move(s![.., 0..target_frames, ..]);
+    }
+    if target_frames == 0 {
+        return Array3::<f32>::zeros((batch, 0, channels));
+    }
+    if frame_len == 0 {
+        return Array3::<f32>::zeros((batch, target_frames, channels));
+    }
+
+    let mut out = Array3::<f32>::zeros((batch, target_frames, channels));
+    out.slice_mut(s![.., 0..frame_len, ..]).assign(&frames);
+    if frame_len >= 2 {
+        for b in 0..batch {
+            for c in 0..channels {
+                let last = frames[(b, frame_len - 1, c)];
+                let prev = frames[(b, frame_len - 2, c)];
+                let delta = last - prev;
+                for t in frame_len..target_frames {
+                    let step = (t - frame_len + 1) as f32;
+                    out[(b, t, c)] = last + delta * step;
+                }
+            }
+        }
+    } else {
+        let last = frames.slice(s![.., frame_len - 1, ..]);
+        for t in frame_len..target_frames {
+            out.slice_mut(s![.., t, ..]).assign(&last);
+        }
+    }
+    out
 }
 
-fn rvc_frame_count_from_input_samples(input_samples: usize, input_sample_rate: u32) -> usize {
-    if input_samples == 0 || input_sample_rate == 0 {
-        return 1;
+fn force_frame_count_1d_tail_pad(values: Vec<f32>, target_frames: usize) -> Vec<f32> {
+    if values.len() == target_frames {
+        return values;
     }
-    // RVC hop is defined at 16kHz:
-    // frames = ceil((samples_in * 16000) / (sample_rate_in * hop_16k)).
-    let num = (input_samples as u128) * (RMVPE_SAMPLE_RATE as u128);
-    let den = (input_sample_rate as u128) * (RVC_HOP_LENGTH as u128);
-    (((num + den - 1) / den) as usize).max(1)
+    if values.len() > target_frames {
+        let mut out = values;
+        out.truncate(target_frames);
+        return out;
+    }
+    if target_frames == 0 {
+        return Vec::new();
+    }
+    if values.is_empty() {
+        return vec![0.0; target_frames];
+    }
+
+    let mut out = values;
+    let tail = *out.last().unwrap_or(&0.0);
+    out.resize(target_frames, tail);
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1079,10 +1184,6 @@ fn classify_rvc_input_with_fallback(
     ty: Option<TensorElementType>,
 ) -> RvcInputKind {
     classify_rvc_input(name).unwrap_or_else(|| fallback_rvc_input_kind(rank, ty, name))
-}
-
-fn tensor_from_audio_rank(rank: usize, samples: &[f32]) -> Result<Tensor<f32>> {
-    tensor_from_audio_rank_owned(rank, samples.to_vec())
 }
 
 fn tensor_from_audio_rank_owned(rank: usize, samples: Vec<f32>) -> Result<Tensor<f32>> {
@@ -1237,282 +1338,6 @@ fn phone_from_hubert_tensor(
         )));
     }
     Ok(out)
-}
-
-fn tail_phone_frames(phone: &Array3<f32>, frames: usize) -> Array3<f32> {
-    let want = frames.max(1);
-    let total = phone.shape()[1];
-    let dims = phone.shape()[2];
-    if total <= want {
-        return phone.clone();
-    }
-    let start = total - want;
-    let mut out = Array3::<f32>::zeros((1, want, dims));
-    for t in 0..want {
-        for c in 0..dims {
-            out[(0, t, c)] = phone[(0, start + t, c)];
-        }
-    }
-    out
-}
-
-fn upsample_phone_frames(phone: &Array3<f32>, factor: usize) -> Array3<f32> {
-    if factor <= 1 {
-        return phone.clone();
-    }
-    let src_frames = phone.shape()[1].max(1);
-    let dims = phone.shape()[2];
-    let target_frames = (src_frames * factor).max(1);
-    let mut out = Array3::<f32>::zeros((1, target_frames, dims));
-    for t in 0..target_frames {
-        let src_t = (t / factor).min(src_frames - 1);
-        for c in 0..dims {
-            out[(0, t, c)] = phone[(0, src_t, c)];
-        }
-    }
-    out
-}
-
-fn align_phone_frames_to_target(phone: &Array3<f32>, target_frames: usize) -> Array3<f32> {
-    let frames = phone.shape()[1].max(1);
-    let target = target_frames.max(1);
-    if frames == target {
-        return phone.clone();
-    }
-    if frames > target {
-        return tail_phone_frames(phone, target);
-    }
-
-    // Keep temporal alignment by extending the tail frame, instead of time-warp interpolation.
-    let dims = phone.shape()[2];
-    let mut out = Array3::<f32>::zeros((1, target, dims));
-    for t in 0..target {
-        let src_t = t.min(frames - 1);
-        for c in 0..dims {
-            out[(0, t, c)] = phone[(0, src_t, c)];
-        }
-    }
-    out
-}
-
-fn align_pitch_frames_to_target(pitch: &[f32], target_frames: usize) -> Vec<f32> {
-    let target = target_frames.max(1);
-    if pitch.is_empty() {
-        return vec![0.0; target];
-    }
-    if pitch.len() == target {
-        return pitch.to_vec();
-    }
-    if pitch.len() > target {
-        return pitch[pitch.len() - target..].to_vec();
-    }
-
-    let mut out = pitch.to_vec();
-    let fill = out.last().copied().unwrap_or(0.0);
-    out.resize(target, fill);
-    out
-}
-
-fn run_hubert_session(
-    session: &mut Session,
-    source: &[f32],
-    pad_left: usize,
-    phone_feature_dim: usize,
-    hubert_output_layer: i64,
-) -> Result<Array3<f32>> {
-    let mut inputs: Vec<(String, SessionInputValue<'static>)> = Vec::new();
-    let source_len = source.len().max(1);
-    for input in session.inputs() {
-        let name = input.name().to_string();
-        let lname = name.to_lowercase();
-        let rank = input.dtype().tensor_shape().map_or(2, |s| s.len());
-        let ty = input.dtype().tensor_type();
-        let value = if lname.contains("source") || ty == Some(TensorElementType::Float32) {
-            let tensor = tensor_from_audio_rank(rank.max(2), source)?;
-            SessionInputValue::from(tensor)
-        } else if lname.contains("padding") || ty == Some(TensorElementType::Bool) {
-            let mut mask = vec![false; source_len];
-            let pad = pad_left.min(source_len);
-            for m in &mut mask[..pad] {
-                *m = true;
-            }
-            if rank <= 1 {
-                SessionInputValue::from(
-                    Tensor::from_array(Array1::from_vec(mask.clone())).map_err(|e| {
-                        VcError::Inference(format!(
-                            "failed to create hubert padding mask rank1: {e}"
-                        ))
-                    })?,
-                )
-            } else {
-                SessionInputValue::from(
-                    Tensor::from_array(Array2::from_shape_vec((1, source_len), mask).map_err(
-                        |e| {
-                            VcError::Inference(format!(
-                                "failed to shape hubert padding mask as [1,T]: {e}"
-                            ))
-                        },
-                    )?)
-                    .map_err(|e| {
-                        VcError::Inference(format!(
-                            "failed to create hubert padding mask rank2: {e}"
-                        ))
-                    })?,
-                )
-            }
-        } else if ty == Some(TensorElementType::Int64) {
-            let scalar = if lname.contains("output_layer") || lname.contains("layer") {
-                hubert_output_layer
-            } else if lname.contains("sample_rate") || lname == "sr" {
-                RMVPE_SAMPLE_RATE as i64
-            } else {
-                source_len as i64
-            };
-            SessionInputValue::from(Tensor::from_array(Array1::from_vec(vec![scalar])).map_err(
-                |e| {
-                    VcError::Inference(format!(
-                        "failed to create hubert int64 side-input tensor: {e}"
-                    ))
-                },
-            )?)
-        } else {
-            return Err(VcError::Inference(format!(
-                "unsupported hubert input '{}' type={ty:?} rank={rank}",
-                name
-            )));
-        };
-        inputs.push((name, value));
-    }
-
-    let outputs = session.run(inputs).map_err(|e| {
-        VcError::Inference(format!(
-            "hubert inference failed (source_len={source_len}, pad_left={pad_left}): {e}"
-        ))
-    })?;
-    if outputs.len() == 0 {
-        return Err(VcError::Inference(
-            "hubert model returned no outputs".to_string(),
-        ));
-    }
-    let mut best: Option<(usize, Vec<i64>, Vec<f32>)> = None;
-    for idx in 0..outputs.len() {
-        let Ok((shape, data)) = outputs[idx].try_extract_tensor::<f32>() else {
-            continue;
-        };
-        let shape_vec = shape.to_vec();
-        let feature_axis = shape_vec.last().copied().unwrap_or_default();
-        let has_expected_dim = feature_axis == phone_feature_dim as i64;
-        let rank_score = shape_vec.len();
-        let score = (if has_expected_dim { 100 } else { 0 }) + rank_score;
-        let replace = best.as_ref().map(|(s, _, _)| score > *s).unwrap_or(true);
-        if replace {
-            best = Some((score, shape_vec, data.to_vec()));
-        }
-    }
-    let Some((_, shape_vec, data_vec)) = best else {
-        return Err(VcError::Inference(
-            "failed to extract any hubert output tensor<f32>".to_string(),
-        ));
-    };
-    phone_from_hubert_tensor(&shape_vec, &data_vec, phone_feature_dim)
-}
-
-fn build_hubert_reflect_window(history: &[f32], target_len: usize) -> Vec<f32> {
-    let target_len = align_hubert_source_len(target_len.max(1));
-    if history.is_empty() {
-        return vec![0.0_f32; target_len];
-    }
-    if history.len() >= target_len {
-        return history[history.len() - target_len..].to_vec();
-    }
-
-    let hist_len = history.len();
-    let pad = target_len - hist_len;
-    let mut out = vec![0.0_f32; target_len];
-    out[pad..].copy_from_slice(history);
-    if hist_len == 1 {
-        out[..pad].fill(history[0]);
-        return out;
-    }
-    for i in 0..pad {
-        // i is from far-left to near-left. dist=1 should map to history[1].
-        let dist = pad - i;
-        let idx = reflect_left_index(dist, hist_len);
-        out[i] = history[idx];
-    }
-    out
-}
-
-fn reflect_left_index(dist: usize, len: usize) -> usize {
-    if len <= 1 {
-        return 0;
-    }
-    let period = 2 * (len - 1);
-    let mut m = dist % period;
-    if m == 0 {
-        m = period;
-    }
-    if m <= (len - 1) {
-        m
-    } else {
-        period - m
-    }
-}
-
-fn align_hubert_source_len(len: usize) -> usize {
-    if len == 0 {
-        return HUBERT_SOURCE_LEN_ALIGN;
-    }
-    len.div_ceil(HUBERT_SOURCE_LEN_ALIGN) * HUBERT_SOURCE_LEN_ALIGN
-}
-
-fn hubert_source_len_candidates(requested_ctx_16k: usize) -> Vec<usize> {
-    let base = align_hubert_source_len(requested_ctx_16k.clamp(
-        MIN_HUBERT_CONTEXT_SAMPLES_16K,
-        MAX_HUBERT_CONTEXT_SAMPLES_16K,
-    ));
-    let mut candidates = Vec::with_capacity(HUBERT_LEN_FALLBACK_MAX_TRIES * 2 + 1);
-    candidates.push(base);
-    for step in 1..=HUBERT_LEN_FALLBACK_MAX_TRIES {
-        let delta = step * HUBERT_LEN_FALLBACK_STEP;
-        let plus = base.saturating_add(delta);
-        if plus <= MAX_HUBERT_CONTEXT_SAMPLES_16K && !candidates.contains(&plus) {
-            candidates.push(plus);
-        }
-        let minus = base.saturating_sub(delta);
-        if minus >= MIN_HUBERT_CONTEXT_SAMPLES_16K && !candidates.contains(&minus) {
-            candidates.push(minus);
-        }
-    }
-    candidates
-}
-
-fn is_hubert_length_shape_mismatch(err: &VcError) -> bool {
-    let VcError::Inference(msg) = err else {
-        return false;
-    };
-    let m = msg.to_ascii_lowercase();
-    if !m.contains("hubert") {
-        return false;
-    }
-    (m.contains("self_attn/where") && m.contains("broadcast"))
-        || m.contains("condition operand cannot broadcast")
-        || m.contains("can broadcast 0 by 0 or 1")
-        || m.contains("can't reduce on dim with value of 0")
-        || m.contains("reduce on dim with value of 0")
-}
-
-fn is_hubert_cuda_runtime_failure(err: &VcError) -> bool {
-    let VcError::Inference(msg) = err else {
-        return false;
-    };
-    let m = msg.to_ascii_lowercase();
-    if !m.contains("hubert") {
-        return false;
-    }
-    is_cuda_kernel_compat_failure_text(&m)
-        || m.contains("onnxruntime_providers_cuda.dll")
-        || (m.contains("cuda") && m.contains("failed"))
 }
 
 fn is_rvc_cuda_runtime_failure(err: &VcError) -> bool {
@@ -1986,9 +1811,15 @@ fn apply_unvoiced_protect(
     if frames == 0 || dims == 0 {
         return;
     }
-    let pitchf = resize_pitch_to_frames(f0_hz, frames);
+    assert_eq!(
+        f0_hz.len(),
+        frames,
+        "strict frame contract mismatch in unvoiced protect: f0={} phone={}",
+        f0_hz.len(),
+        frames
+    );
     for t in 0..frames {
-        if pitchf[t] >= 1.0 {
+        if f0_hz[t] >= 1.0 {
             continue;
         }
         for c in 0..dims {
@@ -2246,11 +2077,20 @@ fn build_ort_session(
     let mut builder = Session::builder()
         .map_err(|e| VcError::Inference(format!("failed to create {label} session builder: {e}")))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|e| VcError::Inference(format!("failed to set {label} optimization level: {e}")))?
-        .with_intra_threads(intra_threads)
-        .map_err(|e| VcError::Inference(format!("failed to set {label} intra threads: {e}")))?
-        .with_inter_threads(inter_threads)
-        .map_err(|e| VcError::Inference(format!("failed to set {label} inter threads: {e}")))?
+        .map_err(|e| {
+            VcError::Inference(format!("failed to set {label} optimization level: {e}"))
+        })?;
+    if intra_threads > 0 {
+        builder = builder
+            .with_intra_threads(intra_threads)
+            .map_err(|e| VcError::Inference(format!("failed to set {label} intra threads: {e}")))?;
+    }
+    if inter_threads > 0 {
+        builder = builder
+            .with_inter_threads(inter_threads)
+            .map_err(|e| VcError::Inference(format!("failed to set {label} inter threads: {e}")))?;
+    }
+    builder = builder
         .with_parallel_execution(parallel_execution)
         .map_err(|e| VcError::Inference(format!("failed to set {label} execution mode: {e}")))?;
     let eps = build_execution_providers(execution, cuda_tuning);
@@ -2399,35 +2239,23 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
     "unknown panic payload".to_string()
 }
 
-fn signal_rms_peak(samples: &[f32]) -> (f32, f32) {
-    if samples.is_empty() {
-        return (0.0, 0.0);
-    }
-    let mut sum_sq = 0.0_f32;
-    let mut peak = 0.0_f32;
-    for &s in samples {
-        sum_sq += s * s;
-        peak = peak.max(s.abs());
-    }
-    ((sum_sq / samples.len() as f32).sqrt(), peak)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{rvc_frame_count_from_input_samples, rvc_hop_samples_at_input_rate};
+    use super::{fit_waveform_to_len, STRICT_ONNX_INPUT_SAMPLES_16K};
 
     #[test]
-    fn frame_count_uses_16k_hop_basis_for_48k_input() {
-        // 48k input with 16k-hop(160) equivalence -> 480 samples / frame.
-        assert_eq!(rvc_hop_samples_at_input_rate(48_000), 480);
-        assert_eq!(rvc_frame_count_from_input_samples(8_192, 48_000), 18);
-        assert_eq!(rvc_frame_count_from_input_samples(16_000, 48_000), 34);
+    fn strict_input_fits_to_16k() {
+        let src = vec![0.1_f32; 8000];
+        let fitted = fit_waveform_to_len(&src, STRICT_ONNX_INPUT_SAMPLES_16K);
+        assert_eq!(fitted.len(), STRICT_ONNX_INPUT_SAMPLES_16K);
     }
 
     #[test]
-    fn frame_count_uses_16k_hop_basis_for_44k1_input() {
-        // 44.1k input -> 441 samples / 10ms frame.
-        assert_eq!(rvc_hop_samples_at_input_rate(44_100), 441);
-        assert_eq!(rvc_frame_count_from_input_samples(8_192, 44_100), 19);
+    fn strict_input_keeps_latest_tail_when_longer() {
+        let src: Vec<f32> = (0..20_000).map(|i| i as f32).collect();
+        let fitted = fit_waveform_to_len(&src, STRICT_ONNX_INPUT_SAMPLES_16K);
+        assert_eq!(fitted.len(), STRICT_ONNX_INPUT_SAMPLES_16K);
+        assert_eq!(fitted[0], 4_000.0);
+        assert_eq!(fitted[STRICT_ONNX_INPUT_SAMPLES_16K - 1], 19_999.0);
     }
 }

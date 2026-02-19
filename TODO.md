@@ -1,19 +1,22 @@
 # Rust-VC TODO
 
-## P0 (最優先)
+## P0 (Critical)
 
-- [ ] HuBERT の `Where/ReduceSum` 形状エラー再発ケースを収集し、固定長入力経路で再現しないことを確認
-- [ ] RMVPE の all-unvoiced 発生条件を詰め、`rmvpe_threshold` と fallback 既定値を安定化
-- [ ] 実機ログで `slow block` / `queue headroom` の閾値を確定し、途切れ対策の既定値を決定
+- [ ] Eliminate remaining `STATUS_ACCESS_VIOLATION` cases in long-run start/stop loops
+- [ ] Add integration test for zero-copy shutdown path (`prepare_for_shutdown` -> drop)
+- [ ] Verify stable real-time behavior with strict models on CUDA (`slow block`, `underrun`, queue headroom)
+- [ ] Finalize HuBERT 49->50 shaping policy with audio A/B validation
 
-## P1 (重要)
+## P1 (Important)
 
-- [ ] プリセット Import/Export（JSON）を実装
-- [ ] 起動前チェック（CUDA DLL / onnxruntime.dll バージョン整合）の UI ガイドを追加
-- [ ] 低遅延 / 高品質 / 安定重視のランタイムプリセットを同梱
+- [ ] Preset import/export (JSON file) in Tauri UI
+- [ ] Better runtime diagnostics panel in UI (latency, queue, provider, frame stats)
+- [ ] Auto-detect and validate ONNX runtime DLL/provider mismatch at startup
+- [ ] Add profile presets for low-latency / balanced / quality modes
 
-## P2 (改善)
+## P2 (Nice to Have)
 
-- [ ] `vc-inference` と `vc-signal` の回帰テストを拡充（サンプル波形ベース）
-- [ ] パフォーマンス計測用コマンド（block elapsed / queue headroom）を開発向けに整備
-- [ ] ドキュメントを運用手順（GPUセットアップ、トラブルシュート）中心に整理
+- [ ] Unit tests for frame shaping helpers and RMVPE decode paths
+- [ ] Add benchmark command for inference path comparison (standard vs zero-copy)
+- [ ] Expand docs for model conversion workflow (`scripts/export_strict_onnx.py`)
+- [ ] Add optional telemetry log file export for issue reports

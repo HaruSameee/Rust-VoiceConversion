@@ -142,13 +142,22 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
             config.pitch_shift_semitones
         ));
     }
-    let clamped_intra = config.ort_intra_threads.clamp(1, 4);
-    if clamped_intra != config.ort_intra_threads {
+    let max_threads = max_runtime_threads();
+    let clamped_intra = clamp_intra_threads(config.intra_threads, max_threads);
+    if clamped_intra != config.intra_threads {
         log_debug(&format!(
-            "set_runtime_config_cmd ort_intra_threads clamped: {} -> {}",
-            config.ort_intra_threads, clamped_intra
+            "set_runtime_config_cmd intra_threads clamped: {} -> {} (max_threads={})",
+            config.intra_threads, clamped_intra, max_threads
         ));
-        config.ort_intra_threads = clamped_intra;
+        config.intra_threads = clamped_intra;
+    }
+    let clamped_inter = clamp_inter_threads(config.inter_threads, max_threads);
+    if clamped_inter != config.inter_threads {
+        log_debug(&format!(
+            "set_runtime_config_cmd inter_threads clamped: {} -> {} (max_threads={})",
+            config.inter_threads, clamped_inter, max_threads
+        ));
+        config.inter_threads = clamped_inter;
     }
     log_debug(&format!(
         "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
@@ -173,8 +182,8 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.ort_provider,
         config.ort_device_id,
         config.ort_gpu_mem_limit_mb,
-        config.ort_intra_threads,
-        config.ort_inter_threads,
+        config.intra_threads,
+        config.inter_threads,
         config.ort_parallel_execution,
         config.hubert_context_samples_16k,
         config.hubert_output_layer,
@@ -187,6 +196,13 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.index_max_vectors
     ));
     let mut guard = state.lock_runtime();
+    let thread_changed = guard.config.intra_threads != config.intra_threads
+        || guard.config.inter_threads != config.inter_threads;
+    if guard.running && thread_changed {
+        return Err(
+            "changing intra_threads/inter_threads requires model reload; stop_engine_cmd first, then call set_runtime_config_cmd again.".to_string(),
+        );
+    }
     guard.config = config;
     Ok(())
 }
@@ -261,8 +277,8 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.ort_provider,
             runtime_config.ort_device_id,
             runtime_config.ort_gpu_mem_limit_mb,
-            runtime_config.ort_intra_threads,
-            runtime_config.ort_inter_threads,
+            runtime_config.intra_threads,
+            runtime_config.inter_threads,
             runtime_config.ort_parallel_execution,
             runtime_config.hubert_context_samples_16k,
             runtime_config.hubert_output_layer,
@@ -300,7 +316,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
         if guard.running {
             log_debug("engine already running");
             sync_levels_from_engine(&mut guard);
-            drop(audio_engine);
+            audio_engine.stop_and_abort();
             return Ok(EngineStatus {
                 running: guard.running,
                 input_level_rms: guard.input_level_rms,
@@ -424,8 +440,27 @@ fn env_bool(key: &str) -> Option<bool> {
     }
 }
 
+fn max_runtime_threads() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn clamp_intra_threads(value: u32, max_threads: u32) -> u32 {
+    if value == 0 {
+        return 0;
+    }
+    value.clamp(1, max_threads.max(1))
+}
+
+fn clamp_inter_threads(value: u32, max_threads: u32) -> u32 {
+    value.clamp(1, max_threads.max(1))
+}
+
 fn default_runtime_config() -> RuntimeConfig {
     let mut cfg = RuntimeConfig::default();
+    let max_threads = max_runtime_threads();
 
     if let Some(v) = std::env::var("RUST_VC_ORT_PROVIDER").ok() {
         let lc = v.trim().to_ascii_lowercase();
@@ -439,11 +474,11 @@ fn default_runtime_config() -> RuntimeConfig {
     if let Some(v) = env_u32("RUST_VC_ORT_GPU_MEM_LIMIT_MB") {
         cfg.ort_gpu_mem_limit_mb = v;
     }
-    if let Some(v) = env_usize("RUST_VC_ORT_INTRA_THREADS") {
-        cfg.ort_intra_threads = v.clamp(1, 4);
+    if let Some(v) = env_u32("RUST_VC_ORT_INTRA_THREADS") {
+        cfg.intra_threads = clamp_intra_threads(v, max_threads);
     }
-    if let Some(v) = env_usize("RUST_VC_ORT_INTER_THREADS") {
-        cfg.ort_inter_threads = v.max(1);
+    if let Some(v) = env_u32("RUST_VC_ORT_INTER_THREADS") {
+        cfg.inter_threads = clamp_inter_threads(v, max_threads);
     }
     if let Some(v) = env_bool("RUST_VC_ORT_PARALLEL") {
         cfg.ort_parallel_execution = v;
@@ -487,8 +522,8 @@ fn default_runtime_config() -> RuntimeConfig {
         cfg.ort_provider,
         cfg.ort_device_id,
         cfg.ort_gpu_mem_limit_mb,
-        cfg.ort_intra_threads,
-        cfg.ort_inter_threads,
+        cfg.intra_threads,
+        cfg.inter_threads,
         cfg.ort_parallel_execution,
         cfg.hubert_context_samples_16k,
         cfg.hubert_output_layer,

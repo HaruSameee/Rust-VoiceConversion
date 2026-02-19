@@ -195,6 +195,16 @@
               <input id="ortGpuMemLimitMb" type="number" step="128" min="0" />
               <p class="hint">他アプリ併用時に有効です。低すぎると初期化失敗します。</p>
             </div>
+            <div class="field">
+              <label for="ortIntraThreads">ORT intra threads（0=auto）</label>
+              <input id="ortIntraThreads" type="number" step="1" min="0" />
+              <p class="hint">0 は ORT デフォルト。1..CPUコア数で固定できます。</p>
+            </div>
+            <div class="field">
+              <label for="ortInterThreads">ORT inter threads</label>
+              <input id="ortInterThreads" type="number" step="1" min="1" />
+              <p class="hint">通常は 1 推奨。必要時のみ増やしてください。</p>
+            </div>
           </div>
         </section>
       </section>

@@ -19,6 +19,10 @@ const MIN_INFERENCE_BLOCK: usize = 8_192;
 const MIN_OUTPUT_CROSSFADE_SAMPLES: usize = 256;
 const MAX_OUTPUT_CROSSFADE_SAMPLES: usize = 1_024;
 const SOLA_SEARCH_MS: f32 = 10.0;
+const BLOCK_ALIGN_SAMPLES: usize = 256;
+const WARMUP_BUDGET_HEADROOM: f64 = 1.25;
+const MAX_AUTO_BLOCK_SIZE: usize = 96_000;
+const MAX_WARMUP_BLOCK_CAP: usize = 16_384;
 
 pub fn list_input_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
@@ -53,6 +57,8 @@ pub struct RealtimeAudioEngine {
     input_peak: Arc<AtomicU32>,
     stream_thread: Option<thread::JoinHandle<()>>,
     worker_thread: Option<thread::JoinHandle<()>>,
+    worker_control_tx: Option<SyncSender<WorkerControl>>,
+    worker_shutdown_ack_rx: Option<Receiver<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +72,11 @@ pub struct AudioStreamOptions {
     pub response_threshold: f32,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkerControl {
+    PrepareShutdown,
 }
 
 impl RealtimeAudioEngine {
@@ -84,14 +95,50 @@ impl RealtimeAudioEngine {
         self.running.store(false, Ordering::Relaxed);
     }
 
-    pub fn stop_and_abort(mut self) {
-        self.stop();
+    fn prepare_inference_shutdown(&mut self) {
+        if let Some(tx) = self.worker_control_tx.as_ref() {
+            let _ = tx.try_send(WorkerControl::PrepareShutdown);
+        }
+        if let Some(rx) = self.worker_shutdown_ack_rx.as_ref() {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    eprintln!(
+                        "[vc-audio] warning: timed out waiting for inference shutdown acknowledgement"
+                    );
+                }
+            }
+        }
+        self.worker_control_tx = None;
+        self.worker_shutdown_ack_rx = None;
+    }
+
+    fn join_threads(&mut self) {
+        let current = thread::current().id();
         if let Some(handle) = self.stream_thread.take() {
-            let _ = handle.join();
+            if handle.thread().id() != current {
+                let _ = handle.join();
+            }
         }
         if let Some(handle) = self.worker_thread.take() {
-            let _ = handle.join();
+            if handle.thread().id() != current {
+                let _ = handle.join();
+            }
         }
+    }
+
+    pub fn stop_and_abort(mut self) {
+        self.prepare_inference_shutdown();
+        self.stop();
+        self.join_threads();
+    }
+}
+
+impl Drop for RealtimeAudioEngine {
+    fn drop(&mut self) {
+        self.prepare_inference_shutdown();
+        self.stop();
+        self.join_threads();
     }
 }
 
@@ -103,8 +150,8 @@ where
     E: InferenceEngine,
 {
     let host = cpal::default_host();
-    let model_sample_rate = options.model_sample_rate;
-    let block_size = options.block_size;
+    let model_sample_rate = options.model_sample_rate.max(1);
+    let requested_block_size = options.block_size.max(1);
     let allow_process_window_grow = options.allow_process_window_grow;
     let extra_inference_ms = options.extra_inference_ms;
     let response_threshold = normalize_response_threshold(options.response_threshold);
@@ -131,11 +178,69 @@ where
     let output_rate = output_stream_config.sample_rate.0;
     let input_channels = input_stream_config.channels as usize;
     let output_channels = output_stream_config.channels as usize;
-    let extra_samples =
-        ((model_sample_rate as f64) * (extra_inference_ms as f64 / 1000.0)).round() as usize;
     let sola_search_output = sola_search_samples(output_rate);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
+    let warmup_inference_block_size = requested_block_size
+        .max(MIN_INFERENCE_BLOCK)
+        .saturating_add(sola_search_model);
+    eprintln!(
+        "[vc-audio] input_rate={} output_rate={} input_ch={} output_ch={} model_rate={} block_size_requested={}",
+        input_rate,
+        output_rate,
+        input_channels,
+        output_channels,
+        model_sample_rate,
+        requested_block_size
+    );
+    eprintln!(
+        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} allow_window_grow={}",
+        input_device.name().unwrap_or_else(|_| "unknown-input".to_string()),
+        output_device.name().unwrap_or_else(|_| "unknown-output".to_string()),
+        extra_inference_ms,
+        response_threshold,
+        fade_in_ms,
+        fade_out_ms,
+        allow_process_window_grow
+    );
+    // Warm up the model before starting audio streams to avoid first-block stalls
+    // (notably large on GPU providers like DirectML during graph compilation).
+    let warmup_input = vec![0.0_f32; warmup_inference_block_size.max(MIN_INFERENCE_BLOCK)];
+    let warmup_start = Instant::now();
+    let warmup_elapsed_ms = match voice_changer.process_frame(&warmup_input) {
+        Ok(out) => {
+            let elapsed_ms = warmup_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[vc-audio] warmup done: in={} out={} elapsed={:.2}ms",
+                warmup_input.len(),
+                out.len(),
+                elapsed_ms
+            );
+            elapsed_ms
+        }
+        Err(err) => {
+            let elapsed_ms = warmup_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[vc-audio] warmup failed (continuing): {} elapsed={:.2}ms",
+                err, elapsed_ms
+            );
+            elapsed_ms
+        }
+    };
+
+    let block_size = recommended_block_size_from_warmup(
+        requested_block_size,
+        model_sample_rate,
+        warmup_elapsed_ms,
+    );
+    if block_size != requested_block_size {
+        eprintln!(
+            "[vc-audio] block_size adjusted for realtime headroom: requested={} effective={} warmup_ms={:.2}",
+            requested_block_size, block_size, warmup_elapsed_ms
+        );
+    }
+    let extra_samples =
+        ((model_sample_rate as f64) * (extra_inference_ms as f64 / 1000.0)).round() as usize;
     let inference_block_size = block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
@@ -149,20 +254,6 @@ where
     let input_queue_capacity = callbacks_per_infer.saturating_mul(2).max(64);
     let output_queue_capacity = callbacks_per_infer.saturating_mul(2).max(64);
     eprintln!(
-        "[vc-audio] input_rate={} output_rate={} input_ch={} output_ch={} model_rate={} block_size={}",
-        input_rate, output_rate, input_channels, output_channels, model_sample_rate, block_size
-    );
-    eprintln!(
-        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} allow_window_grow={}",
-        input_device.name().unwrap_or_else(|_| "unknown-input".to_string()),
-        output_device.name().unwrap_or_else(|_| "unknown-output".to_string()),
-        extra_inference_ms,
-        response_threshold,
-        fade_in_ms,
-        fade_out_ms,
-        allow_process_window_grow
-    );
-    eprintln!(
         "[vc-audio] queue_capacity input={} output={} (est_cb={} frames, infer_block={} target_buffer={})",
         input_queue_capacity,
         output_queue_capacity,
@@ -170,26 +261,12 @@ where
         inference_block_size,
         target_buffer_samples
     );
-    // Warm up the model before starting audio streams to avoid first-block stalls
-    // (notably large on GPU providers like DirectML during graph compilation).
-    let warmup_input = vec![0.0_f32; inference_block_size.max(MIN_INFERENCE_BLOCK)];
-    let warmup_start = Instant::now();
-    match voice_changer.process_frame(&warmup_input) {
-        Ok(out) => {
-            eprintln!(
-                "[vc-audio] warmup done: in={} out={} elapsed={:.2}ms",
-                warmup_input.len(),
-                out.len(),
-                warmup_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "[vc-audio] warmup failed (continuing): {} elapsed={:.2}ms",
-                err,
-                warmup_start.elapsed().as_secs_f64() * 1000.0
-            );
-        }
+    let budget_ms = block_size as f64 / model_sample_rate as f64 * 1000.0;
+    if warmup_elapsed_ms > budget_ms {
+        eprintln!(
+            "[vc-audio] latency advisory: warmup={:.2}ms exceeds budget={:.2}ms (effective_block={})",
+            warmup_elapsed_ms, budget_ms, block_size
+        );
     }
 
     let (input_tx, input_rx) = sync_channel::<Vec<f32>>(input_queue_capacity);
@@ -218,12 +295,16 @@ where
     let running_worker = Arc::clone(&running);
     let input_rms_worker = Arc::clone(&input_rms);
     let input_peak_worker = Arc::clone(&input_peak);
+    let (worker_control_tx, worker_control_rx) = sync_channel::<WorkerControl>(1);
+    let (worker_shutdown_ack_tx, worker_shutdown_ack_rx) = sync_channel::<()>(1);
     let worker_thread = thread::spawn(move || {
         let mut level_meter = LevelMeter::new(0.92);
         worker_loop(
             &mut voice_changer,
             input_rx,
             output_tx,
+            worker_control_rx,
+            worker_shutdown_ack_tx,
             model_sample_rate,
             block_size,
             input_rate,
@@ -262,6 +343,8 @@ where
         input_peak,
         stream_thread: Some(stream_thread),
         worker_thread: Some(worker_thread),
+        worker_control_tx: Some(worker_control_tx),
+        worker_shutdown_ack_rx: Some(worker_shutdown_ack_rx),
     })
 }
 
@@ -380,6 +463,8 @@ fn worker_loop<E>(
     voice_changer: &mut VoiceChanger<E>,
     input_rx: Receiver<Vec<f32>>,
     output_tx: SyncSender<Vec<f32>>,
+    worker_control_rx: Receiver<WorkerControl>,
+    worker_shutdown_ack_tx: SyncSender<()>,
     model_sample_rate: u32,
     block_size: usize,
     input_rate: u32,
@@ -397,6 +482,7 @@ fn worker_loop<E>(
 ) where
     E: InferenceEngine,
 {
+    let mut shutdown_prepared = false;
     let extra_samples =
         ((model_sample_rate as f64) * (extra_inference_ms as f64 / 1000.0)).round() as usize;
     let io_block_size = block_size.max(1);
@@ -479,6 +565,19 @@ fn worker_loop<E>(
     let _ = output_tx.try_send(vec![0.0; prefill_frames]);
 
     while running.load(Ordering::Relaxed) {
+        if !shutdown_prepared {
+            match worker_control_rx.try_recv() {
+                Ok(WorkerControl::PrepareShutdown) => {
+                    if let Err(e) = voice_changer.prepare_shutdown() {
+                        eprintln!("[vc-audio] warning: inference shutdown hook failed: {e}");
+                    }
+                    shutdown_prepared = true;
+                    let _ = worker_shutdown_ack_tx.try_send(());
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {}
+            }
+        }
         let mut mono = match input_rx.recv_timeout(Duration::from_millis(5)) {
             Ok(v) => v,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -713,6 +812,12 @@ fn worker_loop<E>(
             }
         }
     }
+    if !shutdown_prepared {
+        if let Err(e) = voice_changer.prepare_shutdown() {
+            eprintln!("[vc-audio] warning: inference shutdown hook failed: {e}");
+        }
+        let _ = worker_shutdown_ack_tx.try_send(());
+    }
     eprintln!("[vc-audio] worker loop stopped");
 }
 
@@ -789,12 +894,41 @@ fn normalize_response_threshold(raw: f32) -> f32 {
     if !raw.is_finite() {
         return 0.0;
     }
-    if raw <= 0.0 {
+    if raw == 0.0 {
         // 0.0 means gate disabled (fully open).
-        // Negative legacy dB-style values are treated as disabled as well.
         return 0.0;
     }
+    if raw < 0.0 {
+        // Legacy/UI path: negative values are dBFS thresholds (e.g. -50 dB).
+        let db = raw.clamp(-120.0, 0.0);
+        return (10.0_f32.powf(db / 20.0)).clamp(0.0, 1.0);
+    }
     raw.clamp(0.0, 1.0)
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    if align <= 1 {
+        return value.max(1);
+    }
+    value.div_ceil(align) * align
+}
+
+fn recommended_block_size_from_warmup(
+    requested_block_size: usize,
+    model_sample_rate: u32,
+    warmup_elapsed_ms: f64,
+) -> usize {
+    let requested = requested_block_size.max(1);
+    if !warmup_elapsed_ms.is_finite() || warmup_elapsed_ms <= 0.0 || model_sample_rate == 0 {
+        return requested;
+    }
+    let target_budget_ms = warmup_elapsed_ms * WARMUP_BUDGET_HEADROOM;
+    let required = ((target_budget_ms / 1000.0) * model_sample_rate as f64).ceil() as usize;
+    let recommended = align_up(required.max(requested), BLOCK_ALIGN_SAMPLES);
+    let cap = requested
+        .max(requested.saturating_mul(2).min(MAX_WARMUP_BLOCK_CAP))
+        .min(MAX_AUTO_BLOCK_SIZE);
+    recommended.min(cap)
 }
 
 fn map_model_samples_to_output(model_samples: usize, model_rate: u32, output_rate: u32) -> usize {
@@ -1066,6 +1200,22 @@ impl LevelMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_threshold_accepts_db_values() {
+        let t = normalize_response_threshold(-50.0);
+        assert!((t - 0.003_162_277_6).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn response_threshold_zero_disables_gate() {
+        assert_eq!(normalize_response_threshold(0.0), 0.0);
+    }
+
+    #[test]
+    fn response_threshold_keeps_linear_values() {
+        assert_eq!(normalize_response_threshold(0.2), 0.2);
+    }
 
     #[test]
     fn sola_fft_matches_time_domain_offset() {

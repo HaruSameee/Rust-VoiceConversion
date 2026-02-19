@@ -2,6 +2,10 @@ use crate::{Result, RuntimeConfig};
 
 pub trait InferenceEngine: Send + Sync + 'static {
     fn infer_frame(&mut self, frame: &[f32], config: &RuntimeConfig) -> Result<Vec<f32>>;
+
+    fn prepare_for_shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct VoiceChanger<E: InferenceEngine> {
@@ -30,5 +34,9 @@ impl<E: InferenceEngine> VoiceChanger<E> {
         }
 
         Ok(out)
+    }
+
+    pub fn prepare_shutdown(&mut self) -> Result<()> {
+        self.engine.prepare_for_shutdown()
     }
 }

@@ -1,14 +1,21 @@
 # Build artifacts
+target/
 **/target/
 **/*.rs.bk
-*.pdb
 **/mutants.out*/
+*.pdb
+
+# Runtime/cache artifacts
+ort_cache/
+apps/tauri/src-tauri/cache/
 
 # Python
 **/__pycache__/
 *.pyc
 *.pyo
 *.pyd
+.venv/
+venv/
 
 # Tauri / frontend artifacts
 apps/tauri/ui/node_modules/
@@ -31,6 +38,9 @@ models/*.bin
 models/*.cache
 models/*.rustvc.cache
 models/*.dll
+scripts/*.pt
+scripts/*.pth
+scripts/*.ckpt
 
 # Local references / dumps
 Mangio-RVC-v23.7.0/

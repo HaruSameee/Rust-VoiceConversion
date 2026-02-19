@@ -35,8 +35,10 @@ pub struct RuntimeConfig {
     pub ort_provider: String,
     pub ort_device_id: i32,
     pub ort_gpu_mem_limit_mb: u32,
-    pub ort_intra_threads: usize,
-    pub ort_inter_threads: usize,
+    #[serde(rename = "ort_intra_threads", alias = "intra_threads")]
+    pub intra_threads: u32,
+    #[serde(rename = "ort_inter_threads", alias = "inter_threads")]
+    pub inter_threads: u32,
     pub ort_parallel_execution: bool,
     pub hubert_context_samples_16k: usize,
     pub hubert_output_layer: i64,
@@ -68,16 +70,16 @@ impl Default for RuntimeConfig {
             f0_median_filter_radius: 3,
             extra_inference_ms: 0,
             response_threshold: 0.0,
-            fade_in_ms: 15,
-            fade_out_ms: 80,
+            fade_in_ms: 12,
+            fade_out_ms: 120,
             speaker_id: 0,
             sample_rate: 48_000,
             block_size: 8_192,
             ort_provider: "auto".to_string(),
             ort_device_id: 0,
             ort_gpu_mem_limit_mb: 0,
-            ort_intra_threads: default_ort_intra_threads(),
-            ort_inter_threads: 1,
+            intra_threads: default_intra_threads(),
+            inter_threads: 1,
             ort_parallel_execution: false,
             hubert_context_samples_16k: 16_000,
             hubert_output_layer: 12,
@@ -92,9 +94,9 @@ impl Default for RuntimeConfig {
     }
 }
 
-fn default_ort_intra_threads() -> usize {
+fn default_intra_threads() -> u32 {
     std::thread::available_parallelism()
-        .map(|n| n.get().min(4))
+        .map(|n| n.get() as u32)
         .unwrap_or(4)
         .max(1)
 }

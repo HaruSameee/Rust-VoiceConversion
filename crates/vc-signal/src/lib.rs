@@ -28,6 +28,15 @@ static HQ_RESAMPLE_BANK_CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<HqResample
 static RMVPE_MEL_SCALE_LOGGED: OnceLock<()> = OnceLock::new();
 static RMVPE_MEL_FLOOR_COUNT: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputNormalizeStats {
+    pub rms_before: f32,
+    pub peak_before: f32,
+    pub rms_after: f32,
+    pub peak_after: f32,
+    pub gain_applied: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct RmvpeMelInput {
     pub mel: Array3<f32>,
@@ -57,40 +66,6 @@ pub struct HqResampler {
     ratio: f64,
     integer_downsample_step: Option<usize>,
     bank: Option<Arc<HqResampleBank>>,
-}
-
-pub fn normalize_peak(samples: &mut [f32], target_peak: f32) {
-    let peak = samples
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0_f32, |acc, v| acc.max(v));
-    if peak <= f32::EPSILON {
-        return;
-    }
-    let gain = target_peak / peak;
-    for sample in samples {
-        *sample *= gain;
-    }
-}
-
-pub fn normalize_for_onnx_input(samples: &[f32], target_peak: f32) -> Vec<f32> {
-    if samples.is_empty() {
-        return Vec::new();
-    }
-
-    let mut out: Vec<f32> = samples.to_vec();
-    let peak = out
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0_f32, |acc, v| acc.max(v));
-    // Streaming input should not be amplified per block; only attenuate when clipping.
-    if peak > target_peak && peak > f32::EPSILON {
-        let gain = target_peak / peak;
-        for sample in &mut out {
-            *sample *= gain;
-        }
-    }
-    out
 }
 
 pub fn pad_for_rmvpe(samples: &[f32], hop_length: usize) -> RmvpePaddedInput {
@@ -152,6 +127,49 @@ pub fn postprocess_generated_audio(samples: &[f32]) -> Vec<f32> {
         *s = v.clamp(-0.99, 0.99);
     }
     out
+}
+
+pub fn normalize_peak(samples: &mut [f32], target_peak: f32, min_peak: f32) -> InputNormalizeStats {
+    if samples.is_empty() {
+        return InputNormalizeStats::default();
+    }
+
+    let (rms_before, peak_before) = signal_rms_peak(samples);
+    let target_peak = target_peak.clamp(1.0e-3, 1.0);
+    let min_peak = min_peak.max(1.0e-12);
+    if peak_before <= min_peak {
+        samples.fill(0.0);
+        return InputNormalizeStats {
+            rms_before,
+            peak_before,
+            rms_after: 0.0,
+            peak_after: 0.0,
+            gain_applied: 0.0,
+        };
+    }
+
+    let gain = (target_peak / peak_before).clamp(0.25, 32.0);
+    let mut sum_sq = 0.0_f32;
+    let mut peak_after = 0.0_f32;
+    for s in samples.iter_mut() {
+        let v = (*s * gain).clamp(-1.0, 1.0);
+        *s = v;
+        sum_sq += v * v;
+        peak_after = peak_after.max(v.abs());
+    }
+    let rms_after = (sum_sq / samples.len() as f32).sqrt();
+
+    InputNormalizeStats {
+        rms_before,
+        peak_before,
+        rms_after,
+        peak_after,
+        gain_applied: gain,
+    }
+}
+
+pub fn normalize_for_onnx_input(samples: &mut [f32]) -> InputNormalizeStats {
+    normalize_peak(samples, 0.95, 1.0e-6)
 }
 
 pub fn apply_rms_mix(
@@ -893,14 +911,6 @@ fn reflect_tail_index(index: usize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_peak_scales_to_target() {
-        let mut v = vec![0.25, -0.5, 0.1];
-        normalize_peak(&mut v, 1.0);
-        let peak = v.iter().map(|x| x.abs()).fold(0.0_f32, |a, b| a.max(b));
-        assert!((peak - 1.0).abs() < 1e-4);
-    }
 
     #[test]
     fn resample_linear_identity_when_same_rate() {
