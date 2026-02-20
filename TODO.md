@@ -1,26 +1,25 @@
-# Rust-VC TODO
+# TODO
 
-Single-file bilingual task list (日本語 / English).
+## P0 Critical
+- [ ] Eliminate remaining `STATUS_ACCESS_VIOLATION` cases in repeated start/stop loops.
+- [ ] Add integration test for inference shutdown ordering (`prepare_shutdown` to thread join).
+- [ ] Stabilize long-run real-time behavior on CUDA (slow block, underrun, queue headroom).
+- [ ] Finalize HuBERT frame policy (49/50) with reproducible A/B audio checks.
 
-<a id="ja-en-shared"></a>
+## P1 Important
+- [ ] Add preset import/export (JSON) in Tauri UI.
+- [ ] Add runtime diagnostics panel (latency, queue, provider, frame stats).
+- [ ] Improve provider/DLL mismatch detection on startup.
+- [ ] Add profile presets: low-latency / balanced / quality.
 
-## P0 (Critical / 最優先)
+## P2 Nice to have
+- [ ] Expand unit tests for frame shaping and RMVPE decode paths.
+- [ ] Add benchmark command for standard vs zero-copy inference comparison.
+- [ ] Expand `scripts/export_strict_onnx.py` documentation.
+- [ ] Add optional telemetry log export for issue reports.
 
-- [ ] 長時間 start/stop で残る `STATUS_ACCESS_VIOLATION` の解消 / Eliminate remaining `STATUS_ACCESS_VIOLATION` in long-run start/stop loops
-- [ ] ゼロコピー終了経路の統合テスト追加 / Add integration test for zero-copy shutdown path (`prepare_for_shutdown` -> drop)
-- [ ] Strict モデル + CUDA の安定性検証 / Verify stable real-time behavior with strict models on CUDA (`slow block`, `underrun`, queue headroom)
-- [ ] HuBERT 49->50 フレーム整形方針の最終確定 / Finalize HuBERT 49->50 shaping policy with audio A/B validation
-
-## P1 (Important / 重要)
-
-- [ ] UI でプリセット import/export（JSON） / Preset import/export (JSON file) in Tauri UI
-- [ ] ランタイム診断パネル追加 / Better runtime diagnostics panel (latency, queue, provider, frame stats)
-- [ ] DLL/Provider 不一致の起動時検証 / Auto-detect and validate ONNX runtime DLL/provider mismatch
-- [ ] 低遅延/バランス/高音質プリセット / Add profile presets for low-latency / balanced / quality modes
-
-## P2 (Nice to Have / 余力)
-
-- [ ] フレーム整形/RMVPE 経路のユニットテスト / Unit tests for frame shaping helpers and RMVPE decode paths
-- [ ] 標準 vs ゼロコピー比較ベンチ / Benchmark command for inference path comparison (standard vs zero-copy)
-- [ ] `scripts/export_strict_onnx.py` のドキュメント拡充 / Expand docs for model conversion workflow
-- [ ] 任意のテレメトリログ出力 / Optional telemetry log file export for issue reports
+## 日本語メモ
+- [ ] start/stop ループ時のクラッシュを完全解消する。
+- [ ] シャットダウン順序の統合テストを追加する。
+- [ ] CUDA実行時の長時間安定性を確認する。
+- [ ] HuBERT 49/50フレーム方針を最終確定する。

@@ -1,66 +1,41 @@
 # Rust-VC
 
-Single-file bilingual docs (日本語 / English).
+Rust + Tauri based real-time RVC engine.
 
-- 日本語: [日本語セクション](#ja)
-- English: [English section](#en)
-- TODO: `TODO.md`
-- Run Guide: `RUN.md`
-
-<a id="ja"></a>
-
-## 日本語
+## Japanese
 
 ### 概要
+- Rust製のリアルタイム音声変換エンジンです。
+- ONNX Runtime を使って HuBERT / RMVPE / RVC Decoder を実行します。
+- Tauri UI からランタイム設定を変更できます。
 
-Rust + Tauri で構成した、低レイテンシな RVC リアルタイム音声変換エンジンです。
-
-### 主な構成
-
-- `crates/vc-core`: 共通設定、エラー、推論トレイト
-- `crates/vc-signal`: DSP 補助（リサンプル、ピッチ補助、後処理）
-- `crates/vc-inference`: ONNX 推論（標準経路 + ゼロコピー経路）
-- `crates/vc-audio`: リアルタイム音声ワーカー
-- `apps/tauri/src-tauri`: バックエンド
+### 主要ディレクトリ
+- `crates/vc-core`: 共通設定・トレイト・エラー
+- `crates/vc-signal`: リサンプルや信号処理ユーティリティ
+- `crates/vc-inference`: ONNX 推論エンジン
+- `crates/vc-audio`: リアルタイム音声I/Oワーカー
+- `apps/tauri/src-tauri`: Tauriバックエンド
 - `apps/tauri/ui`: フロントエンド
 
-### クイックスタート（Windows）
-
-```powershell
-npm --prefix apps/tauri/ui install
-scripts\install_onnxruntime_provider.bat cuda
-cargo tauri dev
-```
-
-モデルは `model/` に配置してください（`model.onnx`, `hubert*.onnx`, `rmvpe*.onnx`, optional `model_vectors.bin`）。
-
-詳細な実行手順は `RUN.md`、開発タスクは `TODO.md` を参照してください。
-
-<a id="en"></a>
+### ドキュメント
+- 実行手順: `RUN.md`
+- 開発タスク: `TODO.md`
 
 ## English
 
 ### Overview
+- Real-time voice conversion engine implemented in Rust.
+- Runs HuBERT / RMVPE / RVC Decoder via ONNX Runtime.
+- Runtime settings are controlled from the Tauri UI.
 
-Low-latency RVC voice conversion engine in Rust with a Tauri desktop UI.
-
-### Main Layout
-
-- `crates/vc-core`: shared config, errors, inference trait
-- `crates/vc-signal`: DSP helpers (resample, pitch helpers, postprocess)
-- `crates/vc-inference`: ONNX inference (standard + zero-copy paths)
-- `crates/vc-audio`: real-time audio worker
-- `apps/tauri/src-tauri`: backend
+### Main directories
+- `crates/vc-core`: shared config, traits, errors
+- `crates/vc-signal`: resample and DSP utilities
+- `crates/vc-inference`: ONNX inference engine
+- `crates/vc-audio`: real-time audio I/O worker
+- `apps/tauri/src-tauri`: Tauri backend
 - `apps/tauri/ui`: frontend
 
-### Quick Start (Windows)
-
-```powershell
-npm --prefix apps/tauri/ui install
-scripts\install_onnxruntime_provider.bat cuda
-cargo tauri dev
-```
-
-Place models in `model/` (`model.onnx`, `hubert*.onnx`, `rmvpe*.onnx`, optional `model_vectors.bin`).
-
-See `RUN.md` for run details and `TODO.md` for development tasks.
+### Docs
+- Run guide: `RUN.md`
+- Development tasks: `TODO.md`
