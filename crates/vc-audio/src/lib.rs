@@ -25,8 +25,9 @@ const BLOCK_ALIGN_SAMPLES: usize = 256;
 const WARMUP_BUDGET_HEADROOM: f64 = 1.25;
 const MAX_AUTO_BLOCK_SIZE: usize = 96_000;
 const MAX_WARMUP_BLOCK_CAP: usize = 16_384;
-const HUBERT_WINDOW_SAMPLES: usize = 16_000;
+const PROCESS_WINDOW_CONTEXT_SEC: f64 = 1.0;
 const OUTPUT_SLICE_AUDIT_BLOCKS: u64 = 30;
+const FRAME_GRID_SEC: f64 = 0.02; // 20ms per frame
 
 /// Returns the minimum `extra_inference_ms` value that avoids buffer deadlock.
 ///
@@ -128,8 +129,8 @@ pub struct AudioStreamOptions {
     /// Must satisfy:
     ///   extra_inference_ms >= ceil((process_window - block_size) / (sr / 1000))
     ///
-    /// With process_window=16000, block_size=8192, sr=48000:
-    ///   minimum = 163ms
+    /// With process_window=1.0s, block_size=8192, sr=48000:
+    ///   process_window = 48000, minimum = 830ms
     ///
     /// Recommended = minimum + actual_inference_ms + 20ms jitter margin.
     pub extra_inference_ms: u32,
@@ -247,6 +248,7 @@ where
     let sola_search_output = sola_search_samples(output_rate);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
+    let process_window_samples = process_window_samples(model_sample_rate);
     let warmup_inference_block_size = requested_block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
@@ -295,32 +297,74 @@ where
         }
     };
 
-    let block_size = recommended_block_size_from_warmup(
+    let recommended_block_size = recommended_block_size_from_warmup(
         requested_block_size,
         model_sample_rate,
         warmup_elapsed_ms,
     );
+    let max_safe_block_size = process_window_samples.saturating_sub(sola_search_model);
+    if max_safe_block_size == 0 {
+        return Err(anyhow!(
+            "invalid realtime geometry: process_window({}) <= sola_search_model({})",
+            process_window_samples,
+            sola_search_model
+        ));
+    }
+    let clamped_block_size = recommended_block_size.min(max_safe_block_size);
+    let frame_grid = frame_grid_samples(model_sample_rate);
+    let mut block_size = align_down(clamped_block_size, frame_grid);
+    block_size = block_size.clamp(1, max_safe_block_size);
     if block_size != requested_block_size {
         eprintln!(
             "[vc-audio] block_size adjusted for realtime headroom: requested={} effective={} warmup_ms={:.2}",
             requested_block_size, block_size, warmup_elapsed_ms
         );
     }
-    let extra_samples = (extra_inference_ms as usize)
-        .saturating_mul(model_sample_rate as usize)
-        .saturating_div(1000);
+    if block_size != recommended_block_size {
+        eprintln!(
+            "[vc-audio] block_size clamped for strict window safety: recommended={} clamped={} (max_safe={} process_window={} sola_search_model={})",
+            recommended_block_size,
+            block_size,
+            max_safe_block_size,
+            process_window_samples,
+            sola_search_model
+        );
+    }
+    if block_size != clamped_block_size {
+        eprintln!(
+            "[vc-audio] block_size aligned to frame grid: pre_align={} aligned={} frame_grid={}samples",
+            clamped_block_size, block_size, frame_grid
+        );
+    }
     let inference_block_size = block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
-    let target_buffer_samples = block_size.saturating_add(extra_samples);
+    if inference_block_size > process_window_samples {
+        return Err(anyhow!(
+            "invalid realtime geometry: inference_block_size({}) > process_window({})",
+            inference_block_size,
+            process_window_samples
+        ));
+    }
+    let min_extra_ms = min_extra_inference_ms(process_window_samples, block_size, model_sample_rate);
+    let effective_extra_inference_ms = extra_inference_ms.max(min_extra_ms);
+    if effective_extra_inference_ms != extra_inference_ms {
+        eprintln!(
+            "[vc-audio] extra_inference_ms elevated for process window: requested={} effective={} (min_required={})",
+            extra_inference_ms, effective_extra_inference_ms, min_extra_ms
+        );
+    }
+    let effective_extra_samples = (effective_extra_inference_ms as usize)
+        .saturating_mul(model_sample_rate as usize)
+        .saturating_div(1000);
+    let target_buffer_samples = block_size.saturating_add(effective_extra_samples);
     validate_buffer_contract(
-        extra_inference_ms,
+        effective_extra_inference_ms,
         block_size,
-        HUBERT_WINDOW_SAMPLES,
+        process_window_samples,
         model_sample_rate,
     );
-    let min_extra_ms = min_extra_inference_ms(HUBERT_WINDOW_SAMPLES, block_size, model_sample_rate);
-    let headroom_samples = target_buffer_samples.saturating_sub(HUBERT_WINDOW_SAMPLES);
+    let headroom_samples = target_buffer_samples.saturating_sub(process_window_samples);
     let sr_per_ms = model_sample_rate as f64 / 1000.0;
     let headroom_ms = if sr_per_ms > 0.0 {
         headroom_samples as f64 / sr_per_ms
@@ -330,9 +374,9 @@ where
     eprintln!(
         "[vc-audio] buffer_geometry: block={}smp process_window={}smp target_buffer={}smp extra_ms={}ms headroom={}smp ({:.1}ms) min_extra_ms={}ms",
         block_size,
-        HUBERT_WINDOW_SAMPLES,
+        process_window_samples,
         target_buffer_samples,
-        extra_inference_ms,
+        effective_extra_inference_ms,
         headroom_samples,
         headroom_ms,
         min_extra_ms
@@ -403,11 +447,12 @@ where
             output_rate,
             output_channels,
             allow_process_window_grow,
-            extra_inference_ms,
+            effective_extra_inference_ms,
             response_threshold,
             fade_in_ms,
             fade_out_ms,
             output_tail_offset_ms,
+            process_window_samples,
             &running_worker,
             &input_rms_worker,
             &input_peak_worker,
@@ -582,6 +627,7 @@ fn worker_loop<E>(
     fade_in_ms: u32,
     fade_out_ms: u32,
     output_tail_offset_ms: u32,
+    configured_process_window_samples: usize,
     running: &Arc<AtomicBool>,
     input_rms: &Arc<AtomicU32>,
     input_peak: &Arc<AtomicU32>,
@@ -596,6 +642,9 @@ fn worker_loop<E>(
     let io_block_size = block_size.max(1);
     let output_step_samples =
         map_model_samples_to_output(io_block_size, model_sample_rate, output_rate);
+    // Slice length should follow what the output engine actually consumes per block
+    // (device-facing output domain), not a separately derived hop estimate.
+    let output_slice_len_out = output_step_samples;
     let crossfade_samples = default_output_crossfade_samples(output_rate).min(output_step_samples);
     let sola_search_output = sola_search_samples(output_rate);
     let edge_guard_samples = crossfade_samples.max(sola_search_output / 2);
@@ -603,12 +652,24 @@ fn worker_loop<E>(
         resolve_output_tail_offset_samples(output_rate, edge_guard_samples, output_tail_offset_ms);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
+    let output_slice_len_model = map_output_samples_to_model(
+        output_slice_len_out.saturating_add(sola_search_output),
+        model_sample_rate,
+        output_rate,
+    );
+    let output_tail_offset_model =
+        map_output_samples_to_model(output_tail_offset_samples, model_sample_rate, output_rate);
+    // Keep only the newest region required for this block:
+    //   - one output block worth of fresh samples (in output domain)
+    //   - SOLA search margin
+    //   - optional right-edge safety offset margin
+    let output_source_window_model = output_slice_len_model.saturating_add(output_tail_offset_model);
     let inference_block_size = io_block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
     let target_buffer_samples = io_block_size.saturating_add(extra_samples);
     let min_process_window_samples = io_block_size;
-    let process_window_cap = HUBERT_WINDOW_SAMPLES;
+    let process_window_cap = configured_process_window_samples.max(io_block_size);
     let mut process_window_samples = if allow_process_window_grow {
         min_process_window_samples
     } else {
@@ -761,18 +822,18 @@ fn worker_loop<E>(
             };
 
             let (output_source, source_slice_start, source_slice_end): (Vec<f32>, usize, usize) =
-                if model_out.len() >= process_window_samples {
-                    // Keep the newest region: sliding-window inference appends fresh content to the tail.
+                if model_out.len() >= output_source_window_model {
+                    // Keep only the freshest window (hop + required margins), not the full process window.
                     let end = model_out.len();
-                    let start = end.saturating_sub(process_window_samples);
+                    let start = end.saturating_sub(output_source_window_model);
                     (model_out[start..end].to_vec(), start, end)
                 } else {
-                    // If model output is shorter than the process window, align it to the tail and
+                    // If model output is shorter than the required source window, align it to the tail and
                     // pad the head with zeros so downstream tail slicing keeps recent audio.
-                    let mut padded = vec![0.0_f32; process_window_samples];
+                    let mut padded = vec![0.0_f32; output_source_window_model];
                     let copy_len = model_out.len();
                     if copy_len > 0 {
-                        let dst_start = process_window_samples.saturating_sub(copy_len);
+                        let dst_start = output_source_window_model.saturating_sub(copy_len);
                         padded[dst_start..].copy_from_slice(&model_out);
                     }
                     (padded, 0, model_out.len())
@@ -787,7 +848,8 @@ fn worker_loop<E>(
             } else {
                 &output_source
             };
-            let expected_len = output_step_samples.min(output_mono.len().max(1));
+            // Keep callback pacing deterministic: always produce one output block per inference step.
+            let expected_len = output_step_samples.max(1);
             let ola_overlap_samples =
                 compute_ola_overlap_samples(expected_len, crossfade_samples, extra_inference_ms);
             // Avoid using the very end of each block where non-causal generators are often unstable.
@@ -815,11 +877,12 @@ fn worker_loop<E>(
             }
             if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
                 eprintln!(
-                    "[vc-audio] output-slice-audit block={} model_out_len={} source_slice=[{}..{}) output_len={} expected_len={} tail_offset={} anchor_end={} tail=[{}..{}) search_limit={}",
+                    "[vc-audio] output-slice-audit block={} model_out_len={} source_slice=[{}..{}) source_window_model={} source_len={} expected_len={} tail_offset={} anchor_end={} tail=[{}..{}) search_limit={}",
                     processed_blocks + 1,
                     model_out.len(),
                     source_slice_start,
                     source_slice_end,
+                    output_source_window_model,
                     output_mono.len(),
                     expected_len,
                     applied_guard,
@@ -834,6 +897,16 @@ fn worker_loop<E>(
             if smoothed_output.len() < expected_len {
                 let pad = smoothed_output.last().copied().unwrap_or(0.0);
                 smoothed_output.resize(expected_len, pad);
+            } else if smoothed_output.len() > expected_len {
+                smoothed_output.truncate(expected_len);
+            }
+            if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                eprintln!(
+                    "[vc-audio] output-slice-final block={} final_len={} expected_len={}",
+                    processed_blocks + 1,
+                    smoothed_output.len(),
+                    expected_len
+                );
             }
             let overlap = ola_overlap_samples
                 .min(smoothed_output.len())
@@ -1050,6 +1123,32 @@ fn align_up(value: usize, align: usize) -> usize {
         return value.max(1);
     }
     value.div_ceil(align) * align
+}
+
+fn align_down(value: usize, align: usize) -> usize {
+    if align <= 1 {
+        return value.max(1);
+    }
+    if value < align {
+        return value.max(1);
+    }
+    (value / align) * align
+}
+
+fn frame_grid_samples(model_sample_rate: u32) -> usize {
+    if model_sample_rate == 0 {
+        return 1;
+    }
+    ((model_sample_rate as f64) * FRAME_GRID_SEC).round().max(1.0) as usize
+}
+
+fn process_window_samples(model_sample_rate: u32) -> usize {
+    if model_sample_rate == 0 {
+        return 1;
+    }
+    ((model_sample_rate as f64) * PROCESS_WINDOW_CONTEXT_SEC)
+        .round()
+        .max(1.0) as usize
 }
 
 fn recommended_block_size_from_warmup(
@@ -1392,18 +1491,40 @@ mod tests {
     }
 
     #[test]
+    fn test_min_extra_inference_ms_for_1s_context() {
+        assert_eq!(min_extra_inference_ms(48_000, 8_192, 48_000), 830);
+    }
+
+    #[test]
     fn test_min_extra_inference_ms_exact() {
         assert_eq!(min_extra_inference_ms(8_192, 8_192, 48_000), 0);
     }
 
     #[test]
-    fn test_process_window_clamp_at_hubert_window() {
-        const HUBERT_WINDOW: usize = 16_000;
+    fn test_process_window_clamp_at_context_window() {
+        const CONTEXT_WINDOW: usize = 48_000;
         let mut w = 8_192usize;
         for _ in 0..1000 {
-            w = (w + 500).min(HUBERT_WINDOW);
+            w = (w + 500).min(CONTEXT_WINDOW);
         }
-        assert_eq!(w, HUBERT_WINDOW);
+        assert_eq!(w, CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn test_process_window_samples_1s_at_48k() {
+        assert_eq!(process_window_samples(48_000), 48_000);
+    }
+
+    #[test]
+    fn test_frame_grid_samples_48k_is_960() {
+        assert_eq!(frame_grid_samples(48_000), 960);
+    }
+
+    #[test]
+    fn test_align_down_to_frame_grid() {
+        let grid = frame_grid_samples(48_000);
+        assert_eq!(align_down(8_192, grid), 7_680);
+        assert_eq!(align_down(15_520, grid), 15_360);
     }
 
     #[test]

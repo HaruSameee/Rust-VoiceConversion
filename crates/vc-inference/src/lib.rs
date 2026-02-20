@@ -390,23 +390,9 @@ impl RvcOrtEngine {
                 STRICT_ONNX_INPUT_SAMPLES_16K,
                 (STRICT_ONNX_INPUT_SAMPLES_16K as f64 / hop_samples_16k as f64).ceil() as usize
             );
-            let zero_copy_engine = match zero_copy_engine::ZeroCopyInferenceEngine::try_new_from_env(
-                &model,
-                runtime_config,
-            ) {
-                Ok(engine) => {
-                    if engine.is_some() {
-                        eprintln!("[vc-inference] zero-copy execution path enabled (experimental)");
-                    }
-                    engine
-                }
-                Err(e) => {
-                    eprintln!(
-                            "[vc-inference] warning: zero-copy init failed; fallback to standard path. cause={e}"
-                        );
-                    None
-                }
-            };
+            eprintln!("[vc-inference] execution path: standard copy (zero-copy disabled)");
+            let zero_copy_engine: Option<Arc<Mutex<zero_copy_engine::ZeroCopyInferenceEngine>>> =
+                None;
 
             Ok(Self {
                 model,
@@ -423,7 +409,7 @@ impl RvcOrtEngine {
                 ort_inter_threads,
                 ort_parallel_execution,
                 ort_cuda_tuning,
-                zero_copy_engine: zero_copy_engine.map(|engine| Arc::new(Mutex::new(engine))),
+                zero_copy_engine,
                 rvc_runtime_cpu_fallback_tried: false,
                 default_pitch_smooth_alpha: pitch_smooth_alpha,
                 decoder_frame_count,
