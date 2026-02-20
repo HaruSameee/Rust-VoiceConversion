@@ -28,6 +28,7 @@ const MAX_WARMUP_BLOCK_CAP: usize = 16_384;
 const PROCESS_WINDOW_CONTEXT_SEC: f64 = 1.0;
 const OUTPUT_SLICE_AUDIT_BLOCKS: u64 = 30;
 const FRAME_GRID_SEC: f64 = 0.02; // 20ms per frame
+const INPUT_DC_BLOCK_COEFF: f32 = 0.995;
 
 /// Returns the minimum `extra_inference_ms` value that avoids buffer deadlock.
 ///
@@ -231,13 +232,12 @@ where
     let input_config = input_device.default_input_config()?;
     let output_config = output_device.default_output_config()?;
 
-    if input_config.sample_format() != cpal::SampleFormat::F32
-        || output_config.sample_format() != cpal::SampleFormat::F32
-    {
+    if output_config.sample_format() != cpal::SampleFormat::F32 {
         return Err(anyhow!(
-            "only f32 input/output sample format is supported in this prototype"
+            "only f32 output sample format is supported in this prototype"
         ));
     }
+    let input_sample_format = input_config.sample_format();
 
     let input_stream_config: cpal::StreamConfig = input_config.clone().into();
     let output_stream_config: cpal::StreamConfig = output_config.clone().into();
@@ -253,11 +253,13 @@ where
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
     eprintln!(
-        "[vc-audio] input_rate={} output_rate={} input_ch={} output_ch={} model_rate={} block_size_requested={}",
+        "[vc-audio] input_rate={} output_rate={} input_ch={} output_ch={} input_fmt={:?} output_fmt={:?} model_rate={} block_size_requested={}",
         input_rate,
         output_rate,
         input_channels,
         output_channels,
+        input_sample_format,
+        output_config.sample_format(),
         model_sample_rate,
         requested_block_size
     );
@@ -412,15 +414,44 @@ where
     let input_rms = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
 
-    let input_data_fn = build_input_callback(Arc::clone(&running), input_channels, input_tx);
     let output_data_fn = build_output_callback(Arc::clone(&running), output_rx);
-
-    let input_stream = input_device.build_input_stream(
-        &input_stream_config,
-        input_data_fn,
-        |err| eprintln!("input stream error: {err}"),
-        None,
-    )?;
+    let input_stream = match input_sample_format {
+        cpal::SampleFormat::F32 => input_device.build_input_stream(
+            &input_stream_config,
+            build_input_callback_f32(Arc::clone(&running), input_channels, input_tx.clone()),
+            |err| eprintln!("input stream error: {err}"),
+            None,
+        )?,
+        cpal::SampleFormat::I16 => input_device.build_input_stream(
+            &input_stream_config,
+            build_input_callback_i16(Arc::clone(&running), input_channels, input_tx.clone()),
+            |err| eprintln!("input stream error: {err}"),
+            None,
+        )?,
+        cpal::SampleFormat::U16 => input_device.build_input_stream(
+            &input_stream_config,
+            build_input_callback_u16(Arc::clone(&running), input_channels, input_tx.clone()),
+            |err| eprintln!("input stream error: {err}"),
+            None,
+        )?,
+        cpal::SampleFormat::I32 => input_device.build_input_stream(
+            &input_stream_config,
+            build_input_callback_i32(Arc::clone(&running), input_channels, input_tx.clone()),
+            |err| eprintln!("input stream error: {err}"),
+            None,
+        )?,
+        cpal::SampleFormat::U32 => input_device.build_input_stream(
+            &input_stream_config,
+            build_input_callback_u32(Arc::clone(&running), input_channels, input_tx.clone()),
+            |err| eprintln!("input stream error: {err}"),
+            None,
+        )?,
+        other => {
+            return Err(anyhow!(
+                "unsupported input sample format: {other:?}. Supported: f32/i16/u16/i32/u32"
+            ))
+        }
+    };
     let output_stream = output_device.build_output_stream(
         &output_stream_config,
         output_data_fn,
@@ -518,17 +549,64 @@ fn find_output_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Dev
         .ok_or_else(|| anyhow!("default output device not found"))
 }
 
-fn build_input_callback(
+fn build_input_callback_f32(
     running: Arc<AtomicBool>,
     input_channels: usize,
     input_tx: SyncSender<Vec<f32>>,
 ) -> impl FnMut(&[f32], &cpal::InputCallbackInfo) + Send + 'static {
+    build_input_callback_with_convert(running, input_channels, input_tx, sample_f32_to_f32)
+}
+
+fn build_input_callback_i16(
+    running: Arc<AtomicBool>,
+    input_channels: usize,
+    input_tx: SyncSender<Vec<f32>>,
+) -> impl FnMut(&[i16], &cpal::InputCallbackInfo) + Send + 'static {
+    build_input_callback_with_convert(running, input_channels, input_tx, sample_i16_to_f32)
+}
+
+fn build_input_callback_u16(
+    running: Arc<AtomicBool>,
+    input_channels: usize,
+    input_tx: SyncSender<Vec<f32>>,
+) -> impl FnMut(&[u16], &cpal::InputCallbackInfo) + Send + 'static {
+    build_input_callback_with_convert(running, input_channels, input_tx, sample_u16_to_f32)
+}
+
+fn build_input_callback_i32(
+    running: Arc<AtomicBool>,
+    input_channels: usize,
+    input_tx: SyncSender<Vec<f32>>,
+) -> impl FnMut(&[i32], &cpal::InputCallbackInfo) + Send + 'static {
+    build_input_callback_with_convert(running, input_channels, input_tx, sample_i32_to_f32)
+}
+
+fn build_input_callback_u32(
+    running: Arc<AtomicBool>,
+    input_channels: usize,
+    input_tx: SyncSender<Vec<f32>>,
+) -> impl FnMut(&[u32], &cpal::InputCallbackInfo) + Send + 'static {
+    build_input_callback_with_convert(running, input_channels, input_tx, sample_u32_to_f32)
+}
+
+fn build_input_callback_with_convert<T, F>(
+    running: Arc<AtomicBool>,
+    input_channels: usize,
+    input_tx: SyncSender<Vec<f32>>,
+    sample_to_f32: F,
+) -> impl FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static
+where
+    T: Copy + Send + 'static,
+    F: Fn(T) -> f32 + Send + Copy + 'static,
+{
     let mut dropped = 0usize;
-    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+    let mut dc_blocker = DcBlocker::new(INPUT_DC_BLOCK_COEFF);
+    move |data: &[T], _: &cpal::InputCallbackInfo| {
         if !running.load(Ordering::Relaxed) {
             return;
         }
-        let mono = downmix_to_mono(data, input_channels);
+        let mut mono = downmix_to_mono_with_convert(data, input_channels, sample_to_f32);
+        dc_blocker.process_in_place(&mut mono);
         match input_tx.try_send(mono) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
@@ -1396,9 +1474,47 @@ fn find_best_sola_offset_time_domain(
     best_offset
 }
 
+#[inline]
+fn sample_f32_to_f32(sample: f32) -> f32 {
+    sample
+}
+
+#[inline]
+fn sample_i16_to_f32(sample: i16) -> f32 {
+    (sample as f32 / 32_768.0).clamp(-1.0, 1.0)
+}
+
+#[inline]
+fn sample_u16_to_f32(sample: u16) -> f32 {
+    ((sample as f32 / 65_535.0) * 2.0 - 1.0).clamp(-1.0, 1.0)
+}
+
+#[inline]
+fn sample_i32_to_f32(sample: i32) -> f32 {
+    (sample as f32 / 2_147_483_648.0).clamp(-1.0, 1.0)
+}
+
+#[inline]
+fn sample_u32_to_f32(sample: u32) -> f32 {
+    ((sample as f32 / 4_294_967_295.0) * 2.0 - 1.0).clamp(-1.0, 1.0)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
+    downmix_to_mono_with_convert(data, channels, sample_f32_to_f32)
+}
+
+fn downmix_to_mono_with_convert<T, F>(data: &[T], channels: usize, sample_to_f32: F) -> Vec<f32>
+where
+    T: Copy,
+    F: Fn(T) -> f32 + Copy,
+{
     if channels <= 1 {
-        return data.to_vec();
+        let mut out = Vec::with_capacity(data.len());
+        for &sample in data {
+            out.push(sample_to_f32(sample));
+        }
+        return out;
     }
 
     let frames = data.len() / channels;
@@ -1407,11 +1523,38 @@ fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
         let start = frame_idx * channels;
         let mut sum = 0.0_f32;
         for ch in 0..channels {
-            sum += data[start + ch];
+            sum += sample_to_f32(data[start + ch]);
         }
         out.push(sum / channels as f32);
     }
     out
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DcBlocker {
+    coeff: f32,
+    prev_input: f32,
+    prev_output: f32,
+}
+
+impl DcBlocker {
+    fn new(coeff: f32) -> Self {
+        Self {
+            coeff: coeff.clamp(0.0, 0.9999),
+            prev_input: 0.0,
+            prev_output: 0.0,
+        }
+    }
+
+    fn process_in_place(&mut self, samples: &mut [f32]) {
+        for sample in samples {
+            let input = *sample;
+            let output = input - self.prev_input + self.coeff * self.prev_output;
+            self.prev_input = input;
+            self.prev_output = output;
+            *sample = output;
+        }
+    }
 }
 
 fn upmix_from_mono(mono: &[f32], channels: usize) -> Vec<f32> {
@@ -1525,6 +1668,31 @@ mod tests {
         let grid = frame_grid_samples(48_000);
         assert_eq!(align_down(8_192, grid), 7_680);
         assert_eq!(align_down(15_520, grid), 15_360);
+    }
+
+    #[test]
+    fn test_downmix_to_mono_stereo_interleaved() {
+        let input = [1.0_f32, -1.0_f32, 0.5_f32, 0.5_f32, -0.25_f32, 0.25_f32];
+        let mono = downmix_to_mono(&input, 2);
+        assert_eq!(mono.len(), 3);
+        assert!((mono[0] - 0.0).abs() < 1.0e-6);
+        assert!((mono[1] - 0.5).abs() < 1.0e-6);
+        assert!((mono[2] - 0.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn test_sample_i16_to_f32_range() {
+        assert!((sample_i16_to_f32(i16::MAX) - 0.9999695).abs() < 1.0e-4);
+        assert_eq!(sample_i16_to_f32(i16::MIN), -1.0);
+    }
+
+    #[test]
+    fn test_dc_blocker_reduces_constant_offset() {
+        let mut dc = DcBlocker::new(INPUT_DC_BLOCK_COEFF);
+        let mut samples = vec![0.1_f32; 4096];
+        dc.process_in_place(&mut samples);
+        let tail_avg = samples[3500..].iter().copied().sum::<f32>() / 596.0;
+        assert!(tail_avg.abs() < 1.0e-3);
     }
 
     #[test]
