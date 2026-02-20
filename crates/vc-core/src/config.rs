@@ -40,6 +40,10 @@ pub struct RuntimeConfig {
     pub response_threshold: f32,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
+    /// Extra right-edge safety offset (ms) when slicing decoder output tails.
+    ///
+    /// 0 means "use engine default edge guard".
+    pub output_tail_offset_ms: u32,
     pub speaker_id: i64,
     pub sample_rate: u32,
     pub block_size: usize,
@@ -83,6 +87,7 @@ impl Default for RuntimeConfig {
             response_threshold: 0.0,
             fade_in_ms: 12,
             fade_out_ms: 120,
+            output_tail_offset_ms: 0,
             speaker_id: 0,
             sample_rate: 48_000,
             block_size: 8_192,

@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::VecDeque,
     env, fs, io,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
@@ -210,8 +211,12 @@ pub struct RvcOrtEngine {
     zero_copy_engine: Option<Arc<Mutex<zero_copy_engine::ZeroCopyInferenceEngine>>>,
     rvc_runtime_cpu_fallback_tried: bool,
     default_pitch_smooth_alpha: f32,
+    decoder_frame_count: usize,
     index_prev_vector: Vec<f32>,
     last_pitch_hz: f32,
+    source_16k_context: VecDeque<f32>,
+    rmvpe_16k_context: VecDeque<f32>,
+    hop_samples_16k: usize,
     rnd_state: u64,
 }
 
@@ -236,6 +241,10 @@ impl RvcOrtEngine {
             let ort_intra_threads = runtime_config.intra_threads as usize;
             let ort_inter_threads = runtime_config.inter_threads as usize;
             let ort_parallel_execution = runtime_config.ort_parallel_execution;
+            let hubert_upsample_factor = runtime_config.hubert_upsample_factor.max(1);
+            let decoder_frame_count = STRICT_HUBERT_OUTPUT_FRAMES
+                .saturating_mul(hubert_upsample_factor)
+                .max(1);
             let ort_ep = resolve_ort_execution_config(runtime_config);
             let ort_cuda_tuning = resolve_ort_cuda_tuning(runtime_config);
             let pitch_smooth_alpha = if runtime_config.pitch_smooth_alpha.is_finite() {
@@ -245,7 +254,7 @@ impl RvcOrtEngine {
             }
             .max(0.0);
             eprintln!(
-                "[vc-inference] ort intra_threads={} inter_threads={} parallel={} provider={:?} dev={} vram_limit_mb={} strict_input_16k={} strict_hubert_frames={} pitch_smooth_alpha={:.2}",
+                "[vc-inference] ort intra_threads={} inter_threads={} parallel={} provider={:?} dev={} vram_limit_mb={} strict_input_16k={} strict_hubert_frames={} hubert_up={} decoder_frames={} pitch_smooth_alpha={:.2}",
                 if ort_intra_threads == 0 {
                     "auto".to_string()
                 } else {
@@ -265,6 +274,8 @@ impl RvcOrtEngine {
                     .unwrap_or(0),
                 STRICT_ONNX_INPUT_SAMPLES_16K,
                 STRICT_HUBERT_OUTPUT_FRAMES,
+                hubert_upsample_factor,
+                decoder_frame_count,
                 pitch_smooth_alpha
             );
 
@@ -365,6 +376,20 @@ impl RvcOrtEngine {
                 }
                 None => None,
             };
+            let hop_samples_16k = estimate_hop_samples_16k(
+                runtime_config.block_size.max(1),
+                runtime_config.sample_rate.max(1),
+            );
+            let context_samples = STRICT_ONNX_INPUT_SAMPLES_16K.saturating_sub(hop_samples_16k);
+            eprintln!(
+                "[vc-inference] sliding_window: hubert=independent rmvpe=independent window={}smp hop={}smp context={}smp @ 16kHz",
+                STRICT_ONNX_INPUT_SAMPLES_16K, hop_samples_16k, context_samples
+            );
+            eprintln!(
+                "[vc-inference] context_window initialized: {} zeros (silence) -> first {} blocks will have partial context",
+                STRICT_ONNX_INPUT_SAMPLES_16K,
+                (STRICT_ONNX_INPUT_SAMPLES_16K as f64 / hop_samples_16k as f64).ceil() as usize
+            );
             let zero_copy_engine = match zero_copy_engine::ZeroCopyInferenceEngine::try_new_from_env(
                 &model,
                 runtime_config,
@@ -401,8 +426,20 @@ impl RvcOrtEngine {
                 zero_copy_engine: zero_copy_engine.map(|engine| Arc::new(Mutex::new(engine))),
                 rvc_runtime_cpu_fallback_tried: false,
                 default_pitch_smooth_alpha: pitch_smooth_alpha,
+                decoder_frame_count,
                 index_prev_vector: Vec::new(),
                 last_pitch_hz: 0.0,
+                source_16k_context: {
+                    let mut buf = VecDeque::with_capacity(STRICT_ONNX_INPUT_SAMPLES_16K);
+                    buf.resize(STRICT_ONNX_INPUT_SAMPLES_16K, 0.0);
+                    buf
+                },
+                rmvpe_16k_context: {
+                    let mut buf = VecDeque::with_capacity(STRICT_ONNX_INPUT_SAMPLES_16K);
+                    buf.resize(STRICT_ONNX_INPUT_SAMPLES_16K, 0.0);
+                    buf
+                },
+                hop_samples_16k,
                 rnd_state: 0x9E37_79B9_7F4A_7C15,
             })
         }));
@@ -427,7 +464,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
 
     fn estimate_pitch(&mut self, source_16k: &[f32], threshold: f32) -> Result<Vec<f32>> {
         let Some(session) = self.rmvpe_session.as_mut() else {
-            return Ok(vec![0.0; STRICT_HUBERT_OUTPUT_FRAMES]);
+            return Ok(vec![0.0; self.decoder_frame_count]);
         };
         if source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
             return Err(VcError::Inference(format!(
@@ -465,7 +502,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         ensure_tensor_finite("rmvpe_raw", rmvpe_raw_stats)?;
         let f0 = resize_pitch_to_frames(
             &decode_rmvpe_output(shape, data, threshold)?,
-            STRICT_HUBERT_OUTPUT_FRAMES,
+            self.decoder_frame_count,
         );
         let f0_stats = tensor_stats_from_iter(f0.iter().copied());
         maybe_log_tensor_stats("rmvpe_f0", f0_stats);
@@ -513,17 +550,42 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let hubert_stats = tensor_stats_from_iter(data.iter().copied());
         maybe_log_tensor_stats("hubert_raw", hubert_stats);
         ensure_tensor_finite("hubert_raw", hubert_stats)?;
-        let phone = force_frame_count_3d_tail_pad(
+        let phone_50 = force_frame_count_3d_tail_pad(
             phone_from_hubert_tensor(shape, data, self.phone_feature_dim)?,
             STRICT_HUBERT_OUTPUT_FRAMES,
         );
+        let phone = upsample_phone_frames_repeat(phone_50, self.decoder_frame_count);
         let phone_stats = tensor_stats_from_iter(phone.iter().copied());
         maybe_log_tensor_stats("hubert_phone", phone_stats);
         ensure_tensor_finite("hubert_phone", phone_stats)?;
         Ok(phone)
     }
 
-    fn prepare_strict_source_16k(&self, frame: &[f32], input_sample_rate: u32) -> Vec<f32> {
+    fn prepare_inference_inputs_16k(
+        &mut self,
+        frame: &[f32],
+        input_sample_rate: u32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let source_16k = self.resample_block_to_16k(frame, input_sample_rate);
+        self.hop_samples_16k = source_16k.len().max(1).min(STRICT_ONNX_INPUT_SAMPLES_16K);
+        slide_context_window(
+            &mut self.source_16k_context,
+            &source_16k,
+            STRICT_ONNX_INPUT_SAMPLES_16K,
+        );
+        debug_assert_eq!(self.source_16k_context.len(), STRICT_ONNX_INPUT_SAMPLES_16K);
+        slide_context_window(
+            &mut self.rmvpe_16k_context,
+            &source_16k,
+            STRICT_ONNX_INPUT_SAMPLES_16K,
+        );
+        debug_assert_eq!(self.rmvpe_16k_context.len(), STRICT_ONNX_INPUT_SAMPLES_16K);
+        let hubert_input: Vec<f32> = self.source_16k_context.iter().copied().collect();
+        let rmvpe_input: Vec<f32> = self.rmvpe_16k_context.iter().copied().collect();
+        (hubert_input, rmvpe_input)
+    }
+
+    fn resample_block_to_16k(&self, frame: &[f32], input_sample_rate: u32) -> Vec<f32> {
         let mut source_16k = Vec::<f32>::new();
         if input_sample_rate == RMVPE_SAMPLE_RATE {
             source_16k.extend_from_slice(frame);
@@ -535,7 +597,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             let local = HqResampler::new(input_sample_rate.max(1), RMVPE_SAMPLE_RATE);
             resample_hq_into(&local, frame, &mut source_16k);
         }
-        fit_waveform_to_len(&source_16k, STRICT_ONNX_INPUT_SAMPLES_16K)
+        source_16k
     }
 
     fn blend_phone_with_index(&mut self, phone: &mut Array3<f32>, config: &RuntimeConfig) {
@@ -855,28 +917,48 @@ impl InferenceEngine for RvcOrtEngine {
     fn infer_frame(&mut self, frame: &[f32], config: &RuntimeConfig) -> Result<Vec<f32>> {
         let mut infer = || -> Result<Vec<f32>> {
             let waveform = frame.to_vec();
-            let mut source_16k = self.prepare_strict_source_16k(&waveform, config.sample_rate);
-            if source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
+            let (mut hubert_source_16k, mut rmvpe_source_16k) =
+                self.prepare_inference_inputs_16k(&waveform, config.sample_rate);
+            if hubert_source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
                 return Err(VcError::Inference(format!(
-                    "strict source length mismatch: got={}, expected={}",
-                    source_16k.len(),
+                    "strict HuBERT source length mismatch: got={}, expected={}",
+                    hubert_source_16k.len(),
                     STRICT_ONNX_INPUT_SAMPLES_16K
                 )));
             }
-            let norm_stats = normalize_for_onnx_input(&mut source_16k);
+            if rmvpe_source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
+                return Err(VcError::Inference(format!(
+                    "strict RMVPE source length mismatch: got={}, expected={}",
+                    rmvpe_source_16k.len(),
+                    STRICT_ONNX_INPUT_SAMPLES_16K
+                )));
+            }
+            let hubert_norm_stats = normalize_for_onnx_input(&mut hubert_source_16k);
+            let rmvpe_norm_stats = normalize_for_onnx_input(&mut rmvpe_source_16k);
             if tensor_stats_enabled() {
                 eprintln!(
-                    "[vc-inference] stats source_16k_norm: rms_before={:.6e} peak_before={:.6e} rms_after={:.6e} peak_after={:.6e} gain={:.6e}",
-                    norm_stats.rms_before,
-                    norm_stats.peak_before,
-                    norm_stats.rms_after,
-                    norm_stats.peak_after,
-                    norm_stats.gain_applied
+                    "[vc-inference] stats source_16k_norm_hubert: rms_before={:.6e} peak_before={:.6e} rms_after={:.6e} peak_after={:.6e} gain={:.6e}",
+                    hubert_norm_stats.rms_before,
+                    hubert_norm_stats.peak_before,
+                    hubert_norm_stats.rms_after,
+                    hubert_norm_stats.peak_after,
+                    hubert_norm_stats.gain_applied
+                );
+                eprintln!(
+                    "[vc-inference] stats source_16k_norm_rmvpe: rms_before={:.6e} peak_before={:.6e} rms_after={:.6e} peak_after={:.6e} gain={:.6e}",
+                    rmvpe_norm_stats.rms_before,
+                    rmvpe_norm_stats.peak_before,
+                    rmvpe_norm_stats.rms_after,
+                    rmvpe_norm_stats.peak_after,
+                    rmvpe_norm_stats.gain_applied
                 );
             }
-            let source_stats = tensor_stats_from_iter(source_16k.iter().copied());
-            maybe_log_tensor_stats("source_16k", source_stats);
-            ensure_tensor_finite("source_16k", source_stats)?;
+            let hubert_source_stats = tensor_stats_from_iter(hubert_source_16k.iter().copied());
+            maybe_log_tensor_stats("source_16k_hubert", hubert_source_stats);
+            ensure_tensor_finite("source_16k_hubert", hubert_source_stats)?;
+            let rmvpe_source_stats = tensor_stats_from_iter(rmvpe_source_16k.iter().copied());
+            maybe_log_tensor_stats("source_16k_rmvpe", rmvpe_source_stats);
+            ensure_tensor_finite("source_16k_rmvpe", rmvpe_source_stats)?;
             let rmvpe_threshold = if config.rmvpe_threshold.is_finite() {
                 config.rmvpe_threshold
             } else {
@@ -894,14 +976,20 @@ impl InferenceEngine for RvcOrtEngine {
                 let post_stats = tensor_stats_from_iter(processed.iter().copied());
                 maybe_log_tensor_stats("post_wave", post_stats);
                 ensure_tensor_finite("post_wave", post_stats)?;
-                Ok(match_output_length(&processed, frame.len()))
+                // Return decoder output as-is; vc-audio slices the latest region.
+                Ok(processed)
             };
             let zero_copy_result = if let Some(engine) = self.zero_copy_engine.as_ref() {
                 let run = engine
                     .lock()
                     .map_err(|_| VcError::Inference("zero-copy engine mutex poisoned".to_string()))
                     .and_then(|mut guard| {
-                        guard.run(&source_16k, config.speaker_id, rmvpe_threshold)
+                        guard.run(
+                            &hubert_source_16k,
+                            &rmvpe_source_16k,
+                            config.speaker_id,
+                            rmvpe_threshold,
+                        )
                     });
                 Some(run)
             } else {
@@ -918,8 +1006,8 @@ impl InferenceEngine for RvcOrtEngine {
                     }
                 }
             }
-            let mut phone = self.extract_phone_features(&source_16k)?;
-            let f0 = self.estimate_pitch(&source_16k, rmvpe_threshold)?;
+            let mut phone = self.extract_phone_features(&hubert_source_16k)?;
+            let f0 = self.estimate_pitch(&rmvpe_source_16k, rmvpe_threshold)?;
             let mut phone_raw = None;
             if config.protect < 0.5 {
                 phone_raw = Some(phone.clone());
@@ -1002,6 +1090,7 @@ impl Drop for RvcOrtEngine {
     }
 }
 
+#[cfg(test)]
 fn fit_waveform_to_len(samples: &[f32], target_len: usize) -> Vec<f32> {
     if target_len == 0 {
         return Vec::new();
@@ -1026,6 +1115,7 @@ fn fit_waveform_to_len(samples: &[f32], target_len: usize) -> Vec<f32> {
     out
 }
 
+#[cfg(test)]
 fn reflect_left_pad_index(dist: usize, len: usize) -> usize {
     let period = 2 * (len - 1);
     let mut m = dist % period;
@@ -1039,30 +1129,37 @@ fn reflect_left_pad_index(dist: usize, len: usize) -> usize {
     }
 }
 
-fn match_output_length(samples: &[f32], target_len: usize) -> Vec<f32> {
-    if target_len == 0 {
-        return Vec::new();
+fn estimate_hop_samples_16k(input_samples: usize, input_sample_rate: u32) -> usize {
+    if input_samples == 0 || input_sample_rate == 0 {
+        return 1;
     }
-    if samples.is_empty() {
-        return vec![0.0; target_len];
-    }
-    if samples.len() == target_len {
-        return samples.to_vec();
-    }
-    if samples.len() == 1 {
-        return vec![samples[0]; target_len];
-    }
+    let hop = ((input_samples as f64) * (RMVPE_SAMPLE_RATE as f64) / (input_sample_rate as f64))
+        .round() as usize;
+    hop.max(1).min(STRICT_ONNX_INPUT_SAMPLES_16K)
+}
 
-    let mut out = Vec::with_capacity(target_len);
-    let scale = (samples.len() - 1) as f64 / (target_len - 1).max(1) as f64;
-    for i in 0..target_len {
-        let src = i as f64 * scale;
-        let left = src.floor() as usize;
-        let right = (left + 1).min(samples.len() - 1);
-        let frac = (src - left as f64) as f32;
-        out.push(samples[left] * (1.0 - frac) + samples[right] * frac);
+fn slide_context_window(context: &mut VecDeque<f32>, new_samples: &[f32], window_samples: usize) {
+    if window_samples == 0 {
+        context.clear();
+        return;
     }
-    out
+    if context.len() != window_samples {
+        context.clear();
+        context.resize(window_samples, 0.0);
+    }
+    if new_samples.len() >= window_samples {
+        context.clear();
+        context.extend(
+            new_samples[new_samples.len() - window_samples..]
+                .iter()
+                .copied(),
+        );
+        return;
+    }
+    for _ in 0..new_samples.len() {
+        let _ = context.pop_front();
+    }
+    context.extend(new_samples.iter().copied());
 }
 
 fn force_frame_count_3d_tail_pad(frames: Array3<f32>, target_frames: usize) -> Array3<f32> {
@@ -1099,6 +1196,31 @@ fn force_frame_count_3d_tail_pad(frames: Array3<f32>, target_frames: usize) -> A
                 let bval = frames[(b, right, c)];
                 out[(b, t, c)] = a * w_left + bval * frac;
             }
+        }
+    }
+    out
+}
+
+fn upsample_phone_frames_repeat(frames: Array3<f32>, target_frames: usize) -> Array3<f32> {
+    let (batch, src_frames, channels) = frames.dim();
+    if target_frames == src_frames {
+        return frames;
+    }
+    if target_frames == 0 {
+        return Array3::<f32>::zeros((batch, 0, channels));
+    }
+    if src_frames == 0 {
+        return Array3::<f32>::zeros((batch, target_frames, channels));
+    }
+
+    let mut out = Array3::<f32>::zeros((batch, target_frames, channels));
+    for b in 0..batch {
+        for t in 0..target_frames {
+            let mut src_t = t.saturating_mul(src_frames) / target_frames;
+            if src_t >= src_frames {
+                src_t = src_frames - 1;
+            }
+            out.slice_mut(s![b, t, ..]).assign(&frames.slice(s![b, src_t, ..]));
         }
     }
     out
@@ -2252,7 +2374,13 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_waveform_to_len, STRICT_ONNX_INPUT_SAMPLES_16K};
+    use super::{
+        estimate_hop_samples_16k, fit_waveform_to_len, slide_context_window,
+        upsample_phone_frames_repeat,
+        STRICT_ONNX_INPUT_SAMPLES_16K,
+    };
+    use ndarray::Array3;
+    use std::collections::VecDeque;
 
     #[test]
     fn strict_input_fits_to_16k() {
@@ -2268,5 +2396,62 @@ mod tests {
         assert_eq!(fitted.len(), STRICT_ONNX_INPUT_SAMPLES_16K);
         assert_eq!(fitted[0], 4_000.0);
         assert_eq!(fitted[STRICT_ONNX_INPUT_SAMPLES_16K - 1], 19_999.0);
+    }
+
+    #[test]
+    fn sliding_window_advances_correctly() {
+        const WINDOW: usize = STRICT_ONNX_INPUT_SAMPLES_16K;
+        const HOP: usize = 2730;
+        let mut buf: VecDeque<f32> = (0..WINDOW).map(|_| 0.0f32).collect();
+        let new_block = vec![1.0f32; HOP];
+        slide_context_window(&mut buf, &new_block, WINDOW);
+
+        assert_eq!(buf.len(), WINDOW);
+        let tail: Vec<f32> = buf.iter().skip(WINDOW - HOP).copied().collect();
+        assert!(tail.iter().all(|&x| x == 1.0));
+        let head: Vec<f32> = buf.iter().take(WINDOW - HOP).copied().collect();
+        assert!(head.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn hop_size_calculation_48k_block_8192() {
+        let hop = estimate_hop_samples_16k(8192, 48_000);
+        assert_eq!(hop, 2731);
+        assert!((hop * 3).abs_diff(8192) <= 2);
+    }
+
+    #[test]
+    fn rmvpe_context_independent_from_hubert() {
+        const WINDOW: usize = STRICT_ONNX_INPUT_SAMPLES_16K;
+        const HOP: usize = 2731;
+
+        let mut hubert_ctx: VecDeque<f32> = (0..WINDOW).map(|_| 0.0).collect();
+        let mut rmvpe_ctx: VecDeque<f32> = (0..WINDOW).map(|_| 0.0).collect();
+        let block = vec![1.0_f32; HOP];
+
+        slide_context_window(&mut hubert_ctx, &block, WINDOW);
+        slide_context_window(&mut rmvpe_ctx, &block, WINDOW);
+
+        assert_eq!(hubert_ctx.len(), WINDOW);
+        assert_eq!(rmvpe_ctx.len(), WINDOW);
+        let h: Vec<f32> = hubert_ctx.iter().copied().collect();
+        let r: Vec<f32> = rmvpe_ctx.iter().copied().collect();
+        assert_eq!(h, r);
+    }
+
+    #[test]
+    fn hubert_repeat_upsample_50_to_100() {
+        let mut src = Array3::<f32>::zeros((1, 50, 1));
+        for t in 0..50 {
+            src[(0, t, 0)] = t as f32;
+        }
+        let out = upsample_phone_frames_repeat(src, 100);
+        assert_eq!(out.shape(), &[1, 100, 1]);
+        for t in 0..50 {
+            let a = out[(0, t * 2, 0)];
+            let b = out[(0, t * 2 + 1, 0)];
+            assert_eq!(a, t as f32);
+            assert_eq!(b, t as f32);
+        }
     }
 }

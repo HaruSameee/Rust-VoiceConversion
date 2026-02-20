@@ -26,6 +26,7 @@ const WARMUP_BUDGET_HEADROOM: f64 = 1.25;
 const MAX_AUTO_BLOCK_SIZE: usize = 96_000;
 const MAX_WARMUP_BLOCK_CAP: usize = 16_384;
 const HUBERT_WINDOW_SAMPLES: usize = 16_000;
+const OUTPUT_SLICE_AUDIT_BLOCKS: u64 = 30;
 
 /// Returns the minimum `extra_inference_ms` value that avoids buffer deadlock.
 ///
@@ -135,6 +136,7 @@ pub struct AudioStreamOptions {
     pub response_threshold: f32,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
+    pub output_tail_offset_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -220,6 +222,7 @@ where
     let response_threshold = normalize_response_threshold(options.response_threshold);
     let fade_in_ms = options.fade_in_ms;
     let fade_out_ms = options.fade_out_ms;
+    let output_tail_offset_ms = options.output_tail_offset_ms;
 
     let input_device = find_input_device(&host, options.input_device_name.as_deref())?;
     let output_device = find_output_device(&host, options.output_device_name.as_deref())?;
@@ -257,13 +260,14 @@ where
         requested_block_size
     );
     eprintln!(
-        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} allow_window_grow={}",
+        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} tail_offset_ms={} allow_window_grow={}",
         input_device.name().unwrap_or_else(|_| "unknown-input".to_string()),
         output_device.name().unwrap_or_else(|_| "unknown-output".to_string()),
         extra_inference_ms,
         response_threshold,
         fade_in_ms,
         fade_out_ms,
+        output_tail_offset_ms,
         allow_process_window_grow
     );
     // Warm up the model before starting audio streams to avoid first-block stalls
@@ -403,6 +407,7 @@ where
             response_threshold,
             fade_in_ms,
             fade_out_ms,
+            output_tail_offset_ms,
             &running_worker,
             &input_rms_worker,
             &input_peak_worker,
@@ -546,6 +551,19 @@ fn build_output_callback(
     }
 }
 
+fn resolve_output_tail_offset_samples(
+    output_rate: u32,
+    edge_guard_samples: usize,
+    output_tail_offset_ms: u32,
+) -> usize {
+    if output_tail_offset_ms == 0 {
+        return edge_guard_samples;
+    }
+    let from_ms =
+        ((output_rate as f64) * (output_tail_offset_ms as f64) / 1000.0).round().max(0.0) as usize;
+    from_ms.max(edge_guard_samples)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_loop<E>(
     voice_changer: &mut VoiceChanger<E>,
@@ -563,6 +581,7 @@ fn worker_loop<E>(
     response_threshold: f32,
     fade_in_ms: u32,
     fade_out_ms: u32,
+    output_tail_offset_ms: u32,
     running: &Arc<AtomicBool>,
     input_rms: &Arc<AtomicU32>,
     input_peak: &Arc<AtomicU32>,
@@ -580,6 +599,8 @@ fn worker_loop<E>(
     let crossfade_samples = default_output_crossfade_samples(output_rate).min(output_step_samples);
     let sola_search_output = sola_search_samples(output_rate);
     let edge_guard_samples = crossfade_samples.max(sola_search_output / 2);
+    let output_tail_offset_samples =
+        resolve_output_tail_offset_samples(output_rate, edge_guard_samples, output_tail_offset_ms);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
     let inference_block_size = io_block_size
@@ -591,7 +612,7 @@ fn worker_loop<E>(
     let mut process_window_samples = if allow_process_window_grow {
         min_process_window_samples
     } else {
-        HUBERT_WINDOW_SAMPLES
+        process_window_cap
     };
     let mut smoothed_elapsed_ms = 0.0_f64;
     let mut model_rate_buf = Vec::<f32>::new();
@@ -628,6 +649,12 @@ fn worker_loop<E>(
         sola_search_output,
         edge_guard_samples
     );
+    eprintln!(
+        "[vc-audio] output_tail_offset_out={} (~{:.2}ms) edge_guard_out={} (set output_tail_offset_ms in runtime config to tune)",
+        output_tail_offset_samples,
+        output_tail_offset_samples as f64 / output_rate.max(1) as f64 * 1000.0,
+        edge_guard_samples
+    );
     if target_buffer_samples > process_window_samples {
         if allow_process_window_grow {
             eprintln!(
@@ -642,13 +669,14 @@ fn worker_loop<E>(
         }
     }
     // Prime output queue to cover startup buffering and first inference warm-up.
+    let prefill_target_samples = target_buffer_samples.max(process_window_samples);
     let prefill_model_samples = if model_sample_rate != output_rate {
-        ((target_buffer_samples.saturating_add(io_block_size) as f64) * output_rate as f64
+        ((prefill_target_samples.saturating_add(io_block_size) as f64) * output_rate as f64
             / model_sample_rate as f64)
             .round()
             .max(1.0) as usize
     } else {
-        target_buffer_samples.saturating_add(io_block_size)
+        prefill_target_samples.saturating_add(io_block_size)
     };
     let prefill_frames = prefill_model_samples * output_channels * 2;
     let _ = output_tx.try_send(vec![0.0; prefill_frames]);
@@ -732,13 +760,23 @@ fn worker_loop<E>(
                 }
             };
 
-            let output_source: Vec<f32> = if model_out.len() >= process_window_samples {
-                model_out[..process_window_samples].to_vec()
-            } else {
-                let mut padded = model_out;
-                padded.resize(process_window_samples, 0.0);
-                padded
-            };
+            let (output_source, source_slice_start, source_slice_end): (Vec<f32>, usize, usize) =
+                if model_out.len() >= process_window_samples {
+                    // Keep the newest region: sliding-window inference appends fresh content to the tail.
+                    let end = model_out.len();
+                    let start = end.saturating_sub(process_window_samples);
+                    (model_out[start..end].to_vec(), start, end)
+                } else {
+                    // If model output is shorter than the process window, align it to the tail and
+                    // pad the head with zeros so downstream tail slicing keeps recent audio.
+                    let mut padded = vec![0.0_f32; process_window_samples];
+                    let copy_len = model_out.len();
+                    if copy_len > 0 {
+                        let dst_start = process_window_samples.saturating_sub(copy_len);
+                        padded[dst_start..].copy_from_slice(&model_out);
+                    }
+                    (padded, 0, model_out.len())
+                };
             let output_mono: &[f32] = if model_sample_rate != output_rate {
                 resample_hq_into(
                     &model_to_output_resampler,
@@ -754,7 +792,7 @@ fn worker_loop<E>(
                 compute_ola_overlap_samples(expected_len, crossfade_samples, extra_inference_ms);
             // Avoid using the very end of each block where non-causal generators are often unstable.
             let max_guard = output_mono.len().saturating_sub(expected_len);
-            let applied_guard = edge_guard_samples.min(max_guard);
+            let applied_guard = output_tail_offset_samples.min(max_guard);
             let anchor_end = output_mono.len().saturating_sub(applied_guard);
             let tail_span = expected_len.saturating_add(sola_search_output);
             let tail_start = anchor_end.saturating_sub(tail_span);
@@ -773,6 +811,22 @@ fn worker_loop<E>(
                     tail,
                     crossfade_for_search,
                     search_limit,
+                );
+            }
+            if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                eprintln!(
+                    "[vc-audio] output-slice-audit block={} model_out_len={} source_slice=[{}..{}) output_len={} expected_len={} tail_offset={} anchor_end={} tail=[{}..{}) search_limit={}",
+                    processed_blocks + 1,
+                    model_out.len(),
+                    source_slice_start,
+                    source_slice_end,
+                    output_mono.len(),
+                    expected_len,
+                    applied_guard,
+                    anchor_end,
+                    tail_start,
+                    anchor_end,
+                    search_limit
                 );
             }
             let mut smoothed_output =
@@ -844,10 +898,8 @@ fn worker_loop<E>(
                 let span = process_window_cap - process_window_samples;
                 let grow = ((span as f32) * 0.12).ceil().max(64.0) as usize;
                 let next_window = process_window_samples.saturating_add(grow);
-                let clamped = next_window.min(HUBERT_WINDOW_SAMPLES);
-                if clamped >= HUBERT_WINDOW_SAMPLES
-                    && process_window_samples < HUBERT_WINDOW_SAMPLES
-                {
+                let clamped = next_window.min(process_window_cap);
+                if clamped >= process_window_cap && process_window_samples < process_window_cap {
                     eprintln!(
                         "[vc-audio] process_window converged: now={} (target_buffer={})",
                         clamped, target_buffer_samples

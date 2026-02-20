@@ -29,6 +29,7 @@ interface RuntimeConfig {
   response_threshold: number;
   fade_in_ms: number;
   fade_out_ms: number;
+  output_tail_offset_ms: number;
   speaker_id: number;
   sample_rate: number;
   block_size: number;
@@ -111,6 +112,7 @@ const ui = {
   responseThreshold: $("responseThreshold") as HTMLInputElement,
   fadeInMs: $("fadeInMs") as HTMLInputElement,
   fadeOutMs: $("fadeOutMs") as HTMLInputElement,
+  outputTailOffsetMs: $("outputTailOffsetMs") as HTMLInputElement,
   speakerId: $("speakerId") as HTMLInputElement,
   sampleRate: $("sampleRate") as HTMLInputElement,
   blockSize: $("blockSize") as HTMLInputElement,
@@ -342,6 +344,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     response_threshold: finiteOr(raw.response_threshold, -50.0),
     fade_in_ms: intAtLeast(raw.fade_in_ms, 0, 12),
     fade_out_ms: intAtLeast(raw.fade_out_ms, 0, 120),
+    output_tail_offset_ms: intAtLeast(raw.output_tail_offset_ms, 0, 0),
     speaker_id: Math.round(finiteOr(raw.speaker_id, 0)),
     sample_rate: intAtLeast(raw.sample_rate, 1, 48000),
     block_size: intAtLeast(raw.block_size, 1, 8192),
@@ -397,6 +400,7 @@ function runtimeFromInputs(): RuntimeConfig {
     response_threshold: Number(ui.responseThreshold.value),
     fade_in_ms: Number(ui.fadeInMs.value),
     fade_out_ms: Number(ui.fadeOutMs.value),
+    output_tail_offset_ms: Number(ui.outputTailOffsetMs.value),
     speaker_id: Number(ui.speakerId.value),
     sample_rate: Number(ui.sampleRate.value),
     block_size: Number(ui.blockSize.value),
@@ -445,6 +449,7 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.responseThreshold.value = String(config.response_threshold);
   ui.fadeInMs.value = String(config.fade_in_ms);
   ui.fadeOutMs.value = String(config.fade_out_ms);
+  ui.outputTailOffsetMs.value = String(config.output_tail_offset_ms);
   ui.speakerId.value = String(config.speaker_id);
   ui.sampleRate.value = String(config.sample_rate);
   ui.blockSize.value = String(config.block_size);

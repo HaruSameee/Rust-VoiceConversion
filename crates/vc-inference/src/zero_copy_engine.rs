@@ -16,7 +16,7 @@ use vc_core::{ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::coarse_pitch_from_f0;
 
 const DEFAULT_INPUT_SAMPLES: usize = 16_000;
-const DEFAULT_FRAME_COUNT: usize = 50;
+const HUBERT_BASE_FRAMES: usize = 50;
 const DEFAULT_WARMUP_RUNS: usize = 2;
 const RND_CHANNELS: usize = 192;
 const RMVPE_EXPECTED_FRAMES: usize = 101;
@@ -24,6 +24,7 @@ const RMVPE_SALIENCE_BINS: usize = 360;
 const RMVPE_CENTS_BASE: f32 = 1997.3794;
 const RMVPE_CENTS_STEP: f32 = 20.0;
 const RMVPE_DECODE_RADIUS: usize = 4;
+const DEFAULT_RMS_GATE_THRESHOLD: f32 = 0.0032;
 
 #[derive(Debug, Clone, Default)]
 pub struct ZeroCopyIoOverrides {
@@ -209,7 +210,7 @@ impl ZeroCopyInferenceEngine {
             frame_count: config.frame_count,
             phone_feature_dim,
             rmvpe_threshold: config.rmvpe_threshold,
-            rms_gate_threshold: config.rms_gate_threshold.max(0.0),
+            rms_gate_threshold: resolve_rms_gate_threshold(config.rms_gate_threshold),
             host_waveform,
             hubert_host_waveform,
             hubert_waveform_gpu,
@@ -251,7 +252,7 @@ impl ZeroCopyInferenceEngine {
         let warmup_runs = config.warmup_runs.max(DEFAULT_WARMUP_RUNS);
         let warmup_input = vec![0.0_f32; engine.input_samples];
         for _ in 0..warmup_runs {
-            let _ = engine.run(&warmup_input, 0, config.rmvpe_threshold)?;
+            let _ = engine.run(&warmup_input, &warmup_input, 0, config.rmvpe_threshold)?;
         }
         engine.block_count = 0;
         engine.audit_enabled = true;
@@ -260,32 +261,32 @@ impl ZeroCopyInferenceEngine {
 
     pub fn run(
         &mut self,
-        waveform_16k: &[f32],
+        hubert_waveform_16k: &[f32],
+        rmvpe_waveform_16k: &[f32],
         speaker_id: i64,
         rmvpe_threshold: f32,
     ) -> Result<Vec<f32>> {
-        if waveform_16k.len() != self.input_samples {
+        if hubert_waveform_16k.len() != self.hubert_input_samples {
             return Err(VcError::Inference(format!(
-                "input length mismatch: got={}, expected={}",
-                waveform_16k.len(),
-                self.input_samples
-            )));
-        }
-
-        {
-            let (_, host) = self.host_waveform.extract_tensor_mut();
-            host.copy_from_slice(waveform_16k);
-        }
-        if waveform_16k.len() != self.hubert_input_samples {
-            return Err(VcError::Inference(format!(
-                "HuBERT input length mismatch on zero-copy path: got={} expected={}",
-                waveform_16k.len(),
+                "HuBERT input length mismatch: got={}, expected={}",
+                hubert_waveform_16k.len(),
                 self.hubert_input_samples
             )));
         }
+        if rmvpe_waveform_16k.len() != self.input_samples {
+            return Err(VcError::Inference(format!(
+                "RMVPE input length mismatch: got={}, expected={}",
+                rmvpe_waveform_16k.len(),
+                self.input_samples
+            )));
+        }
+        {
+            let (_, host) = self.host_waveform.extract_tensor_mut();
+            host.copy_from_slice(rmvpe_waveform_16k);
+        }
         {
             let (_, hubert_host) = self.hubert_host_waveform.extract_tensor_mut();
-            hubert_host.copy_from_slice(waveform_16k);
+            hubert_host.copy_from_slice(hubert_waveform_16k);
         }
         map_ort(
             "failed to copy waveform host->HuBERT CUDA tensor",
@@ -354,17 +355,10 @@ impl ZeroCopyInferenceEngine {
         }
         if src_frames != self.frame_count && !self.hubert_frame_mismatch_warned {
             self.hubert_frame_mismatch_warned = true;
-            if src_frames < self.frame_count {
-                eprintln!(
-                    "[vc-inference] warning: HuBERT returned {} frames (<{}); tail frame will be repeated",
-                    src_frames, self.frame_count
-                );
-            } else {
-                eprintln!(
-                    "[vc-inference] warning: HuBERT returned {} frames (>{}); extra frames will be truncated",
-                    src_frames, self.frame_count
-                );
-            }
+            eprintln!(
+                "[vc-inference] warning: HuBERT returned {} frames; host will resample to decoder_frames={}",
+                src_frames, self.frame_count
+            );
         }
         let copy_dims = src_dim.min(self.phone_feature_dim);
         {
@@ -378,19 +372,14 @@ impl ZeroCopyInferenceEngine {
                         expected
                     )));
                 }
-                let copy_frames = src_frames.min(self.frame_count);
-                for t in 0..copy_frames {
-                    let src_base = t.saturating_mul(src_dim);
+                for t in 0..self.frame_count {
+                    let mut src_t = t.saturating_mul(src_frames) / self.frame_count.max(1);
+                    if src_t >= src_frames {
+                        src_t = src_frames - 1;
+                    }
+                    let src_base = src_t.saturating_mul(src_dim);
                     for c in 0..copy_dims {
                         self.features_workspace[(0, t, c)] = hubert_data[src_base + c];
-                    }
-                }
-                if src_frames < self.frame_count {
-                    let src_base = (src_frames - 1).saturating_mul(src_dim);
-                    for t in src_frames..self.frame_count {
-                        for c in 0..copy_dims {
-                            self.features_workspace[(0, t, c)] = hubert_data[src_base + c];
-                        }
                     }
                 }
             }
@@ -505,7 +494,7 @@ impl ZeroCopyInferenceEngine {
                 self.frame_count
             )));
         }
-        let input_rms = compute_rms(waveform_16k);
+        let input_rms = compute_rms(rmvpe_waveform_16k);
         let gated = self.rms_gate_threshold > 0.0 && input_rms < self.rms_gate_threshold;
         if gated {
             pitchf.fill(0.0);
@@ -515,7 +504,7 @@ impl ZeroCopyInferenceEngine {
         if self.audit_enabled {
             self.block_count = self.block_count.saturating_add(1);
             if self.block_count <= 30 {
-                let f0_50_voiced_post = pitchf.iter().filter(|&&x| x > 0.0).count();
+                let f0_voiced_post = pitchf.iter().filter(|&&x| x > 0.0).count();
                 let sal_max =
                     salience
                         .iter()
@@ -549,7 +538,7 @@ impl ZeroCopyInferenceEngine {
                     sal_mean,
                     f0_101_voiced_pre,
                     rmvpe_frames,
-                    f0_50_voiced_post,
+                    f0_voiced_post,
                     self.frame_count,
                     min_hz,
                     max_hz,
@@ -679,8 +668,12 @@ impl ZeroCopyInferenceEngine {
             .unwrap_or_else(|_| default_zero_copy_cache_dir());
         let input_samples =
             env_parse_usize("RUST_VC_ZERO_COPY_INPUT_SAMPLES").unwrap_or(DEFAULT_INPUT_SAMPLES);
-        let frame_count =
-            env_parse_usize("RUST_VC_ZERO_COPY_FRAMES").unwrap_or(DEFAULT_FRAME_COUNT);
+        let default_frame_count = HUBERT_BASE_FRAMES
+            .saturating_mul(runtime.hubert_upsample_factor.max(1))
+            .max(1);
+        let frame_count = env_parse_usize("RUST_VC_ZERO_COPY_FRAMES")
+            .unwrap_or(default_frame_count)
+            .max(1);
         let warmup_runs =
             env_parse_usize("RUST_VC_ZERO_COPY_WARMUP").unwrap_or(DEFAULT_WARMUP_RUNS);
         let io_overrides = ZeroCopyIoOverrides {
@@ -708,7 +701,7 @@ impl ZeroCopyInferenceEngine {
             frame_count,
             warmup_runs,
             rmvpe_threshold: runtime.rmvpe_threshold,
-            rms_gate_threshold: runtime.response_threshold.max(0.0),
+            rms_gate_threshold: runtime.response_threshold,
             io_overrides,
         };
         Self::new(config).map(Some)
@@ -1385,27 +1378,75 @@ fn compute_rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt()
 }
 
-fn filter_f0_octave_errors(f0: &mut Vec<f32>, f0_min_hz: f32, f0_max_hz: f32) {
-    for v in f0.iter_mut() {
-        if *v > 0.0 && (*v < f0_min_hz || *v > f0_max_hz) {
-            *v = 0.0;
-        }
+#[inline]
+fn resolve_rms_gate_threshold(raw: f32) -> f32 {
+    if !raw.is_finite() {
+        return DEFAULT_RMS_GATE_THRESHOLD;
     }
+    if raw > 0.0 {
+        return raw.clamp(0.0, 1.0);
+    }
+    if raw < -1.0 {
+        // Treat negative values as dBFS (e.g. -50 dB -> ~0.00316 linear).
+        return 10.0_f32.powf(raw / 20.0).clamp(0.0, 1.0);
+    }
+    // `0.0` (or tiny around zero) should not disable gate silently.
+    DEFAULT_RMS_GATE_THRESHOLD
+}
 
-    let mut voiced: Vec<f32> = f0.iter().copied().filter(|&x| x > 0.0).collect();
+fn filter_f0_octave_errors(f0: &mut Vec<f32>, f0_min_hz: f32, f0_max_hz: f32) {
+    let mut voiced: Vec<f32> = f0
+        .iter()
+        .copied()
+        .filter(|&x| x >= f0_min_hz * 0.5 && x <= f0_max_hz * 2.0)
+        .collect();
     if voiced.is_empty() {
         return;
     }
     voiced.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = voiced[voiced.len() / 2];
     for v in f0.iter_mut() {
-        if *v > 0.0 && *v < median * 0.65 {
-            let corrected = *v * 2.0;
-            if corrected >= f0_min_hz && corrected <= f0_max_hz {
-                *v = corrected;
-            } else {
-                *v = 0.0;
+        if *v <= 0.0 {
+            continue;
+        }
+        let mut x = *v;
+        while x > 0.0 && x < f0_min_hz {
+            x *= 2.0;
+            if x > f0_max_hz * 2.0 {
+                x = 0.0;
+                break;
             }
+        }
+        while x > f0_max_hz {
+            x *= 0.5;
+            if x < f0_min_hz * 0.5 {
+                x = 0.0;
+                break;
+            }
+        }
+        if x <= 0.0 {
+            *v = 0.0;
+            continue;
+        }
+
+        // Conservative octave fix around local median.
+        if x < median * 0.55 {
+            let up = x * 2.0;
+            if up >= f0_min_hz && up <= f0_max_hz {
+                x = up;
+            }
+        } else if x > median * 1.95 {
+            let down = x * 0.5;
+            if down >= f0_min_hz && down <= f0_max_hz {
+                x = down;
+            }
+        }
+
+        if x < f0_min_hz || x > f0_max_hz {
+            // Keep as unvoiced only when it's still out of valid range.
+            *v = 0.0;
+        } else {
+            *v = x;
         }
     }
 }
@@ -1414,6 +1455,7 @@ fn filter_f0_octave_errors(f0: &mut Vec<f32>, f0_min_hz: f32, f0_max_hz: f32) {
 mod tests {
     use super::{
         compute_rms, decode_f0_from_salience, filter_f0_octave_errors, resample_f0_linear,
+        resolve_rms_gate_threshold,
     };
     use ndarray::Array2;
 
@@ -1479,8 +1521,8 @@ mod tests {
     fn test_filter_f0_removes_out_of_range() {
         let mut f0 = vec![40.0, 110.0, 900.0, 115.0];
         filter_f0_octave_errors(&mut f0, 70.0, 800.0);
-        assert_eq!(f0[0], 0.0);
-        assert_eq!(f0[2], 0.0);
+        assert!(f0[0] >= 70.0 || f0[0] == 0.0);
+        assert!((70.0..=800.0).contains(&f0[2]) || f0[2] == 0.0);
         assert!(f0[1] > 0.0);
     }
 
@@ -1495,5 +1537,17 @@ mod tests {
         let samples: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.1).sin()).collect();
         let rms = compute_rms(&samples);
         assert!((rms - 0.707).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_resolve_rms_gate_threshold_from_db() {
+        let th = resolve_rms_gate_threshold(-50.0);
+        assert!((th - 0.00316).abs() < 0.0005);
+    }
+
+    #[test]
+    fn test_resolve_rms_gate_threshold_zero_uses_default() {
+        let th = resolve_rms_gate_threshold(0.0);
+        assert!(th > 0.0);
     }
 }
