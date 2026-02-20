@@ -89,7 +89,10 @@ pub fn resample_features_catmull_rom(features: ArrayView2<f32>) -> Array2<f32> {
 }
 
 #[inline]
-fn resample_features_catmull_rom_to(features: ArrayView2<'_, f32>, dst_frames: usize) -> Array2<f32> {
+fn resample_features_catmull_rom_to(
+    features: ArrayView2<'_, f32>,
+    dst_frames: usize,
+) -> Array2<f32> {
     let src_frames = features.shape()[0];
     let feat_dim = features.shape()[1];
     let mut out = allocate_dst(features, dst_frames);
@@ -243,7 +246,8 @@ impl F0Smoother {
             if voiced_mask[i] {
                 if f0[i] > VOICED_F0_HZ {
                     let log_f0 = (f0[i] / A4_HZ).log2() * 12.0;
-                    self.ema_value = self.ema_alpha * log_f0 + (1.0 - self.ema_alpha) * self.ema_value;
+                    self.ema_value =
+                        self.ema_alpha * log_f0 + (1.0 - self.ema_alpha) * self.ema_value;
                 } else {
                     self.ema_value *= 0.995;
                 }
@@ -292,7 +296,12 @@ impl InferencePipeline {
     ///
     /// `block_size` is reserved for higher-level orchestration and currently not used internally.
     #[inline]
-    pub fn new(sample_rate: u32, _block_size: usize, overlap_samples: usize, hop_size: usize) -> Self {
+    pub fn new(
+        sample_rate: u32,
+        _block_size: usize,
+        overlap_samples: usize,
+        hop_size: usize,
+    ) -> Self {
         Self {
             ola: OlaBuffer::new(overlap_samples),
             f0_smoother: F0Smoother::new(sample_rate, hop_size),

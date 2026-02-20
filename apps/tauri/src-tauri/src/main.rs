@@ -292,10 +292,8 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
         ));
         let infer_engine = RvcOrtEngine::new(model, &runtime_config).map_err(|e| e.to_string())?;
         let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());
-        let ort_provider_lc = runtime_config.ort_provider.to_ascii_lowercase();
-        // DirectML/CPU are often sensitive to aggressive context-window growth.
-        // Keep window fixed for stability; allow growth on explicit CUDA.
-        let allow_process_window_grow = ort_provider_lc == "cuda";
+        // Keep process_window fixed for strict HuBERT geometry stability.
+        let allow_process_window_grow = false;
         let audio_engine = spawn_voice_changer_stream(
             voice_changer,
             AudioStreamOptions {
@@ -379,10 +377,13 @@ fn default_model_config() -> ModelConfig {
     let pitch_extractor_path = std::env::var("RUST_VC_RMVPE_PATH")
         .ok()
         .and_then(|p| resolve_existing_path(&p).or(Some(p)))
+        .or_else(|| resolve_existing_path("model/rmvpe_strict.onnx"))
         .or_else(|| resolve_existing_path("model/rmvpe.onnx"));
     let hubert_path = std::env::var("RUST_VC_HUBERT_PATH")
         .ok()
         .and_then(|p| resolve_existing_path(&p).or(Some(p)))
+        .or_else(|| resolve_existing_path("model/hubert_pad80.onnx"))
+        .or_else(|| resolve_existing_path("model/hubert_strict.onnx"))
         .or_else(|| resolve_existing_path("model/hubert.onnx"));
     let index_path = std::env::var("RUST_VC_INDEX_PATH")
         .ok()
@@ -563,11 +564,43 @@ fn resolve_model_config_for_start(mut model: ModelConfig) -> Result<ModelConfig,
         .and_then(|p| resolve_existing_path(&p).or(Some(p)));
     model.hubert_path = model
         .hubert_path
-        .and_then(|p| resolve_existing_path(&p).or(Some(p)));
+        .and_then(|p| resolve_existing_path(&p).or(Some(p)))
+        .map(|p| prefer_padded_hubert_path(&p));
+    if model.hubert_path.is_none() {
+        model.hubert_path = resolve_existing_path("model/hubert_pad80.onnx")
+            .or_else(|| resolve_existing_path("model/hubert_strict.onnx"))
+            .or_else(|| resolve_existing_path("model/hubert.onnx"));
+    }
     model.index_path = model
         .index_path
         .and_then(|p| resolve_existing_path(&p).or(Some(p)));
     Ok(model)
+}
+
+fn prefer_padded_hubert_path(path: &str) -> String {
+    let p = Path::new(path);
+    let Some(file_name) = p.file_name().and_then(|s| s.to_str()) else {
+        return path.to_string();
+    };
+    let name_lc = file_name.to_ascii_lowercase();
+    if name_lc != "hubert_strict.onnx" && name_lc != "hubert.onnx" {
+        return path.to_string();
+    }
+    let Some(parent) = p.parent() else {
+        return path.to_string();
+    };
+    let padded = parent.join("hubert_pad80.onnx");
+    if padded.exists() {
+        let swapped = padded.to_string_lossy().to_string();
+        if swapped != path {
+            log_debug(&format!(
+                "hubert_path '{}' overridden to '{}' (prefer pad80 contract)",
+                path, swapped
+            ));
+        }
+        return swapped;
+    }
+    path.to_string()
 }
 
 fn resolve_existing_path(path: &str) -> Option<String> {

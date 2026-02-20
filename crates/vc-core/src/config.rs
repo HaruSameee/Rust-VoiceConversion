@@ -25,6 +25,17 @@ pub struct RuntimeConfig {
     pub pitch_smooth_alpha: f32,
     pub rms_mix_rate: f32,
     pub f0_median_filter_radius: usize,
+    /// Milliseconds of audio buffered ahead of inference.
+    ///
+    /// # Physical Constraint
+    /// Must satisfy:
+    ///   extra_inference_ms >= ceil((process_window - block_size) / (sr / 1000))
+    ///
+    /// For process_window=16000, block_size=8192, sr=48000:
+    ///   minimum = 163ms
+    ///
+    /// Recommended = minimum + actual_inference_ms + 20ms jitter margin.
+    /// Default 250ms assumes ~60ms inference latency.
     pub extra_inference_ms: u32,
     pub response_threshold: f32,
     pub fade_in_ms: u32,
@@ -68,7 +79,7 @@ impl Default for RuntimeConfig {
             pitch_smooth_alpha: 0.12,
             rms_mix_rate: 0.2,
             f0_median_filter_radius: 3,
-            extra_inference_ms: 0,
+            extra_inference_ms: 250,
             response_threshold: 0.0,
             fade_in_ms: 12,
             fade_out_ms: 120,

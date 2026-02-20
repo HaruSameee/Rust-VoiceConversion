@@ -25,6 +25,55 @@ const BLOCK_ALIGN_SAMPLES: usize = 256;
 const WARMUP_BUDGET_HEADROOM: f64 = 1.25;
 const MAX_AUTO_BLOCK_SIZE: usize = 96_000;
 const MAX_WARMUP_BLOCK_CAP: usize = 16_384;
+const HUBERT_WINDOW_SAMPLES: usize = 16_000;
+
+/// Returns the minimum `extra_inference_ms` value that avoids buffer deadlock.
+///
+/// Formula: ceil((process_window - block_size) / (sample_rate / 1000))
+///
+/// Add the actual inference latency on top of this value for safe operation.
+pub fn min_extra_inference_ms(process_window: usize, block_size: usize, sample_rate: u32) -> u32 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    let samples_needed = process_window.saturating_sub(block_size);
+    if samples_needed == 0 {
+        return 0;
+    }
+    let ms_per_sample = 1000.0 / sample_rate as f64;
+    (samples_needed as f64 * ms_per_sample).ceil() as u32
+}
+
+/// Validates that the audio buffer sizing is physically consistent.
+///
+/// # Panics
+/// Panics if target_buffer < process_window, which would cause the engine
+/// to deadlock waiting for samples that can never accumulate.
+pub fn validate_buffer_contract(
+    extra_inference_ms: u32,
+    block_size: usize,
+    process_window: usize,
+    sample_rate: u32,
+) {
+    let target_buffer = (extra_inference_ms as usize)
+        .saturating_mul(sample_rate as usize)
+        .saturating_div(1000)
+        .saturating_add(block_size);
+    let min_extra_ms = min_extra_inference_ms(process_window, block_size, sample_rate) as f64;
+
+    assert!(
+        target_buffer >= process_window,
+        "[vc-audio] FATAL: target_buffer({}) < process_window({}).\n\
+         This causes a deadlock: the engine waits for {} samples that \
+         can never accumulate.\n\
+         Minimum extra_inference_ms required: {:.1}ms (recommended: {:.0}ms)",
+        target_buffer,
+        process_window,
+        process_window.saturating_sub(target_buffer),
+        min_extra_ms,
+        min_extra_ms.ceil() + 80.0,
+    );
+}
 
 pub fn list_input_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
@@ -69,7 +118,19 @@ pub struct AudioStreamOptions {
     pub block_size: usize,
     pub input_device_name: Option<String>,
     pub output_device_name: Option<String>,
+    /// Enables adaptive process-window growth.
+    ///
+    /// Default runtime policy is `false` for strict geometry stability.
     pub allow_process_window_grow: bool,
+    /// Milliseconds of audio buffered ahead of inference.
+    ///
+    /// Must satisfy:
+    ///   extra_inference_ms >= ceil((process_window - block_size) / (sr / 1000))
+    ///
+    /// With process_window=16000, block_size=8192, sr=48000:
+    ///   minimum = 163ms
+    ///
+    /// Recommended = minimum + actual_inference_ms + 20ms jitter margin.
     pub extra_inference_ms: u32,
     pub response_threshold: f32,
     pub fade_in_ms: u32,
@@ -241,12 +302,37 @@ where
             requested_block_size, block_size, warmup_elapsed_ms
         );
     }
-    let extra_samples =
-        ((model_sample_rate as f64) * (extra_inference_ms as f64 / 1000.0)).round() as usize;
+    let extra_samples = (extra_inference_ms as usize)
+        .saturating_mul(model_sample_rate as usize)
+        .saturating_div(1000);
     let inference_block_size = block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
-    let target_buffer_samples = inference_block_size.saturating_add(extra_samples);
+    let target_buffer_samples = block_size.saturating_add(extra_samples);
+    validate_buffer_contract(
+        extra_inference_ms,
+        block_size,
+        HUBERT_WINDOW_SAMPLES,
+        model_sample_rate,
+    );
+    let min_extra_ms = min_extra_inference_ms(HUBERT_WINDOW_SAMPLES, block_size, model_sample_rate);
+    let headroom_samples = target_buffer_samples.saturating_sub(HUBERT_WINDOW_SAMPLES);
+    let sr_per_ms = model_sample_rate as f64 / 1000.0;
+    let headroom_ms = if sr_per_ms > 0.0 {
+        headroom_samples as f64 / sr_per_ms
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[vc-audio] buffer_geometry: block={}smp process_window={}smp target_buffer={}smp extra_ms={}ms headroom={}smp ({:.1}ms) min_extra_ms={}ms",
+        block_size,
+        HUBERT_WINDOW_SAMPLES,
+        target_buffer_samples,
+        extra_inference_ms,
+        headroom_samples,
+        headroom_ms,
+        min_extra_ms
+    );
     let needed_input_frames = ((target_buffer_samples as f64) * (input_rate as f64)
         / (model_sample_rate as f64))
         .round()
@@ -485,8 +571,9 @@ fn worker_loop<E>(
     E: InferenceEngine,
 {
     let mut shutdown_prepared = false;
-    let extra_samples =
-        ((model_sample_rate as f64) * (extra_inference_ms as f64 / 1000.0)).round() as usize;
+    let extra_samples = (extra_inference_ms as usize)
+        .saturating_mul(model_sample_rate as usize)
+        .saturating_div(1000);
     let io_block_size = block_size.max(1);
     let output_step_samples =
         map_model_samples_to_output(io_block_size, model_sample_rate, output_rate);
@@ -498,18 +585,18 @@ fn worker_loop<E>(
     let inference_block_size = io_block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
-    let target_buffer_samples = inference_block_size.saturating_add(extra_samples);
-    let min_process_window_samples = inference_block_size;
-    let process_window_cap = if allow_process_window_grow {
-        target_buffer_samples
-    } else {
+    let target_buffer_samples = io_block_size.saturating_add(extra_samples);
+    let min_process_window_samples = io_block_size;
+    let process_window_cap = HUBERT_WINDOW_SAMPLES;
+    let mut process_window_samples = if allow_process_window_grow {
         min_process_window_samples
+    } else {
+        HUBERT_WINDOW_SAMPLES
     };
-    let mut process_window_samples = min_process_window_samples;
     let mut smoothed_elapsed_ms = 0.0_f64;
     let mut model_rate_buf = Vec::<f32>::new();
     let mut model_input_queue = VecDeque::<f32>::new();
-    let mut model_block = Vec::<f32>::with_capacity(inference_block_size);
+    let mut model_block = Vec::<f32>::with_capacity(process_window_cap.max(inference_block_size));
     let mut output_rate_buf = Vec::<f32>::new();
     let mut previous_output_tail = Vec::<f32>::new();
     let input_to_model_resampler = HqResampler::new(input_rate, model_sample_rate);
@@ -734,7 +821,8 @@ fn worker_loop<E>(
             } else {
                 smoothed_elapsed_ms * 0.9 + elapsed_ms * 0.1
             };
-            if process_window_samples > min_process_window_samples
+            if allow_process_window_grow
+                && process_window_samples > min_process_window_samples
                 && smoothed_elapsed_ms > budget_ms * 1.03
             {
                 let span = process_window_samples - min_process_window_samples;
@@ -755,11 +843,18 @@ fn worker_loop<E>(
             {
                 let span = process_window_cap - process_window_samples;
                 let grow = ((span as f32) * 0.12).ceil().max(64.0) as usize;
-                let next = process_window_samples
-                    .saturating_add(grow)
-                    .min(process_window_cap);
-                if next != process_window_samples {
-                    process_window_samples = next;
+                let next_window = process_window_samples.saturating_add(grow);
+                let clamped = next_window.min(HUBERT_WINDOW_SAMPLES);
+                if clamped >= HUBERT_WINDOW_SAMPLES
+                    && process_window_samples < HUBERT_WINDOW_SAMPLES
+                {
+                    eprintln!(
+                        "[vc-audio] process_window converged: now={} (target_buffer={})",
+                        clamped, target_buffer_samples
+                    );
+                }
+                if clamped != process_window_samples {
+                    process_window_samples = clamped;
                     eprintln!(
                         "[vc-audio] process_window auto-grow: now={} cap={} elapsed={:.2}ms budget={:.2}ms",
                         process_window_samples, process_window_cap, smoothed_elapsed_ms, budget_ms
@@ -1227,6 +1322,37 @@ impl LevelMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_buffer_contract_ok() {
+        validate_buffer_contract(250, 8_192, 16_000, 48_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL: target_buffer")]
+    fn test_validate_buffer_contract_deadlock() {
+        validate_buffer_contract(80, 8_192, 16_000, 48_000);
+    }
+
+    #[test]
+    fn test_min_extra_inference_ms() {
+        assert_eq!(min_extra_inference_ms(16_000, 8_192, 48_000), 163);
+    }
+
+    #[test]
+    fn test_min_extra_inference_ms_exact() {
+        assert_eq!(min_extra_inference_ms(8_192, 8_192, 48_000), 0);
+    }
+
+    #[test]
+    fn test_process_window_clamp_at_hubert_window() {
+        const HUBERT_WINDOW: usize = 16_000;
+        let mut w = 8_192usize;
+        for _ in 0..1000 {
+            w = (w + 500).min(HUBERT_WINDOW);
+        }
+        assert_eq!(w, HUBERT_WINDOW);
+    }
 
     #[test]
     fn response_threshold_accepts_db_values() {

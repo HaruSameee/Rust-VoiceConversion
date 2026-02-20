@@ -18,13 +18,12 @@ use ort::{
 use vc_core::{InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::{
     apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace,
-    normalize_for_onnx_input, postprocess_generated_audio, resize_pitch_to_frames,
-    resample_hq_into, HqResampler,
-    RMVPE_SAMPLE_RATE,
+    normalize_for_onnx_input, postprocess_generated_audio, resample_hq_into,
+    resize_pitch_to_frames, HqResampler, RMVPE_SAMPLE_RATE,
 };
 
-pub mod zero_copy_engine;
 pub mod audio_pipeline;
+pub mod zero_copy_engine;
 
 const STRICT_ONNX_INPUT_SAMPLES_16K: usize = 16_000;
 const STRICT_HUBERT_OUTPUT_FRAMES: usize = 50;

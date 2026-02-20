@@ -1,9 +1,10 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
-use ndarray::{s, Array3, ArrayView3};
+use ndarray::{Array3, ArrayView2};
 use ort::{
     ep::{self, ArbitrarilyConfigurableExecutionProvider, ExecutionProviderDispatch},
     memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
@@ -12,12 +13,17 @@ use ort::{
     value::{DynTensorValueType, Tensor},
 };
 use vc_core::{ModelConfig, Result, RuntimeConfig, VcError};
-use vc_signal::{coarse_pitch_from_f0, resize_pitch_to_frames};
+use vc_signal::coarse_pitch_from_f0;
 
 const DEFAULT_INPUT_SAMPLES: usize = 16_000;
 const DEFAULT_FRAME_COUNT: usize = 50;
 const DEFAULT_WARMUP_RUNS: usize = 2;
 const RND_CHANNELS: usize = 192;
+const RMVPE_EXPECTED_FRAMES: usize = 101;
+const RMVPE_SALIENCE_BINS: usize = 360;
+const RMVPE_CENTS_BASE: f32 = 1997.3794;
+const RMVPE_CENTS_STEP: f32 = 20.0;
+const RMVPE_DECODE_RADIUS: usize = 4;
 
 #[derive(Debug, Clone, Default)]
 pub struct ZeroCopyIoOverrides {
@@ -60,6 +66,7 @@ pub struct ZeroCopyEngineConfig {
     pub frame_count: usize,
     pub warmup_runs: usize,
     pub rmvpe_threshold: f32,
+    pub rms_gate_threshold: f32,
     pub io_overrides: ZeroCopyIoOverrides,
 }
 
@@ -70,6 +77,7 @@ pub struct ZeroCopyInferenceEngine {
     frame_count: usize,
     phone_feature_dim: usize,
     rmvpe_threshold: f32,
+    rms_gate_threshold: f32,
     host_waveform: Tensor<f32>,
     hubert_host_waveform: Tensor<f32>,
     hubert_waveform_gpu: Tensor<f32>,
@@ -88,6 +96,9 @@ pub struct ZeroCopyInferenceEngine {
     decoder_rnd_host: Tensor<f32>,
     decoder_rnd_gpu: Tensor<f32>,
     rnd_state: u64,
+    block_count: usize,
+    audit_enabled: bool,
+    hubert_frame_mismatch_warned: bool,
     drop_synced: bool,
     // Keep sessions last so tensor resources are dropped first.
     hubert: Session,
@@ -198,6 +209,7 @@ impl ZeroCopyInferenceEngine {
             frame_count: config.frame_count,
             phone_feature_dim,
             rmvpe_threshold: config.rmvpe_threshold,
+            rms_gate_threshold: config.rms_gate_threshold.max(0.0),
             host_waveform,
             hubert_host_waveform,
             hubert_waveform_gpu,
@@ -216,6 +228,9 @@ impl ZeroCopyInferenceEngine {
             decoder_rnd_host,
             decoder_rnd_gpu,
             rnd_state: 0x9E37_79B9_7F4A_7C15,
+            block_count: 0,
+            audit_enabled: false,
+            hubert_frame_mismatch_warned: false,
             drop_synced: false,
             hubert,
             rmvpe,
@@ -238,6 +253,8 @@ impl ZeroCopyInferenceEngine {
         for _ in 0..warmup_runs {
             let _ = engine.run(&warmup_input, 0, config.rmvpe_threshold)?;
         }
+        engine.block_count = 0;
+        engine.audit_enabled = true;
         Ok(engine)
     }
 
@@ -330,34 +347,52 @@ impl ZeroCopyInferenceEngine {
                 batch
             )));
         }
-        if src_frames < self.frame_count {
-            eprintln!(
-                "[vc-inference] warning: HuBERT returned {} frames (<{}); features will be resampled to decoder contract",
-                src_frames, self.frame_count
-            );
-        } else if src_frames > self.frame_count {
-            eprintln!(
-                "[vc-inference] HuBERT returned {} frames; features will be resampled to decoder contract ({})",
-                src_frames, self.frame_count
-            );
+        if src_frames == 0 {
+            return Err(VcError::Inference(
+                "HuBERT returned zero frames on zero-copy path".to_string(),
+            ));
+        }
+        if src_frames != self.frame_count && !self.hubert_frame_mismatch_warned {
+            self.hubert_frame_mismatch_warned = true;
+            if src_frames < self.frame_count {
+                eprintln!(
+                    "[vc-inference] warning: HuBERT returned {} frames (<{}); tail frame will be repeated",
+                    src_frames, self.frame_count
+                );
+            } else {
+                eprintln!(
+                    "[vc-inference] warning: HuBERT returned {} frames (>{}); extra frames will be truncated",
+                    src_frames, self.frame_count
+                );
+            }
         }
         let copy_dims = src_dim.min(self.phone_feature_dim);
         {
             self.features_workspace.fill(0.0);
             if src_frames > 0 && copy_dims > 0 {
-                let src = ArrayView3::from_shape((1, src_frames, src_dim), hubert_data).map_err(
-                    |e| {
-                        VcError::Inference(format!(
-                            "failed to view HuBERT tensor as [1,T,C] on zero-copy path: {e}"
-                        ))
-                    },
-                )?;
-                resample_feature_frames_linear_into(
-                    &mut self.features_workspace,
-                    src,
-                    self.frame_count,
-                    copy_dims,
-                );
+                let expected = src_frames.saturating_mul(src_dim).max(1);
+                if hubert_data.len() < expected {
+                    return Err(VcError::Inference(format!(
+                        "HuBERT output buffer too small: len={} required={}",
+                        hubert_data.len(),
+                        expected
+                    )));
+                }
+                let copy_frames = src_frames.min(self.frame_count);
+                for t in 0..copy_frames {
+                    let src_base = t.saturating_mul(src_dim);
+                    for c in 0..copy_dims {
+                        self.features_workspace[(0, t, c)] = hubert_data[src_base + c];
+                    }
+                }
+                if src_frames < self.frame_count {
+                    let src_base = (src_frames - 1).saturating_mul(src_dim);
+                    for t in src_frames..self.frame_count {
+                        for c in 0..copy_dims {
+                            self.features_workspace[(0, t, c)] = hubert_data[src_base + c];
+                        }
+                    }
+                }
             }
         }
         self.update_features_buf_from_workspace()?;
@@ -401,8 +436,130 @@ impl ZeroCopyInferenceEngine {
         } else {
             self.rmvpe_threshold
         };
-        let mut pitchf =
-            resize_pitch_to_frames(&decode_rmvpe_output(rmvpe_shape, rmvpe_data, threshold)?, self.frame_count);
+        let rmvpe_shape_vec = rmvpe_shape.to_vec();
+        let rmvpe_shape = rmvpe_shape_vec.as_slice();
+        let (rmvpe_frames, rmvpe_bins, rmvpe_required) = match rmvpe_shape {
+            [batch, frames, bins] => {
+                let batch = (*batch).max(0) as usize;
+                let frames = (*frames).max(0) as usize;
+                let bins = (*bins).max(0) as usize;
+                if batch != 1 {
+                    return Err(VcError::Inference(format!(
+                        "unexpected RMVPE batch on zero-copy path: got={} expected=1 shape={:?}",
+                        batch, rmvpe_shape
+                    )));
+                }
+                let required = frames.saturating_mul(bins);
+                (frames, bins, required)
+            }
+            [frames, bins] => {
+                let frames = (*frames).max(0) as usize;
+                let bins = (*bins).max(0) as usize;
+                let required = frames.saturating_mul(bins);
+                (frames, bins, required)
+            }
+            _ => {
+                return Err(VcError::Inference(format!(
+                    "unexpected RMVPE output rank on zero-copy path: shape={:?}",
+                    rmvpe_shape
+                )))
+            }
+        };
+        if rmvpe_bins != RMVPE_SALIENCE_BINS {
+            return Err(VcError::Inference(format!(
+                "unexpected RMVPE salience bins on zero-copy path: got={} expected={} shape={:?}",
+                rmvpe_bins, RMVPE_SALIENCE_BINS, rmvpe_shape
+            )));
+        }
+        if rmvpe_data.len() < rmvpe_required {
+            return Err(VcError::Inference(format!(
+                "RMVPE output buffer too small: len={} required={} shape={:?}",
+                rmvpe_data.len(),
+                rmvpe_required,
+                rmvpe_shape
+            )));
+        }
+        debug_assert_eq!(
+            rmvpe_frames, RMVPE_EXPECTED_FRAMES,
+            "RMVPE strict model should output {} frames before host resample",
+            RMVPE_EXPECTED_FRAMES
+        );
+        let salience =
+            ArrayView2::from_shape((rmvpe_frames, rmvpe_bins), &rmvpe_data[..rmvpe_required])
+                .map_err(|e| {
+                    VcError::Inference(format!("failed to view RMVPE salience as 2D: {e}"))
+                })?;
+        let f0_101 = decode_f0_from_salience(&salience, threshold);
+        let f0_101_voiced_pre = f0_101.iter().filter(|&&x| x > 0.0).count();
+        let mut pitchf = resample_f0_linear(&f0_101, self.frame_count);
+        debug_assert_eq!(
+            pitchf.len(),
+            self.frame_count,
+            "RMVPE resampled f0 must be exactly {} frames",
+            self.frame_count
+        );
+        if pitchf.len() != self.frame_count {
+            return Err(VcError::Inference(format!(
+                "unexpected RMVPE resampled frame count on zero-copy path: got={} expected={}",
+                pitchf.len(),
+                self.frame_count
+            )));
+        }
+        let input_rms = compute_rms(waveform_16k);
+        let gated = self.rms_gate_threshold > 0.0 && input_rms < self.rms_gate_threshold;
+        if gated {
+            pitchf.fill(0.0);
+        } else {
+            filter_f0_octave_errors(&mut pitchf, 70.0, 800.0);
+        }
+        if self.audit_enabled {
+            self.block_count = self.block_count.saturating_add(1);
+            if self.block_count <= 30 {
+                let f0_50_voiced_post = pitchf.iter().filter(|&&x| x > 0.0).count();
+                let sal_max =
+                    salience
+                        .iter()
+                        .copied()
+                        .fold(f32::NEG_INFINITY, |a, b| if a > b { a } else { b });
+                let sal_mean = if salience.is_empty() {
+                    0.0
+                } else {
+                    salience.iter().copied().sum::<f32>() / salience.len() as f32
+                };
+                let mut min_hz = f32::INFINITY;
+                let mut max_hz = 0.0_f32;
+                for &v in &pitchf {
+                    if v > 0.0 {
+                        if v < min_hz {
+                            min_hz = v;
+                        }
+                        if v > max_hz {
+                            max_hz = v;
+                        }
+                    }
+                }
+                if !min_hz.is_finite() {
+                    min_hz = 0.0;
+                }
+                eprintln!(
+                    "[rmvpe-audit] block={} salience_shape={:?} sal_max={:.4} sal_mean={:.6} f0_voiced_pre={}/{} f0_voiced_post={}/{} f0_range={:.1}..{:.1}Hz rms={:.4} gated={} rmvpe_th={:.4} rms_gate_th={:.4}",
+                    self.block_count,
+                    rmvpe_shape,
+                    sal_max,
+                    sal_mean,
+                    f0_101_voiced_pre,
+                    rmvpe_frames,
+                    f0_50_voiced_post,
+                    self.frame_count,
+                    min_hz,
+                    max_hz,
+                    input_rms,
+                    gated,
+                    threshold,
+                    self.rms_gate_threshold
+                );
+            }
+        }
         smooth_pitch_track_gaussian_inplace(&mut pitchf, 2);
         let pitch = coarse_pitch_from_f0(&pitchf);
         if pitch.len() != self.frame_count {
@@ -551,6 +708,7 @@ impl ZeroCopyInferenceEngine {
             frame_count,
             warmup_runs,
             rmvpe_threshold: runtime.rmvpe_threshold,
+            rms_gate_threshold: runtime.response_threshold.max(0.0),
             io_overrides,
         };
         Self::new(config).map(Some)
@@ -602,7 +760,8 @@ impl ZeroCopyInferenceEngine {
         )?;
         map_ort(
             "failed to synchronize decoder pitch CUDA buffer before drop",
-            self.decoder_pitch_gpu.copy_into(&mut self.decoder_pitch_host),
+            self.decoder_pitch_gpu
+                .copy_into(&mut self.decoder_pitch_host),
         )?;
         map_ort(
             "failed to synchronize decoder pitchf CUDA buffer before drop",
@@ -653,41 +812,6 @@ fn update_features_buf_from_ndarray_impl(
         "failed to copy features host->CUDA",
         features_buf_host.copy_into(features_buf),
     )
-}
-
-fn resample_feature_frames_linear_into(
-    dst: &mut Array3<f32>,
-    src: ArrayView3<'_, f32>,
-    target_frames: usize,
-    copy_dims: usize,
-) {
-    if target_frames == 0 || copy_dims == 0 {
-        return;
-    }
-    let src_frames = src.shape()[1];
-    if src_frames == 0 {
-        return;
-    }
-    if src_frames == 1 || target_frames == 1 {
-        for t in 0..target_frames {
-            dst.slice_mut(s![0, t, ..copy_dims])
-                .assign(&src.slice(s![0, 0, ..copy_dims]));
-        }
-        return;
-    }
-    let scale = (src_frames - 1) as f32 / (target_frames - 1) as f32;
-    for t in 0..target_frames {
-        let pos = t as f32 * scale;
-        let left = pos.floor() as usize;
-        let right = (left + 1).min(src_frames - 1);
-        let frac = pos - left as f32;
-        let w_left = 1.0 - frac;
-        for c in 0..copy_dims {
-            let a = src[(0, left, c)];
-            let b = src[(0, right, c)];
-            dst[(0, t, c)] = a * w_left + b * frac;
-        }
-    }
 }
 
 fn smooth_pitch_track_gaussian_inplace(pitchf: &mut [f32], radius: usize) {
@@ -765,7 +889,7 @@ fn build_session_with_cache(
             cache_dir.display()
         ))
     })?;
-    let optimized = cache_dir.join(format!("{cache_tag}.opt.onnx"));
+    let optimized = optimized_cache_path(cache_dir, cache_tag, model_path);
     let load_path = if optimized.exists() {
         optimized.as_path()
     } else {
@@ -783,6 +907,23 @@ fn build_session_with_cache(
             .and_then(|b| b.with_execution_providers(eps))
             .and_then(|b| b.commit_from_file(load_path)),
     )
+}
+
+fn optimized_cache_path(cache_dir: &Path, cache_tag: &str, model_path: &Path) -> PathBuf {
+    let (size, mtime_ns) = fs::metadata(model_path)
+        .ok()
+        .map(|m| {
+            let size = m.len();
+            let mtime_ns = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (size, mtime_ns)
+        })
+        .unwrap_or((0, 0));
+    cache_dir.join(format!("{cache_tag}.{size}.{mtime_ns}.opt.onnx"))
 }
 
 fn default_zero_copy_cache_dir() -> PathBuf {
@@ -1136,77 +1277,223 @@ fn env_bool_default_true(key: &str) -> bool {
         .unwrap_or(true)
 }
 
-fn decode_rmvpe_output(shape: &[i64], data: &[f32], threshold: f32) -> Result<Vec<f32>> {
-    if data.is_empty() {
-        return Ok(Vec::new());
+/// Decodes RMVPE salience map to F0 Hz values.
+///
+/// `salience` is shaped as `[frames, bins]` where `bins` is typically 360.
+/// Values may be logits or already normalized probabilities.
+/// Returns `0.0` for unvoiced frames.
+fn decode_f0_from_salience(salience: &ArrayView2<'_, f32>, threshold: f32) -> Vec<f32> {
+    let n_frames = salience.shape()[0];
+    let n_bins = salience.shape()[1];
+    if n_frames == 0 || n_bins == 0 {
+        return Vec::new();
     }
-    if shape.len() >= 3 {
-        let batch = shape[0].max(1) as usize;
-        let time = if shape[1] > 0 {
-            shape[1] as usize
-        } else {
-            data.len() / 360
-        };
-        let bins = if shape[2] > 0 { shape[2] as usize } else { 360 };
-        if bins == 360 && data.len() >= batch * time * bins {
-            let mut out = Vec::<f32>::with_capacity(time);
-            for t in 0..time {
-                let base = t * bins;
-                out.push(decode_rmvpe_salience_row(
-                    &data[base..base + bins],
-                    threshold,
-                ));
+    let threshold = threshold.max(0.0);
+    let mut f0 = vec![0.0_f32; n_frames];
+
+    for t in 0..n_frames {
+        let row = salience.row(t);
+        let mut peak_bin = 0usize;
+        let mut peak_val = f32::NEG_INFINITY;
+        for (idx, &v) in row.iter().enumerate() {
+            if v > peak_val {
+                peak_val = v;
+                peak_bin = idx;
             }
-            return Ok(out);
+        }
+        if !peak_val.is_finite() || peak_val <= threshold {
+            continue;
+        }
+
+        let start = peak_bin.saturating_sub(RMVPE_DECODE_RADIUS);
+        let end = (peak_bin + RMVPE_DECODE_RADIUS + 1).min(n_bins);
+        if start >= end {
+            continue;
+        }
+
+        let mut local_max = f32::NEG_INFINITY;
+        for b in start..end {
+            let v = row[b];
+            if v > local_max {
+                local_max = v;
+            }
+        }
+        if !local_max.is_finite() {
+            continue;
+        }
+
+        let mut cents_num = 0.0_f32;
+        let mut cents_den = 0.0_f32;
+        for b in start..end {
+            let w = (row[b] - local_max).exp();
+            let cents = RMVPE_CENTS_BASE + RMVPE_CENTS_STEP * b as f32;
+            cents_num += cents * w;
+            cents_den += w;
+        }
+        if cents_den > f32::EPSILON {
+            let cents = cents_num / cents_den;
+            f0[t] = 10.0_f32 * 2.0_f32.powf(cents / 1200.0_f32);
         }
     }
-    if shape.len() == 2 && shape[1] == 360 {
-        let time = shape[0].max(1) as usize;
-        if data.len() >= time * 360 {
-            let mut out = Vec::<f32>::with_capacity(time);
-            for t in 0..time {
-                let base = t * 360;
-                out.push(decode_rmvpe_salience_row(
-                    &data[base..base + 360],
-                    threshold,
-                ));
-            }
-            return Ok(out);
-        }
-    }
-    Ok(data.to_vec())
+    f0
 }
 
-fn decode_rmvpe_salience_row(row: &[f32], threshold: f32) -> f32 {
-    if row.is_empty() {
-        return 0.0;
+/// Resamples f0 array from `src.len()` to `dst_len` with linear interpolation.
+///
+/// Unvoiced frames (`0.0`) are treated as gaps and not linearly blended across
+/// voiced/unvoiced boundaries.
+fn resample_f0_linear(src: &[f32], dst_len: usize) -> Vec<f32> {
+    if dst_len == 0 {
+        return Vec::new();
     }
-    let mut best_idx = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (idx, &v) in row.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = idx;
-        }
+    if src.is_empty() {
+        return vec![0.0_f32; dst_len];
     }
-    if best_val <= threshold.clamp(0.0, 1.0) {
-        return 0.0;
+    if src.len() == 1 {
+        return vec![src[0]; dst_len];
+    }
+    if dst_len == 1 {
+        return vec![src[0]];
     }
 
-    let start = best_idx.saturating_sub(4);
-    let end = (best_idx + 5).min(row.len());
-    let mut cents_num = 0.0_f32;
-    let mut cents_den = 0.0_f32;
-    for (offset, &score) in row[start..end].iter().enumerate() {
-        let bin = start + offset;
-        let w = score.max(1e-12);
-        let cents = 1997.3794_f32 + 20.0_f32 * bin as f32;
-        cents_num += cents * w;
-        cents_den += w;
+    let src_len = src.len();
+    let mut dst = vec![0.0_f32; dst_len];
+    for (i, out) in dst.iter_mut().enumerate() {
+        let src_pos = i as f32 * (src_len as f32 - 1.0) / (dst_len as f32 - 1.0);
+        let lo = src_pos.floor() as usize;
+        let hi = (lo + 1).min(src_len - 1);
+        let t = src_pos - lo as f32;
+
+        let a = src[lo];
+        let b = src[hi];
+        *out = match (a > 0.0, b > 0.0) {
+            (true, true) => a * (1.0 - t) + b * t,
+            (true, false) => a,
+            (false, true) => b,
+            (false, false) => 0.0,
+        };
     }
-    if cents_den <= f32::EPSILON {
+    dst
+}
+
+#[inline]
+fn compute_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
         return 0.0;
     }
-    let cents = cents_num / cents_den;
-    10.0_f32 * 2.0_f32.powf(cents / 1200.0_f32)
+    let sum_sq: f32 = samples.iter().map(|&x| x * x).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+fn filter_f0_octave_errors(f0: &mut Vec<f32>, f0_min_hz: f32, f0_max_hz: f32) {
+    for v in f0.iter_mut() {
+        if *v > 0.0 && (*v < f0_min_hz || *v > f0_max_hz) {
+            *v = 0.0;
+        }
+    }
+
+    let mut voiced: Vec<f32> = f0.iter().copied().filter(|&x| x > 0.0).collect();
+    if voiced.is_empty() {
+        return;
+    }
+    voiced.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = voiced[voiced.len() / 2];
+    for v in f0.iter_mut() {
+        if *v > 0.0 && *v < median * 0.65 {
+            let corrected = *v * 2.0;
+            if corrected >= f0_min_hz && corrected <= f0_max_hz {
+                *v = corrected;
+            } else {
+                *v = 0.0;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compute_rms, decode_f0_from_salience, filter_f0_octave_errors, resample_f0_linear,
+    };
+    use ndarray::Array2;
+
+    #[test]
+    fn test_decode_f0_voiced() {
+        let mut sal = Array2::<f32>::zeros((1, 360));
+        sal[[0, 100]] = 10.0;
+        let f0 = decode_f0_from_salience(&sal.view(), 0.006);
+        assert!(f0[0] > 0.0, "should be voiced");
+    }
+
+    #[test]
+    fn test_decode_f0_unvoiced() {
+        let sal = Array2::<f32>::ones((1, 360));
+        let f0 = decode_f0_from_salience(&sal.view(), 2.0);
+        assert_eq!(f0[0], 0.0, "flat salience should be unvoiced");
+    }
+
+    #[test]
+    fn test_decode_f0_bin0_base_frequency() {
+        let mut sal = Array2::<f32>::zeros((1, 360));
+        sal[[0, 0]] = 10.0;
+        let f0 = decode_f0_from_salience(&sal.view(), 0.01);
+        assert!(
+            (30.0..35.0).contains(&f0[0]),
+            "bin0 should decode near C1 (~32.7Hz), got {}",
+            f0[0]
+        );
+    }
+
+    #[test]
+    fn test_resample_f0_shape() {
+        let src: Vec<f32> = (0..101)
+            .map(|i| if i % 3 == 0 { 0.0 } else { 440.0 })
+            .collect();
+        let dst = resample_f0_linear(&src, 50);
+        assert_eq!(dst.len(), 50);
+    }
+
+    #[test]
+    fn test_resample_f0_no_voiced_unvoiced_bleed() {
+        let mut src = vec![440.0f32; 101];
+        for v in src.iter_mut().skip(50) {
+            *v = 0.0;
+        }
+        let dst = resample_f0_linear(&src, 50);
+        assert!(
+            dst[49] == 0.0 || dst[48] == 0.0,
+            "unvoiced region must not be filled by interpolation"
+        );
+    }
+
+    #[test]
+    fn test_filter_f0_octave_errors_removes_subharmonic() {
+        let mut f0 = vec![55.0, 110.0, 112.0, 108.0, 54.0, 111.0];
+        filter_f0_octave_errors(&mut f0, 70.0, 800.0);
+        assert!(f0[0] > 70.0 || f0[0] == 0.0);
+        assert!(f0[4] > 70.0 || f0[4] == 0.0);
+        assert!(f0[1] > 100.0);
+    }
+
+    #[test]
+    fn test_filter_f0_removes_out_of_range() {
+        let mut f0 = vec![40.0, 110.0, 900.0, 115.0];
+        filter_f0_octave_errors(&mut f0, 70.0, 800.0);
+        assert_eq!(f0[0], 0.0);
+        assert_eq!(f0[2], 0.0);
+        assert!(f0[1] > 0.0);
+    }
+
+    #[test]
+    fn test_compute_rms_silence() {
+        let samples = vec![0.0f32; 1024];
+        assert_eq!(compute_rms(&samples), 0.0);
+    }
+
+    #[test]
+    fn test_compute_rms_sine() {
+        let samples: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.1).sin()).collect();
+        let rms = compute_rms(&samples);
+        assert!((rms - 0.707).abs() < 0.01);
+    }
 }
