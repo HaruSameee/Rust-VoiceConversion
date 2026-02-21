@@ -160,7 +160,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.inter_threads = clamped_inter;
     }
     log_debug(&format!(
-        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} tail_offset_ms={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} tail_offset_ms={} slice_offset_samples={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
         config.sample_rate,
         config.block_size,
         config.input_device_name,
@@ -170,6 +170,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.fade_in_ms,
         config.fade_out_ms,
         config.output_tail_offset_ms,
+        config.output_slice_offset_samples,
         config.pitch_shift_semitones,
         config.index_rate,
         config.index_smooth_alpha,
@@ -252,7 +253,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             std::env::var("ORT_DYLIB_PATH").ok()
         ));
         log_debug(&format!(
-            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} tail_offset_ms={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} tail_offset_ms={} slice_offset_samples={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
             model.model_path,
             model.hubert_path,
             model.pitch_extractor_path,
@@ -266,6 +267,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.fade_in_ms,
             runtime_config.fade_out_ms,
             runtime_config.output_tail_offset_ms,
+            runtime_config.output_slice_offset_samples,
             runtime_config.pitch_shift_semitones,
             runtime_config.index_rate,
             runtime_config.index_smooth_alpha,
@@ -309,6 +311,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
                 fade_in_ms: runtime_config.fade_in_ms,
                 fade_out_ms: runtime_config.fade_out_ms,
                 output_tail_offset_ms: runtime_config.output_tail_offset_ms,
+                output_slice_offset_samples: runtime_config.output_slice_offset_samples,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -523,9 +526,12 @@ fn default_runtime_config() -> RuntimeConfig {
     if let Some(v) = env_u32("RUST_VC_OUTPUT_TAIL_OFFSET_MS") {
         cfg.output_tail_offset_ms = v;
     }
+    if let Some(v) = env_usize("RUST_VC_OUTPUT_SLICE_OFFSET_SAMPLES") {
+        cfg.output_slice_offset_samples = v;
+    }
 
     log_debug(&format!(
-        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} tail_offset_ms={}",
+        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} tail_offset_ms={} slice_offset_samples={}",
         cfg.ort_provider,
         cfg.ort_device_id,
         cfg.ort_gpu_mem_limit_mb,
@@ -541,7 +547,8 @@ fn default_runtime_config() -> RuntimeConfig {
         cfg.cuda_tf32,
         cfg.index_bin_dim,
         cfg.index_max_vectors,
-        cfg.output_tail_offset_ms
+        cfg.output_tail_offset_ms,
+        cfg.output_slice_offset_samples
     ));
 
     cfg

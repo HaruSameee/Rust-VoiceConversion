@@ -30,6 +30,7 @@ interface RuntimeConfig {
   fade_in_ms: number;
   fade_out_ms: number;
   output_tail_offset_ms: number;
+  output_slice_offset_samples: number;
   speaker_id: number;
   sample_rate: number;
   block_size: number;
@@ -345,6 +346,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     fade_in_ms: intAtLeast(raw.fade_in_ms, 0, 12),
     fade_out_ms: intAtLeast(raw.fade_out_ms, 0, 120),
     output_tail_offset_ms: intAtLeast(raw.output_tail_offset_ms, 0, 0),
+    output_slice_offset_samples: intAtLeast(raw.output_slice_offset_samples, 0, 31680),
     speaker_id: Math.round(finiteOr(raw.speaker_id, 0)),
     sample_rate: intAtLeast(raw.sample_rate, 1, 48000),
     block_size: intAtLeast(raw.block_size, 1, 8192),
@@ -401,6 +403,7 @@ function runtimeFromInputs(): RuntimeConfig {
     fade_in_ms: Number(ui.fadeInMs.value),
     fade_out_ms: Number(ui.fadeOutMs.value),
     output_tail_offset_ms: Number(ui.outputTailOffsetMs.value),
+    output_slice_offset_samples: base?.output_slice_offset_samples ?? 31680,
     speaker_id: Number(ui.speakerId.value),
     sample_rate: Number(ui.sampleRate.value),
     block_size: Number(ui.blockSize.value),

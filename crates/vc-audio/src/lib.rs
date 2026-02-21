@@ -21,14 +21,11 @@ const MAX_OUTPUT_CROSSFADE_SAMPLES: usize = 1_024;
 const SOLA_SEARCH_MS: f32 = 10.0;
 const OLA_MIN_OVERLAP_RATIO: f32 = 0.25;
 const OLA_MAX_OVERLAP_RATIO: f32 = 0.50;
-const BLOCK_ALIGN_SAMPLES: usize = 256;
-const WARMUP_BUDGET_HEADROOM: f64 = 1.25;
-const MAX_AUTO_BLOCK_SIZE: usize = 96_000;
-const MAX_WARMUP_BLOCK_CAP: usize = 16_384;
-const PROCESS_WINDOW_CONTEXT_SEC: f64 = 1.0;
 const OUTPUT_SLICE_AUDIT_BLOCKS: u64 = 30;
 const FRAME_GRID_SEC: f64 = 0.02; // 20ms per frame
 const INPUT_DC_BLOCK_COEFF: f32 = 0.995;
+const DEFAULT_DECODER_NEW_AUDIO_OFFSET_SAMPLES: usize = 31_680;
+const FIXED_PROCESS_WINDOW_SAMPLES: usize = 48_000;
 
 /// Returns the minimum `extra_inference_ms` value that avoids buffer deadlock.
 ///
@@ -121,9 +118,10 @@ pub struct AudioStreamOptions {
     pub block_size: usize,
     pub input_device_name: Option<String>,
     pub output_device_name: Option<String>,
-    /// Enables adaptive process-window growth.
+    /// Legacy compatibility flag.
     ///
-    /// Default runtime policy is `false` for strict geometry stability.
+    /// The backend now allocates the requested process window directly.
+    /// Dynamic auto-grow/shrink behavior is no longer used.
     pub allow_process_window_grow: bool,
     /// Milliseconds of audio buffered ahead of inference.
     ///
@@ -139,6 +137,7 @@ pub struct AudioStreamOptions {
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
     pub output_tail_offset_ms: u32,
+    pub output_slice_offset_samples: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -219,12 +218,17 @@ where
     let host = cpal::default_host();
     let model_sample_rate = options.model_sample_rate.max(1);
     let requested_block_size = options.block_size.max(1);
-    let allow_process_window_grow = options.allow_process_window_grow;
+    let _allow_process_window_grow = options.allow_process_window_grow;
     let extra_inference_ms = options.extra_inference_ms;
     let response_threshold = normalize_response_threshold(options.response_threshold);
     let fade_in_ms = options.fade_in_ms;
     let fade_out_ms = options.fade_out_ms;
     let output_tail_offset_ms = options.output_tail_offset_ms;
+    let output_slice_offset_samples = if options.output_slice_offset_samples == 0 {
+        DEFAULT_DECODER_NEW_AUDIO_OFFSET_SAMPLES
+    } else {
+        options.output_slice_offset_samples
+    };
 
     let input_device = find_input_device(&host, options.input_device_name.as_deref())?;
     let output_device = find_output_device(&host, options.output_device_name.as_deref())?;
@@ -248,7 +252,6 @@ where
     let sola_search_output = sola_search_samples(output_rate);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
-    let process_window_samples = process_window_samples(model_sample_rate);
     let warmup_inference_block_size = requested_block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
@@ -264,7 +267,7 @@ where
         requested_block_size
     );
     eprintln!(
-        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} tail_offset_ms={} allow_window_grow={}",
+        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} tail_offset_ms={} slice_offset_samples={}",
         input_device.name().unwrap_or_else(|_| "unknown-input".to_string()),
         output_device.name().unwrap_or_else(|_| "unknown-output".to_string()),
         extra_inference_ms,
@@ -272,7 +275,7 @@ where
         fade_in_ms,
         fade_out_ms,
         output_tail_offset_ms,
-        allow_process_window_grow
+        output_slice_offset_samples
     );
     // Warm up the model before starting audio streams to avoid first-block stalls
     // (notably large on GPU providers like DirectML during graph compilation).
@@ -299,73 +302,44 @@ where
         }
     };
 
-    let recommended_block_size = recommended_block_size_from_warmup(
-        requested_block_size,
-        model_sample_rate,
-        warmup_elapsed_ms,
-    );
-    let max_safe_block_size = process_window_samples.saturating_sub(sola_search_model);
-    if max_safe_block_size == 0 {
-        return Err(anyhow!(
-            "invalid realtime geometry: process_window({}) <= sola_search_model({})",
-            process_window_samples,
-            sola_search_model
-        ));
-    }
-    let clamped_block_size = recommended_block_size.min(max_safe_block_size);
     let frame_grid = frame_grid_samples(model_sample_rate);
-    let mut block_size = align_down(clamped_block_size, frame_grid);
-    block_size = block_size.clamp(1, max_safe_block_size);
+    let mut block_size = align_down(requested_block_size.max(1), frame_grid);
+    block_size = block_size.max(1);
     if block_size != requested_block_size {
         eprintln!(
-            "[vc-audio] block_size adjusted for realtime headroom: requested={} effective={} warmup_ms={:.2}",
-            requested_block_size, block_size, warmup_elapsed_ms
-        );
-    }
-    if block_size != recommended_block_size {
-        eprintln!(
-            "[vc-audio] block_size clamped for strict window safety: recommended={} clamped={} (max_safe={} process_window={} sola_search_model={})",
-            recommended_block_size,
-            block_size,
-            max_safe_block_size,
-            process_window_samples,
-            sola_search_model
-        );
-    }
-    if block_size != clamped_block_size {
-        eprintln!(
             "[vc-audio] block_size aligned to frame grid: pre_align={} aligned={} frame_grid={}samples",
-            clamped_block_size, block_size, frame_grid
+            requested_block_size, block_size, frame_grid
         );
     }
+    voice_changer.set_effective_block_size(block_size);
+    eprintln!(
+        "[vc-audio] synced effective block_size to inference config: {} samples",
+        block_size
+    );
     let inference_block_size = block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
+    let process_window_samples = FIXED_PROCESS_WINDOW_SAMPLES;
     if inference_block_size > process_window_samples {
         return Err(anyhow!(
-            "invalid realtime geometry: inference_block_size({}) > process_window({})",
+            "invalid realtime geometry: inference_block_size({}) > fixed_process_window({})",
             inference_block_size,
             process_window_samples
         ));
     }
-    let min_extra_ms = min_extra_inference_ms(process_window_samples, block_size, model_sample_rate);
-    let effective_extra_inference_ms = extra_inference_ms.max(min_extra_ms);
-    if effective_extra_inference_ms != extra_inference_ms {
-        eprintln!(
-            "[vc-audio] extra_inference_ms elevated for process window: requested={} effective={} (min_required={})",
-            extra_inference_ms, effective_extra_inference_ms, min_extra_ms
-        );
-    }
+    let effective_extra_inference_ms = extra_inference_ms;
     let effective_extra_samples = (effective_extra_inference_ms as usize)
         .saturating_mul(model_sample_rate as usize)
         .saturating_div(1000);
     let target_buffer_samples = block_size.saturating_add(effective_extra_samples);
-    validate_buffer_contract(
-        effective_extra_inference_ms,
-        block_size,
-        process_window_samples,
-        model_sample_rate,
-    );
+    if process_window_samples != target_buffer_samples {
+        eprintln!(
+            "[vc-audio] process_window fixed: requested={} using={} (fixed model context)",
+            target_buffer_samples, process_window_samples
+        );
+    }
+    let min_extra_ms =
+        min_extra_inference_ms(process_window_samples, block_size, model_sample_rate);
     let headroom_samples = target_buffer_samples.saturating_sub(process_window_samples);
     let sr_per_ms = model_sample_rate as f64 / 1000.0;
     let headroom_ms = if sr_per_ms > 0.0 {
@@ -477,12 +451,12 @@ where
             input_rate,
             output_rate,
             output_channels,
-            allow_process_window_grow,
             effective_extra_inference_ms,
             response_threshold,
             fade_in_ms,
             fade_out_ms,
             output_tail_offset_ms,
+            output_slice_offset_samples,
             process_window_samples,
             &running_worker,
             &input_rms_worker,
@@ -680,10 +654,11 @@ fn resolve_output_tail_offset_samples(
     output_tail_offset_ms: u32,
 ) -> usize {
     if output_tail_offset_ms == 0 {
-        return edge_guard_samples;
+        return 0;
     }
-    let from_ms =
-        ((output_rate as f64) * (output_tail_offset_ms as f64) / 1000.0).round().max(0.0) as usize;
+    let from_ms = ((output_rate as f64) * (output_tail_offset_ms as f64) / 1000.0)
+        .round()
+        .max(0.0) as usize;
     from_ms.max(edge_guard_samples)
 }
 
@@ -699,12 +674,12 @@ fn worker_loop<E>(
     input_rate: u32,
     output_rate: u32,
     output_channels: usize,
-    allow_process_window_grow: bool,
     extra_inference_ms: u32,
     response_threshold: f32,
     fade_in_ms: u32,
     fade_out_ms: u32,
     output_tail_offset_ms: u32,
+    output_slice_offset_samples: usize,
     configured_process_window_samples: usize,
     running: &Arc<AtomicBool>,
     input_rms: &Arc<AtomicU32>,
@@ -720,9 +695,6 @@ fn worker_loop<E>(
     let io_block_size = block_size.max(1);
     let output_step_samples =
         map_model_samples_to_output(io_block_size, model_sample_rate, output_rate);
-    // Slice length should follow what the output engine actually consumes per block
-    // (device-facing output domain), not a separately derived hop estimate.
-    let output_slice_len_out = output_step_samples;
     let crossfade_samples = default_output_crossfade_samples(output_rate).min(output_step_samples);
     let sola_search_output = sola_search_samples(output_rate);
     let edge_guard_samples = crossfade_samples.max(sola_search_output / 2);
@@ -730,29 +702,12 @@ fn worker_loop<E>(
         resolve_output_tail_offset_samples(output_rate, edge_guard_samples, output_tail_offset_ms);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
-    let output_slice_len_model = map_output_samples_to_model(
-        output_slice_len_out.saturating_add(sola_search_output),
-        model_sample_rate,
-        output_rate,
-    );
-    let output_tail_offset_model =
-        map_output_samples_to_model(output_tail_offset_samples, model_sample_rate, output_rate);
-    // Keep only the newest region required for this block:
-    //   - one output block worth of fresh samples (in output domain)
-    //   - SOLA search margin
-    //   - optional right-edge safety offset margin
-    let output_source_window_model = output_slice_len_model.saturating_add(output_tail_offset_model);
     let inference_block_size = io_block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
     let target_buffer_samples = io_block_size.saturating_add(extra_samples);
-    let min_process_window_samples = io_block_size;
-    let process_window_cap = configured_process_window_samples.max(io_block_size);
-    let mut process_window_samples = if allow_process_window_grow {
-        min_process_window_samples
-    } else {
-        process_window_cap
-    };
+    let process_window_samples = configured_process_window_samples;
+    let process_window_cap = process_window_samples;
     let mut smoothed_elapsed_ms = 0.0_f64;
     let mut model_rate_buf = Vec::<f32>::new();
     let mut model_input_queue = VecDeque::<f32>::new();
@@ -789,23 +744,17 @@ fn worker_loop<E>(
         edge_guard_samples
     );
     eprintln!(
-        "[vc-audio] output_tail_offset_out={} (~{:.2}ms) edge_guard_out={} (set output_tail_offset_ms in runtime config to tune)",
+        "[vc-audio] output_tail_offset_out={} (~{:.2}ms) edge_guard_out={} slice_offset_samples={} (set output_tail_offset_ms/output_slice_offset_samples in runtime config to tune)",
         output_tail_offset_samples,
         output_tail_offset_samples as f64 / output_rate.max(1) as f64 * 1000.0,
-        edge_guard_samples
+        edge_guard_samples,
+        output_slice_offset_samples
     );
-    if target_buffer_samples > process_window_samples {
-        if allow_process_window_grow {
-            eprintln!(
-                "[vc-audio] process_window adaptive start: requested={} start={} (auto-grow when realtime budget allows)",
-                target_buffer_samples, process_window_samples
-            );
-        } else {
-            eprintln!(
-                "[vc-audio] process_window fixed: requested={} using={} (grow disabled for stability)",
-                target_buffer_samples, process_window_samples
-            );
-        }
+    if process_window_samples != target_buffer_samples {
+        eprintln!(
+            "[vc-audio] process_window fixed: requested={} using={} (fixed model context)",
+            target_buffer_samples, process_window_samples
+        );
     }
     // Prime output queue to cover startup buffering and first inference warm-up.
     let prefill_target_samples = target_buffer_samples.max(process_window_samples);
@@ -899,79 +848,65 @@ fn worker_loop<E>(
                 }
             };
 
-            let (output_source, source_slice_start, source_slice_end): (Vec<f32>, usize, usize) =
-                if model_out.len() >= output_source_window_model {
-                    // Keep only the freshest window (hop + required margins), not the full process window.
-                    let end = model_out.len();
-                    let start = end.saturating_sub(output_source_window_model);
-                    (model_out[start..end].to_vec(), start, end)
-                } else {
-                    // If model output is shorter than the required source window, align it to the tail and
-                    // pad the head with zeros so downstream tail slicing keeps recent audio.
-                    let mut padded = vec![0.0_f32; output_source_window_model];
-                    let copy_len = model_out.len();
-                    if copy_len > 0 {
-                        let dst_start = output_source_window_model.saturating_sub(copy_len);
-                        padded[dst_start..].copy_from_slice(&model_out);
-                    }
-                    (padded, 0, model_out.len())
-                };
             let output_mono: &[f32] = if model_sample_rate != output_rate {
-                resample_hq_into(
-                    &model_to_output_resampler,
-                    &output_source,
-                    &mut output_rate_buf,
-                );
+                resample_hq_into(&model_to_output_resampler, &model_out, &mut output_rate_buf);
                 &output_rate_buf
             } else {
-                &output_source
+                &model_out
             };
             // Keep callback pacing deterministic: always produce one output block per inference step.
             let expected_len = output_step_samples.max(1);
             let ola_overlap_samples =
                 compute_ola_overlap_samples(expected_len, crossfade_samples, extra_inference_ms);
-            // Avoid using the very end of each block where non-causal generators are often unstable.
-            let max_guard = output_mono.len().saturating_sub(expected_len);
+            // Compute output slice from the latest region dynamically.
+            // For aligned decoder models this directly maps to the newest hop-sized chunk.
+            let max_guard = output_mono.len().saturating_sub(1);
             let applied_guard = output_tail_offset_samples.min(max_guard);
-            let anchor_end = output_mono.len().saturating_sub(applied_guard);
-            let tail_span = expected_len.saturating_add(sola_search_output);
-            let tail_start = anchor_end.saturating_sub(tail_span);
-            let tail = &output_mono[tail_start..anchor_end];
-            let search_limit = tail
+            let guarded_end = output_mono.len().saturating_sub(applied_guard);
+            let source_end = guarded_end;
+            let source_start = source_end.saturating_sub(expected_len);
+            let source_region = &output_mono[source_start..source_end];
+            debug_assert_eq!(
+                source_end.saturating_sub(source_start),
+                expected_len,
+                "slice must exactly match hop size - no padding expected"
+            );
+            let search_limit = source_region
                 .len()
                 .saturating_sub(expected_len)
                 .min(sola_search_output);
             let crossfade_for_search = crossfade_samples
                 .min(previous_output_tail.len())
-                .min(tail.len());
+                .min(source_region.len());
             let mut offset = 0usize;
             if search_limit > 0 && crossfade_for_search >= 16 {
                 offset = sola_correlator.find_best_offset(
                     &previous_output_tail,
-                    tail,
+                    source_region,
                     crossfade_for_search,
                     search_limit,
                 );
             }
+            let final_start = source_start.saturating_add(offset);
+            let final_end = (final_start + expected_len).min(source_end);
             if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
                 eprintln!(
-                    "[vc-audio] output-slice-audit block={} model_out_len={} source_slice=[{}..{}) source_window_model={} source_len={} expected_len={} tail_offset={} anchor_end={} tail=[{}..{}) search_limit={}",
+                    "[vc-audio] output-slice-audit block={} model_out_len={} source_slice=[{}..{}) source_len={} expected_len={} tail_offset={} configured_start={} dynamic_start={} final_start={} final_end={} search_limit={}",
                     processed_blocks + 1,
                     model_out.len(),
-                    source_slice_start,
-                    source_slice_end,
-                    output_source_window_model,
-                    output_mono.len(),
+                    source_start,
+                    source_end,
+                    source_region.len(),
                     expected_len,
                     applied_guard,
-                    anchor_end,
-                    tail_start,
-                    anchor_end,
+                    output_slice_offset_samples,
+                    source_start,
+                    final_start,
+                    final_end,
                     search_limit
                 );
             }
-            let mut smoothed_output =
-                tail[offset..(offset + expected_len).min(tail.len())].to_vec();
+            let mut smoothed_output = output_mono[final_start..final_end].to_vec();
             if smoothed_output.len() < expected_len {
                 let pad = smoothed_output.last().copied().unwrap_or(0.0);
                 smoothed_output.resize(expected_len, pad);
@@ -1026,44 +961,6 @@ fn worker_loop<E>(
             } else {
                 smoothed_elapsed_ms * 0.9 + elapsed_ms * 0.1
             };
-            if allow_process_window_grow
-                && process_window_samples > min_process_window_samples
-                && smoothed_elapsed_ms > budget_ms * 1.03
-            {
-                let span = process_window_samples - min_process_window_samples;
-                let shrink = ((span as f32) * 0.30).ceil().max(128.0) as usize;
-                let next = process_window_samples
-                    .saturating_sub(shrink)
-                    .max(min_process_window_samples);
-                if next != process_window_samples {
-                    process_window_samples = next;
-                    eprintln!(
-                        "[vc-audio] process_window auto-shrink: now={} requested={} elapsed={:.2}ms budget={:.2}ms",
-                        process_window_samples, target_buffer_samples, smoothed_elapsed_ms, budget_ms
-                    );
-                }
-            } else if allow_process_window_grow
-                && process_window_samples < process_window_cap
-                && smoothed_elapsed_ms < budget_ms * 0.78
-            {
-                let span = process_window_cap - process_window_samples;
-                let grow = ((span as f32) * 0.12).ceil().max(64.0) as usize;
-                let next_window = process_window_samples.saturating_add(grow);
-                let clamped = next_window.min(process_window_cap);
-                if clamped >= process_window_cap && process_window_samples < process_window_cap {
-                    eprintln!(
-                        "[vc-audio] process_window converged: now={} (target_buffer={})",
-                        clamped, target_buffer_samples
-                    );
-                }
-                if clamped != process_window_samples {
-                    process_window_samples = clamped;
-                    eprintln!(
-                        "[vc-audio] process_window auto-grow: now={} cap={} elapsed={:.2}ms budget={:.2}ms",
-                        process_window_samples, process_window_cap, smoothed_elapsed_ms, budget_ms
-                    );
-                }
-            }
             if elapsed > block_budget {
                 eprintln!(
                     "[vc-audio] slow block: elapsed={:.2}ms budget={:.2}ms queue={}",
@@ -1196,13 +1093,6 @@ fn normalize_response_threshold(raw: f32) -> f32 {
     raw.clamp(0.0, 1.0)
 }
 
-fn align_up(value: usize, align: usize) -> usize {
-    if align <= 1 {
-        return value.max(1);
-    }
-    value.div_ceil(align) * align
-}
-
 fn align_down(value: usize, align: usize) -> usize {
     if align <= 1 {
         return value.max(1);
@@ -1217,34 +1107,9 @@ fn frame_grid_samples(model_sample_rate: u32) -> usize {
     if model_sample_rate == 0 {
         return 1;
     }
-    ((model_sample_rate as f64) * FRAME_GRID_SEC).round().max(1.0) as usize
-}
-
-fn process_window_samples(model_sample_rate: u32) -> usize {
-    if model_sample_rate == 0 {
-        return 1;
-    }
-    ((model_sample_rate as f64) * PROCESS_WINDOW_CONTEXT_SEC)
+    ((model_sample_rate as f64) * FRAME_GRID_SEC)
         .round()
         .max(1.0) as usize
-}
-
-fn recommended_block_size_from_warmup(
-    requested_block_size: usize,
-    model_sample_rate: u32,
-    warmup_elapsed_ms: f64,
-) -> usize {
-    let requested = requested_block_size.max(1);
-    if !warmup_elapsed_ms.is_finite() || warmup_elapsed_ms <= 0.0 || model_sample_rate == 0 {
-        return requested;
-    }
-    let target_budget_ms = warmup_elapsed_ms * WARMUP_BUDGET_HEADROOM;
-    let required = ((target_budget_ms / 1000.0) * model_sample_rate as f64).ceil() as usize;
-    let recommended = align_up(required.max(requested), BLOCK_ALIGN_SAMPLES);
-    let cap = requested
-        .max(requested.saturating_mul(2).min(MAX_WARMUP_BLOCK_CAP))
-        .min(MAX_AUTO_BLOCK_SIZE);
-    recommended.min(cap)
 }
 
 fn map_model_samples_to_output(model_samples: usize, model_rate: u32, output_rate: u32) -> usize {
@@ -1644,18 +1509,12 @@ mod tests {
     }
 
     #[test]
-    fn test_process_window_clamp_at_context_window() {
-        const CONTEXT_WINDOW: usize = 48_000;
-        let mut w = 8_192usize;
-        for _ in 0..1000 {
-            w = (w + 500).min(CONTEXT_WINDOW);
-        }
-        assert_eq!(w, CONTEXT_WINDOW);
-    }
-
-    #[test]
-    fn test_process_window_samples_1s_at_48k() {
-        assert_eq!(process_window_samples(48_000), 48_000);
+    fn test_target_buffer_geometry_from_runtime_request() {
+        let block_size = 32_768usize;
+        let extra_ms = 1_400usize;
+        let sample_rate = 48_000usize;
+        let target_buffer = block_size + (extra_ms * sample_rate / 1000);
+        assert_eq!(target_buffer, 99_968);
     }
 
     #[test]

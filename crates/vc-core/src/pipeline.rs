@@ -22,6 +22,10 @@ impl<E: InferenceEngine> VoiceChanger<E> {
         self.config = config;
     }
 
+    pub fn set_effective_block_size(&mut self, block_size: usize) {
+        self.config.block_size = block_size.max(1);
+    }
+
     pub fn process_frame(&mut self, input: &[f32]) -> Result<Vec<f32>> {
         let mut pre = Vec::with_capacity(input.len());
         for sample in input {

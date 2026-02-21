@@ -551,9 +551,29 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         &mut self,
         frame: &[f32],
         input_sample_rate: u32,
-    ) -> (Vec<f32>, Vec<f32>) {
+        hop_samples_16k: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         let source_16k = self.resample_block_to_16k(frame, input_sample_rate);
-        self.hop_samples_16k = source_16k.len().max(1).min(STRICT_ONNX_INPUT_SAMPLES_16K);
+        let effective_hop = hop_samples_16k.max(1).min(STRICT_ONNX_INPUT_SAMPLES_16K);
+        debug_assert_eq!(
+            source_16k.len(),
+            effective_hop,
+            "resample_hop mismatch: got={} expected={} (input_len={} sr={})",
+            source_16k.len(),
+            effective_hop,
+            frame.len(),
+            input_sample_rate
+        );
+        if source_16k.len() != effective_hop {
+            return Err(VcError::Inference(format!(
+                "strict hop mismatch after resample: got={} expected={} (input_len={} sr={})",
+                source_16k.len(),
+                effective_hop,
+                frame.len(),
+                input_sample_rate
+            )));
+        }
+        self.hop_samples_16k = effective_hop;
         slide_context_window(
             &mut self.source_16k_context,
             &source_16k,
@@ -568,7 +588,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         debug_assert_eq!(self.rmvpe_16k_context.len(), STRICT_ONNX_INPUT_SAMPLES_16K);
         let hubert_input: Vec<f32> = self.source_16k_context.iter().copied().collect();
         let rmvpe_input: Vec<f32> = self.rmvpe_16k_context.iter().copied().collect();
-        (hubert_input, rmvpe_input)
+        Ok((hubert_input, rmvpe_input))
     }
 
     fn resample_block_to_16k(&self, frame: &[f32], input_sample_rate: u32) -> Vec<f32> {
@@ -903,8 +923,27 @@ impl InferenceEngine for RvcOrtEngine {
     fn infer_frame(&mut self, frame: &[f32], config: &RuntimeConfig) -> Result<Vec<f32>> {
         let mut infer = || -> Result<Vec<f32>> {
             let waveform = frame.to_vec();
-            let (mut hubert_source_16k, mut rmvpe_source_16k) =
-                self.prepare_inference_inputs_16k(&waveform, config.sample_rate);
+            let hop_input_len = config.block_size.max(1).min(waveform.len());
+            let hop_input_start = waveform.len().saturating_sub(hop_input_len);
+            let hop_input = &waveform[hop_input_start..];
+            let target_hop_samples_16k =
+                estimate_hop_samples_16k(config.block_size.max(1), config.sample_rate.max(1));
+            if target_hop_samples_16k != self.hop_samples_16k {
+                let context_samples =
+                    STRICT_ONNX_INPUT_SAMPLES_16K.saturating_sub(target_hop_samples_16k);
+                eprintln!(
+                    "[vc-inference] sliding_window hop sync: hop={}smp context={}smp @ 16kHz (block_size={} sr={})",
+                    target_hop_samples_16k,
+                    context_samples,
+                    config.block_size,
+                    config.sample_rate
+                );
+            }
+            let (mut hubert_source_16k, mut rmvpe_source_16k) = self.prepare_inference_inputs_16k(
+                hop_input,
+                config.sample_rate,
+                target_hop_samples_16k,
+            )?;
             if hubert_source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
                 return Err(VcError::Inference(format!(
                     "strict HuBERT source length mismatch: got={}, expected={}",
@@ -1206,7 +1245,8 @@ fn upsample_phone_frames_repeat(frames: Array3<f32>, target_frames: usize) -> Ar
             if src_t >= src_frames {
                 src_t = src_frames - 1;
             }
-            out.slice_mut(s![b, t, ..]).assign(&frames.slice(s![b, src_t, ..]));
+            out.slice_mut(s![b, t, ..])
+                .assign(&frames.slice(s![b, src_t, ..]));
         }
     }
     out
@@ -2362,8 +2402,7 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
 mod tests {
     use super::{
         estimate_hop_samples_16k, fit_waveform_to_len, slide_context_window,
-        upsample_phone_frames_repeat,
-        STRICT_ONNX_INPUT_SAMPLES_16K,
+        upsample_phone_frames_repeat, STRICT_ONNX_INPUT_SAMPLES_16K,
     };
     use ndarray::Array3;
     use std::collections::VecDeque;
@@ -2404,6 +2443,13 @@ mod tests {
         let hop = estimate_hop_samples_16k(8192, 48_000);
         assert_eq!(hop, 2731);
         assert!((hop * 3).abs_diff(8192) <= 2);
+    }
+
+    #[test]
+    fn hop_size_calculation_48k_block_16320() {
+        let hop = estimate_hop_samples_16k(16_320, 48_000);
+        assert_eq!(hop, 5_440);
+        assert_eq!(hop * 3, 16_320);
     }
 
     #[test]

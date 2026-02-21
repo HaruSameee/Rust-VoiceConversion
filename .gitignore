@@ -1,15 +1,29 @@
-# Build artifacts
+# ------------------------------------------------------------
+# Rust / Cargo
+# ------------------------------------------------------------
 target/
 **/target/
 **/*.rs.bk
 **/mutants.out*/
 *.pdb
 
-# Runtime/cache artifacts
+# ------------------------------------------------------------
+# Runtime cache
+# ------------------------------------------------------------
 ort_cache/
 apps/tauri/src-tauri/cache/
 
+# ------------------------------------------------------------
+# Frontend / Tauri
+# ------------------------------------------------------------
+apps/tauri/ui/node_modules/
+apps/tauri/ui/dist/
+apps/tauri/ui/.vite/
+apps/tauri/src-tauri/gen/
+
+# ------------------------------------------------------------
 # Python
+# ------------------------------------------------------------
 **/__pycache__/
 *.pyc
 *.pyo
@@ -17,15 +31,12 @@ apps/tauri/src-tauri/cache/
 .venv/
 venv/
 
-# Tauri / frontend artifacts
-apps/tauri/ui/node_modules/
-apps/tauri/ui/dist/
-apps/tauri/ui/.vite/
-apps/tauri/src-tauri/gen/
-
-# Local model/runtime files (large binaries)
+# ------------------------------------------------------------
+# Local model assets (large files)
+# ------------------------------------------------------------
 model/*.onnx
 model/*.pth
+model/*.pt
 model/*.index
 model/*.bin
 model/*.cache
@@ -33,6 +44,7 @@ model/*.rustvc.cache
 model/*.dll
 models/*.onnx
 models/*.pth
+models/*.pt
 models/*.index
 models/*.bin
 models/*.cache
@@ -42,16 +54,22 @@ scripts/*.pt
 scripts/*.pth
 scripts/*.ckpt
 
+# ------------------------------------------------------------
 # Local references / dumps
+# ------------------------------------------------------------
 Mangio-RVC-v23.7.0/
 obs-rvc-master/
 
-# Logs and env
+# ------------------------------------------------------------
+# Logs / env
+# ------------------------------------------------------------
 *.log
 .env
 .env.*
 
+# ------------------------------------------------------------
 # Editor / OS
+# ------------------------------------------------------------
 .vscode/
 .idea/
 .DS_Store
