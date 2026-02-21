@@ -23,7 +23,7 @@ const OLA_MAX_OVERLAP_RATIO: f32 = 0.50;
 const OUTPUT_SLICE_AUDIT_BLOCKS: u64 = 30;
 const FRAME_GRID_SEC: f64 = 0.02; // 20ms per frame
 const INPUT_DC_BLOCK_COEFF: f32 = 0.995;
-const DEFAULT_DECODER_NEW_AUDIO_OFFSET_SAMPLES: usize = 31_680;
+const DEFAULT_DECODER_NEW_AUDIO_OFFSET_SAMPLES: usize = 6_054;
 const FIXED_PROCESS_WINDOW_SAMPLES: usize = 48_000;
 const DEBUG_DUMP_MAX_SECONDS: usize = 20;
 
@@ -965,61 +965,107 @@ fn worker_loop<E>(
             let expected_len = output_step_samples.max(1);
             let ola_overlap_samples =
                 compute_ola_overlap_samples(expected_len, crossfade_samples, extra_inference_ms);
-            // Compute output slice from the latest region dynamically.
-            // For aligned decoder models this directly maps to the newest hop-sized chunk.
+            // Strict slicing contract:
+            // always emit exactly `expected_len` samples from [final_start..final_end).
             let max_guard = output_mono.len().saturating_sub(1);
             let applied_guard = output_tail_offset_samples.min(max_guard);
             let guarded_end = output_mono.len().saturating_sub(applied_guard);
             let source_end = guarded_end;
-            let source_start = source_end.saturating_sub(expected_len);
-            let source_region = &output_mono[source_start..source_end];
-            debug_assert_eq!(
-                source_end.saturating_sub(source_start),
-                expected_len,
-                "slice must exactly match hop size - no padding expected"
-            );
-            let search_limit = source_region
-                .len()
-                .saturating_sub(expected_len)
-                .min(sola_search_output);
-            let crossfade_for_search = crossfade_samples
-                .min(previous_output_tail.len())
-                .min(source_region.len());
-            let mut offset = 0usize;
-            if search_limit > 0 && crossfade_for_search >= 16 {
-                offset = sola_correlator.find_best_offset(
-                    &previous_output_tail,
-                    source_region,
-                    crossfade_for_search,
-                    search_limit,
+            let configured_start = output_slice_offset_samples;
+            let max_start = source_end.saturating_sub(expected_len);
+            let mut base_start = configured_start.min(max_start);
+            if configured_start > max_start && processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                eprintln!(
+                    "[vc-audio] output-slice warning: configured_start={} exceeds max_start={} for model_out_len={} (expected_len={}, tail_offset={}); clamping",
+                    configured_start,
+                    max_start,
+                    output_mono.len(),
+                    expected_len,
+                    applied_guard
                 );
             }
-            let final_start = source_start.saturating_add(offset);
-            let final_end = (final_start + expected_len).min(source_end);
+
+            let mut final_start = base_start;
+            let mut final_end = final_start.saturating_add(expected_len);
+            let mut search_limit = 0usize;
+            let mut source_region_len = 0usize;
+            if source_end >= expected_len {
+                search_limit = sola_search_output.min(max_start.saturating_sub(base_start));
+                let search_region_end = base_start
+                    .saturating_add(expected_len)
+                    .saturating_add(search_limit);
+                let source_region = &output_mono[base_start..search_region_end];
+                source_region_len = source_region.len();
+                let crossfade_for_search = crossfade_samples
+                    .min(previous_output_tail.len())
+                    .min(source_region.len());
+                let mut offset = 0usize;
+                if search_limit > 0 && crossfade_for_search >= 16 {
+                    offset = sola_correlator.find_best_offset(
+                        &previous_output_tail,
+                        source_region,
+                        crossfade_for_search,
+                        search_limit,
+                    );
+                }
+                final_start = base_start.saturating_add(offset);
+                final_end = final_start.saturating_add(expected_len);
+                if final_end > source_end {
+                    if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                        eprintln!(
+                            "[vc-audio] output-slice warning: final_end={} exceeds source_end={} (final_start={}, expected_len={}); clamping start",
+                            final_end,
+                            source_end,
+                            final_start,
+                            expected_len
+                        );
+                    }
+                    base_start = max_start;
+                    final_start = base_start;
+                    final_end = final_start.saturating_add(expected_len);
+                }
+            }
+
             if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
                 eprintln!(
-                    "[vc-audio] output-slice-audit block={} model_out_len={} source_slice=[{}..{}) source_len={} expected_len={} tail_offset={} configured_start={} dynamic_start={} final_start={} final_end={} search_limit={}",
+                    "[vc-audio] output-slice-audit block={} model_out_len={} source_end={} source_region_len={} expected_len={} tail_offset={} configured_start={} max_start={} base_start={} final_start={} final_end={} search_limit={}",
                     processed_blocks + 1,
                     model_out.len(),
-                    source_start,
                     source_end,
-                    source_region.len(),
+                    source_region_len,
                     expected_len,
                     applied_guard,
-                    output_slice_offset_samples,
-                    source_start,
+                    configured_start,
+                    max_start,
+                    base_start,
                     final_start,
                     final_end,
                     search_limit
                 );
             }
-            let mut smoothed_output = output_mono[final_start..final_end].to_vec();
-            if smoothed_output.len() < expected_len {
-                let pad = smoothed_output.last().copied().unwrap_or(0.0);
-                smoothed_output.resize(expected_len, pad);
-            } else if smoothed_output.len() > expected_len {
-                smoothed_output.truncate(expected_len);
-            }
+            let mut smoothed_output = if source_end >= expected_len {
+                output_mono[final_start..final_end].to_vec()
+            } else {
+                if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                    eprintln!(
+                        "[vc-audio] output-slice warning: source_end={} < expected_len={}; zero-padding missing samples",
+                        source_end,
+                        expected_len
+                    );
+                }
+                let mut out = vec![0.0_f32; expected_len];
+                let available = source_end.min(expected_len);
+                if available > 0 {
+                    out[expected_len - available..expected_len]
+                        .copy_from_slice(&output_mono[source_end - available..source_end]);
+                }
+                out
+            };
+            debug_assert_eq!(
+                smoothed_output.len(),
+                expected_len,
+                "slice contract violated: final output length must equal expected_len"
+            );
             if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
                 eprintln!(
                     "[vc-audio] output-slice-final block={} final_len={} expected_len={}",

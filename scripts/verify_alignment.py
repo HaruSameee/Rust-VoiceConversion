@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
-Measure sample-level lag between two WAV files via cross-correlation.
+Measure sample-level lag between two WAV files and suggest slice_offset_samples.
+
+Usage example:
+  python scripts/verify_alignment.py \
+    --input debug_input.wav \
+    --output debug_output.wav \
+    --sample-rate 48000 \
+    --current-slice-offset 6054
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import importlib
 import wave
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -16,6 +26,26 @@ try:
     import soundfile as sf
 except Exception:
     sf = None
+
+_SCIPY_CORRELATE = None
+_SCIPY_CHECKED = False
+
+
+def _get_scipy_correlate():
+    global _SCIPY_CORRELATE, _SCIPY_CHECKED
+    if _SCIPY_CHECKED:
+        return _SCIPY_CORRELATE
+    _SCIPY_CHECKED = True
+    try:
+        # Some environments print ABI warnings/traces for SciPy import.
+        # Suppress noisy stderr and fall back to NumPy when SciPy is unusable.
+        with contextlib.redirect_stderr(io.StringIO()):
+            signal_mod = importlib.import_module("scipy.signal")
+        _SCIPY_CORRELATE = getattr(signal_mod, "correlate", None)
+    except Exception:
+        _SCIPY_CORRELATE = None
+    return _SCIPY_CORRELATE
+
 
 def _to_float32(x: np.ndarray) -> np.ndarray:
     if x.dtype == np.float32:
@@ -67,76 +97,131 @@ def load_audio_mono(path: Path) -> Tuple[np.ndarray, int]:
     return data.astype(np.float32, copy=False), int(sr)
 
 
-def _xcorr(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    return np.correlate(a, b, mode="full")
+def _xcorr(signal_out: np.ndarray, signal_in: np.ndarray) -> np.ndarray:
+    scipy_correlate = _get_scipy_correlate()
+    if scipy_correlate is not None:
+        return scipy_correlate(signal_out, signal_in, mode="full", method="fft")
+    return np.correlate(signal_out, signal_in, mode="full")
 
 
-def verify_alignment(input_wav: Path, output_wav: Path, sample_rate: int | None) -> int:
-    x, sr_x = load_audio_mono(input_wav)
-    y, sr_y = load_audio_mono(output_wav)
+def _cosine_after_shift(ref: np.ndarray, out: np.ndarray, lag: int) -> float:
+    if lag > 0:
+        aligned = out[lag:]
+        target = ref[: len(aligned)]
+    elif lag < 0:
+        aligned = out[: lag]
+        target = ref[-lag : -lag + len(aligned)]
+    else:
+        aligned = out
+        target = ref
+    if aligned.size == 0 or target.size == 0:
+        return float("nan")
+    num = float(np.dot(aligned, target))
+    den = float(np.linalg.norm(aligned) * np.linalg.norm(target) + 1e-8)
+    return num / den
+
+
+def verify_alignment(
+    input_wav: Path,
+    output_wav: Path,
+    sample_rate: Optional[int],
+    max_seconds: float,
+    current_slice_offset: Optional[int],
+) -> int:
+    ref, sr_ref = load_audio_mono(input_wav)
+    out, sr_out = load_audio_mono(output_wav)
 
     if sample_rate is not None:
-        if sr_x != sample_rate or sr_y != sample_rate:
+        if sr_ref != sample_rate or sr_out != sample_rate:
             raise RuntimeError(
-                f"sample rate mismatch: input={sr_x}, output={sr_y}, expected={sample_rate}"
+                f"sample rate mismatch: input={sr_ref}, output={sr_out}, expected={sample_rate}"
             )
-    elif sr_x != sr_y:
-        raise RuntimeError(f"sample rate mismatch: input={sr_x}, output={sr_y}")
-
-    sr = sample_rate if sample_rate is not None else sr_x
-    n = min(len(x), len(y))
-    if n <= 8:
-        raise RuntimeError("audio too short for alignment check")
-
-    x = x[:n]
-    y = y[:n]
-    x = x / (np.max(np.abs(x)) + 1e-8)
-    y = y / (np.max(np.abs(y)) + 1e-8)
-
-    corr = _xcorr(y, x)
-    lag = int(np.argmax(corr) - (n - 1))
-
-    print(f"[verify] lag={lag} samples")
-    print(f"[verify] lag_ms={lag / (sr / 1000.0):.3f} ms @ {sr}Hz")
-    print(f"[verify] lag_frames_10ms={lag / (sr / 100.0):.3f}")
-    print(f"[verify] direction={'output late' if lag > 0 else 'output early' if lag < 0 else 'aligned'}")
-
-    if lag > 0:
-        aligned = y[lag:]
-        ref = x[: len(aligned)]
-    elif lag < 0:
-        aligned = y[: lag]
-        ref = x[-lag : -lag + len(aligned)]
+        sr = sample_rate
     else:
-        aligned = y
-        ref = x
+        if sr_ref != sr_out:
+            raise RuntimeError(f"sample rate mismatch: input={sr_ref}, output={sr_out}")
+        sr = sr_ref
 
-    if len(aligned) > 0 and len(ref) > 0:
-        num = float(np.dot(aligned, ref))
-        den = float(np.linalg.norm(aligned) * np.linalg.norm(ref) + 1e-8)
-        print(f"[verify] cosine_after_shift={num / den:.6f}")
-    else:
-        print("[verify] cosine_after_shift=nan (empty aligned segment)")
+    n = min(len(ref), len(out))
+    if n < 32:
+        raise RuntimeError("audio is too short for robust correlation")
 
-    return lag
+    if max_seconds > 0:
+        limit = int(sr * max_seconds)
+        n = min(n, limit)
+
+    ref = ref[:n]
+    out = out[:n]
+    ref = ref / (np.max(np.abs(ref)) + 1e-8)
+    out = out / (np.max(np.abs(out)) + 1e-8)
+
+    corr = _xcorr(out, ref)
+    peak_idx = int(np.argmax(corr))
+    lag_samples = peak_idx - (len(ref) - 1)
+    peak_corr = float(corr[peak_idx])
+    lag_ms = lag_samples * 1000.0 / float(sr)
+    lag_ms_48k = lag_samples / 48.0
+    lag_frames_10ms = lag_samples / (float(sr) / 100.0)
+    direction = "output_late" if lag_samples > 0 else "output_early" if lag_samples < 0 else "aligned"
+    cosine = _cosine_after_shift(ref, out, lag_samples)
+
+    print(f"[verify] input={input_wav}")
+    print(f"[verify] output={output_wav}")
+    print(f"[verify] sr={sr} n={n} scipy={'yes' if _get_scipy_correlate() is not None else 'no'}")
+    print(f"[verify] lag_samples={lag_samples}")
+    print(f"[verify] lag_ms={lag_ms:.3f} ms @ {sr}Hz")
+    print(f"[verify] lag_ms_48k={lag_ms_48k:.3f} ms (48kHz basis)")
+    print(f"[verify] lag_frames_10ms={lag_frames_10ms:.3f}")
+    print(f"[verify] direction={direction}")
+    print(f"[verify] peak_corr={peak_corr:.6f}")
+    print(f"[verify] cosine_after_shift={cosine:.6f}")
+
+    if current_slice_offset is not None:
+        suggested = max(0, current_slice_offset + lag_samples)
+        print(f"[suggest] current_slice_offset_samples={current_slice_offset}")
+        print(f"[suggest] new_slice_offset_samples={suggested}")
+        print(
+            "[suggest] formula: new_offset = current_offset + lag_samples "
+            "(lag>0: shift right, lag<0: shift left)"
+        )
+
+    return lag_samples
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Sample-level WAV alignment checker.")
-    p.add_argument("--input", required=True, help="Reference input WAV")
-    p.add_argument("--output", required=True, help="Converted/output WAV")
+    p = argparse.ArgumentParser(description="Cross-correlation WAV alignment checker.")
+    p.add_argument("--input", required=True, help="Reference input WAV path")
+    p.add_argument("--output", required=True, help="Converted output WAV path")
     p.add_argument(
         "--sample-rate",
         type=int,
-        default=None,
-        help="Expected sample rate (optional)",
+        default=48_000,
+        help="Expected sample rate (default: 48000)",
+    )
+    p.add_argument(
+        "--max-seconds",
+        type=float,
+        default=20.0,
+        help="Max seconds to use for correlation (default: 20.0)",
+    )
+    p.add_argument(
+        "--current-slice-offset",
+        type=int,
+        default=6_054,
+        help="Current slice_offset_samples to compute recommendation",
     )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    verify_alignment(Path(args.input), Path(args.output), args.sample_rate)
+    verify_alignment(
+        input_wav=Path(args.input),
+        output_wav=Path(args.output),
+        sample_rate=args.sample_rate,
+        max_seconds=args.max_seconds,
+        current_slice_offset=args.current_slice_offset,
+    )
 
 
 if __name__ == "__main__":

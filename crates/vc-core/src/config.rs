@@ -54,7 +54,8 @@ pub struct RuntimeConfig {
     pub output_tail_offset_ms: u32,
     /// Decoder output slice start offset in samples (output domain).
     ///
-    /// For 48kHz/100-frame decoder outputs, a practical initial value is 31680.
+    /// For 48kHz/100-frame decoder outputs, a practical initial value is model-dependent.
+    /// Current measured default in this project: 6054.
     /// 0 means "use engine default".
     pub output_slice_offset_samples: usize,
     /// Enables debug WAV dump output from `vc-audio`.
@@ -113,7 +114,7 @@ impl Default for RuntimeConfig {
             fade_out_ms: 120,
             sola_search_ms: 10,
             output_tail_offset_ms: 0,
-            output_slice_offset_samples: 31_680,
+            output_slice_offset_samples: 6_054,
             record_dump: false,
             speaker_id: 0,
             sample_rate: 48_000,

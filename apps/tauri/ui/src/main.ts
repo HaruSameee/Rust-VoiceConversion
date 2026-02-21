@@ -151,6 +151,8 @@ let runtimeCache: RuntimeConfig | null = null;
 const PRESET_STORAGE_KEY = "rust_vc_presets_v1";
 let presetStore: PresetStore = {};
 const MAX_ORT_THREADS = Math.max(1, Math.round(Number(navigator.hardwareConcurrency) || 4));
+const LEGACY_SLICE_OFFSET_SAMPLES = 31680;
+const DEFAULT_SLICE_OFFSET_SAMPLES = 6054;
 
 function now(): string {
   return new Date().toISOString();
@@ -203,6 +205,14 @@ function atLeast(value: number, min: number, fallback: number): number {
 
 function intAtLeast(value: number, min: number, fallback: number): number {
   return Math.round(atLeast(value, min, fallback));
+}
+
+function normalizeSliceOffsetSamples(value: number | null | undefined): number {
+  const normalized = intAtLeast(Number(value), 0, DEFAULT_SLICE_OFFSET_SAMPLES);
+  if (normalized === LEGACY_SLICE_OFFSET_SAMPLES) {
+    return DEFAULT_SLICE_OFFSET_SAMPLES;
+  }
+  return normalized;
 }
 
 function clamp(value: number, min: number, max: number, fallback: number): number {
@@ -337,6 +347,24 @@ function deletePresetLocal(): void {
 
 function initPresetUi(): void {
   presetStore = readPresetStore();
+  let migrated = false;
+  for (const [name, entry] of Object.entries(presetStore)) {
+    const runtimeSanitized = sanitizeRuntime(entry.runtime);
+    const before = entry.runtime.output_slice_offset_samples;
+    const after = runtimeSanitized.output_slice_offset_samples;
+    if (before !== after) {
+      presetStore[name] = { ...entry, runtime: runtimeSanitized };
+      migrated = true;
+    }
+  }
+  if (migrated) {
+    writePresetStore(presetStore);
+    log("INFO", "preset runtime migrated", {
+      field: "output_slice_offset_samples",
+      from: LEGACY_SLICE_OFFSET_SAMPLES,
+      to: DEFAULT_SLICE_OFFSET_SAMPLES
+    });
+  }
   renderPresetSelect();
 }
 
@@ -364,7 +392,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     fade_out_ms: intAtLeast(raw.fade_out_ms, 0, 120),
     sola_search_ms: intAtLeast(raw.sola_search_ms, 1, 10),
     output_tail_offset_ms: intAtLeast(raw.output_tail_offset_ms, 0, 0),
-    output_slice_offset_samples: intAtLeast(raw.output_slice_offset_samples, 0, 31680),
+    output_slice_offset_samples: normalizeSliceOffsetSamples(raw.output_slice_offset_samples),
     record_dump: Boolean(raw.record_dump),
     speaker_id: Math.round(finiteOr(raw.speaker_id, 0)),
     sample_rate: intAtLeast(raw.sample_rate, 1, 48000),
@@ -425,7 +453,7 @@ function runtimeFromInputs(): RuntimeConfig {
     fade_out_ms: Number(ui.fadeOutMs.value),
     sola_search_ms: Number(ui.solaSearchMs.value),
     output_tail_offset_ms: Number(ui.outputTailOffsetMs.value),
-    output_slice_offset_samples: base?.output_slice_offset_samples ?? 31680,
+    output_slice_offset_samples: normalizeSliceOffsetSamples(base?.output_slice_offset_samples),
     record_dump: ui.recordDump.checked,
     speaker_id: Number(ui.speakerId.value),
     sample_rate: Number(ui.sampleRate.value),
