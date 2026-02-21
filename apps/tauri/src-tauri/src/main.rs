@@ -302,7 +302,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
         ));
         let infer_engine = RvcOrtEngine::new(model, &runtime_config).map_err(|e| e.to_string())?;
         let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());
-        // Keep process_window fixed for strict HuBERT geometry stability.
+        // Compatibility plumbing only; vc-audio currently runs with fixed process_window.
         let allow_process_window_grow = false;
         let audio_engine = spawn_voice_changer_stream(
             voice_changer,

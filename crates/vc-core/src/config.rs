@@ -25,15 +25,18 @@ pub struct RuntimeConfig {
     pub pitch_smooth_alpha: f32,
     pub rms_mix_rate: f32,
     pub f0_median_filter_radius: usize,
-    /// Legacy overlap tuning (ms).
+    /// Overlap/fade tuning hint in milliseconds.
     ///
-    /// Used by post-processing overlap/fade heuristics.
-    /// Playback queue depth is configured by `target_buffer_ms`.
+    /// This value is used by `vc-audio` post-processing heuristics
+    /// (e.g. OLA overlap shaping). It is not the playback queue depth.
+    /// Queue depth is configured by `target_buffer_ms`.
     pub extra_inference_ms: u32,
     /// Playback/output queue target size in milliseconds.
     ///
     /// Larger values improve underrun resistance at the cost of latency.
     /// This is independent from `process_window` (model context window).
+    /// Runtime applies a safety floor so the effective queue is never smaller
+    /// than the model context window plus one hop.
     pub target_buffer_ms: u32,
     pub response_threshold: f32,
     pub fade_in_ms: u32,
@@ -56,8 +59,9 @@ pub struct RuntimeConfig {
     pub output_slice_offset_samples: usize,
     /// Enables debug WAV dump output from `vc-audio`.
     ///
-    /// When true, the engine writes synchronized input/output WAV files
-    /// (`debug_input.wav`, `debug_output.wav`) on shutdown.
+    /// Toggled from runtime config/UI. When true, the engine writes
+    /// synchronized input/output WAV files (`debug_input.wav`,
+    /// `debug_output.wav`) on shutdown.
     pub record_dump: bool,
     pub speaker_id: i64,
     pub sample_rate: u32,

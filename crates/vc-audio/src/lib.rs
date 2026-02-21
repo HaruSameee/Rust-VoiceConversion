@@ -27,11 +27,12 @@ const DEFAULT_DECODER_NEW_AUDIO_OFFSET_SAMPLES: usize = 31_680;
 const FIXED_PROCESS_WINDOW_SAMPLES: usize = 48_000;
 const DEBUG_DUMP_MAX_SECONDS: usize = 20;
 
-/// Returns the minimum `extra_inference_ms` value that avoids buffer deadlock.
+/// Legacy helper for minimum `extra_inference_ms` style budgeting.
 ///
-/// Formula: ceil((process_window - block_size) / (sample_rate / 1000))
+/// Formula: `ceil((process_window - block_size) / (sample_rate / 1000))`.
 ///
-/// Add the actual inference latency on top of this value for safe operation.
+/// Current runtime queue sizing uses `target_buffer_ms`, but this helper is
+/// kept for diagnostics/tests and compatibility calculations.
 pub fn min_extra_inference_ms(process_window: usize, block_size: usize, sample_rate: u32) -> u32 {
     if sample_rate == 0 {
         return 0;
@@ -54,11 +55,12 @@ pub fn target_buffer_samples_from_ms(target_buffer_ms: u32, sample_rate: u32) ->
         .saturating_div(1000)
 }
 
-/// Validates that the audio buffer sizing is physically consistent.
+/// Legacy validation for `extra_inference_ms`-based buffer geometry.
 ///
 /// # Panics
-/// Panics if target_buffer < process_window, which would cause the engine
-/// to deadlock waiting for samples that can never accumulate.
+/// Panics if computed `target_buffer` is smaller than `process_window`.
+/// This is kept for diagnostics/tests; main runtime now derives queue size
+/// from `target_buffer_ms` with safety flooring.
 pub fn validate_buffer_contract(
     extra_inference_ms: u32,
     block_size: usize,
@@ -128,12 +130,12 @@ pub struct AudioStreamOptions {
     pub block_size: usize,
     pub input_device_name: Option<String>,
     pub output_device_name: Option<String>,
-    /// Legacy compatibility flag.
+    /// Legacy compatibility flag (ignored).
     ///
-    /// The backend now allocates the requested process window directly.
-    /// Dynamic auto-grow/shrink behavior is no longer used.
+    /// Dynamic auto-grow/shrink behavior is no longer used. The runtime keeps
+    /// a fixed model context window and manages queue depth independently.
     pub allow_process_window_grow: bool,
-    /// Legacy inference overlap tuning (milliseconds).
+    /// Inference overlap tuning hint (milliseconds).
     ///
     /// This value is used for overlap/fade heuristics in post-processing.
     /// Playback queue sizing is controlled by `target_buffer_ms`.
@@ -149,6 +151,7 @@ pub struct AudioStreamOptions {
     pub sola_search_ms: u32,
     pub output_tail_offset_ms: u32,
     pub output_slice_offset_samples: usize,
+    /// Enables debug WAV dump output at shutdown.
     pub record_dump: bool,
 }
 
@@ -230,6 +233,7 @@ where
     let host = cpal::default_host();
     let model_sample_rate = options.model_sample_rate.max(1);
     let requested_block_size = options.block_size.max(1);
+    // Compatibility-only flag. Growth is intentionally disabled in current geometry.
     let _allow_process_window_grow = options.allow_process_window_grow;
     let extra_inference_ms = options.extra_inference_ms;
     let target_buffer_ms = options.target_buffer_ms.max(1);
