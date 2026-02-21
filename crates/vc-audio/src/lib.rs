@@ -18,8 +18,6 @@ use vc_signal::{resample_hq_into, HqResampler};
 const MIN_INFERENCE_BLOCK: usize = 8_192;
 const MIN_OUTPUT_CROSSFADE_SAMPLES: usize = 256;
 const MAX_OUTPUT_CROSSFADE_SAMPLES: usize = 1_024;
-const OLA_MIN_OVERLAP_RATIO: f32 = 0.25;
-const OLA_MAX_OVERLAP_RATIO: f32 = 0.50;
 const OUTPUT_SLICE_AUDIT_BLOCKS: u64 = 30;
 const FRAME_GRID_SEC: f64 = 0.02; // 20ms per frame
 const INPUT_DC_BLOCK_COEFF: f32 = 0.995;
@@ -764,7 +762,7 @@ fn worker_loop<E>(
     input_rate: u32,
     output_rate: u32,
     output_channels: usize,
-    extra_inference_ms: u32,
+    _extra_inference_ms: u32,
     configured_target_buffer_samples: usize,
     response_threshold: f32,
     fade_in_ms: u32,
@@ -787,7 +785,8 @@ fn worker_loop<E>(
     let io_block_size = block_size.max(1);
     let output_step_samples =
         map_model_samples_to_output(io_block_size, model_sample_rate, output_rate);
-    let crossfade_samples = default_output_crossfade_samples(output_rate).min(output_step_samples);
+    let crossfade_samples =
+        configured_output_crossfade_samples(output_rate, fade_in_ms, output_step_samples);
     let sola_search_output = sola_search_samples(output_rate, sola_search_ms);
     let edge_guard_samples = crossfade_samples.max(sola_search_output / 2);
     let output_tail_offset_samples =
@@ -935,10 +934,11 @@ fn worker_loop<E>(
             let quiet_block = response_threshold > 0.0
                 && block_rms < response_threshold
                 && block_peak < (response_threshold * 4.0);
+            let playback_is_ready = playback_ready.load(Ordering::Acquire);
             if quiet_block {
                 if silence_hold_remaining > 0 {
                     silence_hold_remaining -= 1;
-                } else {
+                } else if playback_is_ready {
                     // Keep inferring to avoid hard dropouts, but track sustained-quiet blocks.
                     silence_skips += 1;
                 }
@@ -963,8 +963,7 @@ fn worker_loop<E>(
             };
             // Keep callback pacing deterministic: always produce one output block per inference step.
             let expected_len = output_step_samples.max(1);
-            let ola_overlap_samples =
-                compute_ola_overlap_samples(expected_len, crossfade_samples, extra_inference_ms);
+            let ola_overlap_samples = crossfade_samples.min(expected_len);
             // Strict slicing contract:
             // always emit exactly `expected_len` samples from [final_start..final_end).
             let max_guard = output_mono.len().saturating_sub(1);
@@ -1077,7 +1076,7 @@ fn worker_loop<E>(
             let overlap = ola_overlap_samples
                 .min(smoothed_output.len())
                 .min(previous_output_tail.len());
-            apply_raised_cosine_overlap(&previous_output_tail, &mut smoothed_output, overlap);
+            apply_linear_overlap(&previous_output_tail, &mut smoothed_output, overlap);
             let keep = ola_overlap_samples.min(smoothed_output.len());
             previous_output_tail.clear();
             if keep > 0 {
@@ -1352,27 +1351,25 @@ fn default_output_crossfade_samples(output_rate: u32) -> usize {
     ) as usize
 }
 
-fn compute_ola_overlap_samples(
-    expected_len: usize,
-    base_crossfade: usize,
-    extra_inference_ms: u32,
+fn configured_output_crossfade_samples(
+    output_rate: u32,
+    fade_in_ms: u32,
+    output_step_samples: usize,
 ) -> usize {
-    if expected_len == 0 {
+    if output_step_samples == 0 {
         return 0;
     }
-    let floor = base_crossfade.min(expected_len).max(1);
-    let min_overlap = ((expected_len as f32) * OLA_MIN_OVERLAP_RATIO)
-        .round()
-        .max(floor as f32) as usize;
-    let max_overlap = (((expected_len as f32) * OLA_MAX_OVERLAP_RATIO)
-        .round()
-        .max(min_overlap as f32) as usize)
-        .min(expected_len);
-    let t = (extra_inference_ms as f32 / 300.0).clamp(0.0, 1.0);
-    min_overlap + (((max_overlap - min_overlap) as f32) * t).round() as usize
+    let from_ms = if fade_in_ms == 0 {
+        default_output_crossfade_samples(output_rate)
+    } else {
+        ((output_rate as f64) * (fade_in_ms as f64) / 1000.0).round() as usize
+    };
+    let min_overlap = output_step_samples.min(MIN_OUTPUT_CROSSFADE_SAMPLES).max(1);
+    let max_overlap = output_step_samples.min(MAX_OUTPUT_CROSSFADE_SAMPLES).max(min_overlap);
+    from_ms.clamp(min_overlap, max_overlap)
 }
 
-fn apply_raised_cosine_overlap(previous_tail: &[f32], current: &mut [f32], overlap: usize) {
+fn apply_linear_overlap(previous_tail: &[f32], current: &mut [f32], overlap: usize) {
     if overlap == 0 || previous_tail.len() < overlap || current.len() < overlap {
         return;
     }
@@ -1380,8 +1377,8 @@ fn apply_raised_cosine_overlap(previous_tail: &[f32], current: &mut [f32], overl
     let inv = 1.0_f32 / (overlap + 1) as f32;
     for i in 0..overlap {
         let t = (i + 1) as f32 * inv;
-        // Raised-cosine overlap-add where weights always sum to 1.0.
-        let w_curr = 0.5_f32 - 0.5_f32 * (std::f32::consts::PI * t).cos();
+        // Linear overlap-add where weights always sum to 1.0.
+        let w_curr = t;
         let w_prev = 1.0_f32 - w_curr;
         current[i] = previous_tail[prev_start + i] * w_prev + current[i] * w_curr;
     }
