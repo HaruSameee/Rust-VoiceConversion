@@ -26,11 +26,14 @@ interface RuntimeConfig {
   rms_mix_rate: number;
   f0_median_filter_radius: number;
   extra_inference_ms: number;
+  target_buffer_ms: number;
   response_threshold: number;
   fade_in_ms: number;
   fade_out_ms: number;
+  sola_search_ms: number;
   output_tail_offset_ms: number;
   output_slice_offset_samples: number;
+  record_dump: boolean;
   speaker_id: number;
   sample_rate: number;
   block_size: number;
@@ -44,7 +47,7 @@ interface RuntimeConfig {
   hubert_output_layer: number;
   hubert_upsample_factor: number;
   cuda_conv_algo: string;
-  cuda_conv_max_workspace: boolean;
+  cuda_ws: boolean;
   cuda_conv1d_pad_to_nc1d: boolean;
   cuda_tf32: boolean;
   index_bin_dim: number;
@@ -110,16 +113,22 @@ const ui = {
   rmsMixRate: $("rmsMixRate") as HTMLInputElement,
   f0MedianFilterRadius: $("f0MedianFilterRadius") as HTMLInputElement,
   extraInferenceMs: $("extraInferenceMs") as HTMLInputElement,
+  targetBufferMs: $("targetBufferMs") as HTMLInputElement,
   responseThreshold: $("responseThreshold") as HTMLInputElement,
   fadeInMs: $("fadeInMs") as HTMLInputElement,
   fadeOutMs: $("fadeOutMs") as HTMLInputElement,
+  solaSearchMs: $("solaSearchMs") as HTMLInputElement,
   outputTailOffsetMs: $("outputTailOffsetMs") as HTMLInputElement,
+  recordDump: $("recordDump") as HTMLInputElement,
   speakerId: $("speakerId") as HTMLInputElement,
   sampleRate: $("sampleRate") as HTMLInputElement,
   blockSize: $("blockSize") as HTMLInputElement,
   ortProvider: $("ortProvider") as HTMLSelectElement,
   ortDeviceId: $("ortDeviceId") as HTMLInputElement,
   ortGpuMemLimitMb: $("ortGpuMemLimitMb") as HTMLInputElement,
+  cudaConvAlgo: $("cudaConvAlgo") as HTMLSelectElement,
+  cudaWs: $("cudaWs") as HTMLInputElement,
+  cudaTf32: $("cudaTf32") as HTMLInputElement,
   ortIntraThreads: $("ortIntraThreads") as HTMLInputElement,
   ortInterThreads: $("ortInterThreads") as HTMLInputElement,
   reloadBtn: $("reloadBtn") as HTMLButtonElement,
@@ -252,6 +261,13 @@ function sortedPresetNames(store: PresetStore): string[] {
   return Object.keys(store).sort((a, b) => a.localeCompare(b, "ja"));
 }
 
+function syncCudaWsUiState(): void {
+  if (ui.cudaWs.checked) {
+    ui.ortGpuMemLimitMb.value = "0";
+  }
+  ui.ortGpuMemLimitMb.disabled = ui.cudaWs.checked;
+}
+
 function renderPresetSelect(selected: string | null = null): void {
   const names = sortedPresetNames(presetStore);
   ui.presetSelect.innerHTML = "";
@@ -342,11 +358,14 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     rms_mix_rate: clamp(raw.rms_mix_rate, 0.0, 1.0, 0.2),
     f0_median_filter_radius: intAtLeast(raw.f0_median_filter_radius, 0, 3),
     extra_inference_ms: intAtLeast(raw.extra_inference_ms, 0, 0),
+    target_buffer_ms: intAtLeast(raw.target_buffer_ms, 500, 2000),
     response_threshold: finiteOr(raw.response_threshold, -50.0),
     fade_in_ms: intAtLeast(raw.fade_in_ms, 0, 12),
     fade_out_ms: intAtLeast(raw.fade_out_ms, 0, 120),
+    sola_search_ms: intAtLeast(raw.sola_search_ms, 1, 10),
     output_tail_offset_ms: intAtLeast(raw.output_tail_offset_ms, 0, 0),
     output_slice_offset_samples: intAtLeast(raw.output_slice_offset_samples, 0, 31680),
+    record_dump: Boolean(raw.record_dump),
     speaker_id: Math.round(finiteOr(raw.speaker_id, 0)),
     sample_rate: intAtLeast(raw.sample_rate, 1, 48000),
     block_size: intAtLeast(raw.block_size, 1, 8192),
@@ -361,10 +380,11 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     hubert_context_samples_16k: intAtLeast(raw.hubert_context_samples_16k, 1600, 16000),
     hubert_output_layer: Math.round(finiteOr(raw.hubert_output_layer, 12)),
     hubert_upsample_factor: intAtLeast(raw.hubert_upsample_factor, 1, 2),
-    cuda_conv_algo: ["default", "heuristic", "exhaustive"].includes((raw.cuda_conv_algo ?? "").toLowerCase())
+    cuda_conv_algo: ["default", "exhaustive"].includes((raw.cuda_conv_algo ?? "").toLowerCase())
       ? raw.cuda_conv_algo.toLowerCase()
       : "default",
-    cuda_conv_max_workspace: Boolean(raw.cuda_conv_max_workspace),
+    cuda_ws: Boolean((raw as unknown as { cuda_ws?: unknown; cuda_conv_max_workspace?: unknown }).cuda_ws
+      ?? (raw as unknown as { cuda_ws?: unknown; cuda_conv_max_workspace?: unknown }).cuda_conv_max_workspace),
     cuda_conv1d_pad_to_nc1d: Boolean(raw.cuda_conv1d_pad_to_nc1d),
     cuda_tf32: Boolean(raw.cuda_tf32),
     index_bin_dim: intAtLeast(raw.index_bin_dim, 1, 768),
@@ -399,27 +419,30 @@ function runtimeFromInputs(): RuntimeConfig {
     rms_mix_rate: Number(ui.rmsMixRate.value),
     f0_median_filter_radius: Number(ui.f0MedianFilterRadius.value),
     extra_inference_ms: Number(ui.extraInferenceMs.value),
+    target_buffer_ms: Number(ui.targetBufferMs.value),
     response_threshold: Number(ui.responseThreshold.value),
     fade_in_ms: Number(ui.fadeInMs.value),
     fade_out_ms: Number(ui.fadeOutMs.value),
+    sola_search_ms: Number(ui.solaSearchMs.value),
     output_tail_offset_ms: Number(ui.outputTailOffsetMs.value),
     output_slice_offset_samples: base?.output_slice_offset_samples ?? 31680,
+    record_dump: ui.recordDump.checked,
     speaker_id: Number(ui.speakerId.value),
     sample_rate: Number(ui.sampleRate.value),
     block_size: Number(ui.blockSize.value),
     ort_provider: ui.ortProvider.value,
     ort_device_id: Number(ui.ortDeviceId.value),
     ort_gpu_mem_limit_mb: Number(ui.ortGpuMemLimitMb.value),
+    cuda_conv_algo: ui.cudaConvAlgo.value,
+    cuda_ws: ui.cudaWs.checked,
+    cuda_tf32: ui.cudaTf32.checked,
     ort_intra_threads: Number(ui.ortIntraThreads.value),
     ort_inter_threads: Number(ui.ortInterThreads.value),
     ort_parallel_execution: base?.ort_parallel_execution ?? false,
     hubert_context_samples_16k: base?.hubert_context_samples_16k ?? 16000,
     hubert_output_layer: base?.hubert_output_layer ?? 12,
     hubert_upsample_factor: base?.hubert_upsample_factor ?? 2,
-    cuda_conv_algo: base?.cuda_conv_algo ?? "default",
-    cuda_conv_max_workspace: base?.cuda_conv_max_workspace ?? false,
     cuda_conv1d_pad_to_nc1d: base?.cuda_conv1d_pad_to_nc1d ?? false,
-    cuda_tf32: base?.cuda_tf32 ?? false,
     index_bin_dim: base?.index_bin_dim ?? 768,
     index_max_vectors: base?.index_max_vectors ?? 0
   };
@@ -449,16 +472,23 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.rmsMixRate.value = String(config.rms_mix_rate);
   ui.f0MedianFilterRadius.value = String(config.f0_median_filter_radius);
   ui.extraInferenceMs.value = String(config.extra_inference_ms);
+  ui.targetBufferMs.value = String(config.target_buffer_ms);
   ui.responseThreshold.value = String(config.response_threshold);
   ui.fadeInMs.value = String(config.fade_in_ms);
   ui.fadeOutMs.value = String(config.fade_out_ms);
+  ui.solaSearchMs.value = String(config.sola_search_ms);
   ui.outputTailOffsetMs.value = String(config.output_tail_offset_ms);
+  ui.recordDump.checked = Boolean(config.record_dump);
   ui.speakerId.value = String(config.speaker_id);
   ui.sampleRate.value = String(config.sample_rate);
   ui.blockSize.value = String(config.block_size);
   ui.ortProvider.value = config.ort_provider;
   ui.ortDeviceId.value = String(config.ort_device_id);
   ui.ortGpuMemLimitMb.value = String(config.ort_gpu_mem_limit_mb);
+  ui.cudaConvAlgo.value = config.cuda_conv_algo;
+  ui.cudaWs.checked = config.cuda_ws;
+  ui.cudaTf32.checked = config.cuda_tf32;
+  syncCudaWsUiState();
   ui.ortIntraThreads.value = String(config.ort_intra_threads);
   ui.ortInterThreads.value = String(config.ort_inter_threads);
 }
@@ -602,12 +632,16 @@ ui.stopBtn.addEventListener("click", () => {
 ui.clearLogBtn.addEventListener("click", () => {
   ui.logBox.textContent = "";
 });
+ui.cudaWs.addEventListener("change", () => {
+  syncCudaWsUiState();
+});
 for (const btn of ui.tabButtons) {
   btn.addEventListener("click", () => {
     switchTab(btn.dataset.tab ?? "model");
   });
 }
 switchTab(ui.tabButtons[0]?.dataset.tab ?? "model");
+syncCudaWsUiState();
 initPresetUi();
 
 void runAction("init", loadAll);

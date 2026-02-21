@@ -2105,7 +2105,7 @@ fn resolve_ort_execution_config(runtime: &RuntimeConfig) -> OrtExecutionConfig {
     let provider = parse_ort_provider(&runtime.ort_provider);
     let device_id = runtime.ort_device_id.max(0);
     let gpu_mem_limit_mb = runtime.ort_gpu_mem_limit_mb as usize;
-    let gpu_mem_limit_bytes = if gpu_mem_limit_mb == 0 {
+    let gpu_mem_limit_bytes = if runtime.cuda_ws || gpu_mem_limit_mb == 0 {
         None
     } else {
         Some(gpu_mem_limit_mb.saturating_mul(1024 * 1024))
@@ -2129,7 +2129,7 @@ fn resolve_cuda_conv_algorithm(raw: &str) -> ep::cuda::ConvAlgorithmSearch {
 fn resolve_ort_cuda_tuning(runtime: &RuntimeConfig) -> OrtCudaTuning {
     OrtCudaTuning {
         conv_algo: resolve_cuda_conv_algorithm(&runtime.cuda_conv_algo),
-        conv_max_workspace: runtime.cuda_conv_max_workspace,
+        conv_max_workspace: runtime.cuda_ws,
         conv1d_pad_to_nc1d: runtime.cuda_conv1d_pad_to_nc1d,
         tf32: runtime.cuda_tf32,
     }
@@ -2146,7 +2146,7 @@ fn build_execution_providers(
         }
         if ORT_CUDA_TUNE_LOGGED.set(()).is_ok() {
             eprintln!(
-                "[vc-inference] cuda ep tuning: conv_algo={:?} conv_max_workspace={} conv1d_pad_to_nc1d={} tf32={} (from RuntimeConfig)",
+                "[vc-inference] cuda ep tuning: conv_algo={:?} cuda_ws={} conv1d_pad_to_nc1d={} tf32={} (from RuntimeConfig)",
                 cuda_tuning.conv_algo,
                 cuda_tuning.conv_max_workspace,
                 cuda_tuning.conv1d_pad_to_nc1d,

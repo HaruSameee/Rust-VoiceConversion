@@ -59,6 +59,9 @@ scripts/*.ckpt
 # ------------------------------------------------------------
 Mangio-RVC-v23.7.0/
 obs-rvc-master/
+debug_input.wav
+debug_output.wav
+debug_*.wav
 
 # ------------------------------------------------------------
 # Logs / env

@@ -137,6 +137,11 @@
               <p class="hint">上げるとバッファ余裕が増え途切れが減りますが、遅延は増えます。</p>
             </div>
             <div class="field">
+              <label for="targetBufferMs">Playback Buffer（ms）</label>
+              <input id="targetBufferMs" type="number" step="100" min="500" max="5000" value="2000" />
+              <p class="hint">再生キュー長。大きいほど安定（高遅延）、小さいほど低遅延（不安定化しやすい）。</p>
+            </div>
+            <div class="field">
               <label for="responseThreshold">反応しきい値（dBFS または線形）</label>
               <input id="responseThreshold" type="number" step="0.001" min="-90" />
               <p class="hint">負値は dBFS（例: -50）。上げすぎると語頭/語尾が切れやすくなります。</p>
@@ -152,9 +157,21 @@
               <p class="hint">大きいほど自然に消えますが、語尾が伸びることがあります。</p>
             </div>
             <div class="field">
+              <label for="solaSearchMs">SOLA Search（ms）</label>
+              <input id="solaSearchMs" type="number" step="1" min="1" />
+              <p class="hint">SOLA探索幅。48kHzでは 10ms=480 / 20ms=960 / 40ms=1920 サンプル。</p>
+            </div>
+            <div class="field">
               <label for="outputTailOffsetMs">出力末尾オフセット（ms）</label>
               <input id="outputTailOffsetMs" type="number" step="1" min="0" />
               <p class="hint">デコーダ出力の末尾から何ms手前を採用するか。0で自動（エッジガード）。</p>
+            </div>
+            <div class="field">
+              <label for="recordDump">
+                <input id="recordDump" type="checkbox" />
+                録音ダンプ（debug_input.wav / debug_output.wav）
+              </label>
+              <p class="hint">停止時にデバッグ用WAVを書き出します（同期検証用）。</p>
             </div>
           </div>
         </section>
@@ -199,6 +216,28 @@
               <label for="ortGpuMemLimitMb">GPU VRAM上限（MB / 0で無制限）</label>
               <input id="ortGpuMemLimitMb" type="number" step="128" min="0" />
               <p class="hint">他アプリ併用時に有効です。低すぎると初期化失敗します。</p>
+            </div>
+            <div class="field">
+              <label for="cudaConvAlgo">CUDA conv algorithm</label>
+              <select id="cudaConvAlgo">
+                <option value="default">default</option>
+                <option value="exhaustive">exhaustive</option>
+              </select>
+              <p class="hint">GTX 10xxでは `exhaustive` が有効な場合があります（初回ウォームアップは重くなります）。</p>
+            </div>
+            <div class="field">
+              <label for="cudaWs">
+                <input id="cudaWs" type="checkbox" />
+                CUDA workspace を有効化（`cuda_ws`）
+              </label>
+              <p class="hint">ONで VRAM 上限を 0（無制限）として扱います。</p>
+            </div>
+            <div class="field">
+              <label for="cudaTf32">
+                <input id="cudaTf32" type="checkbox" />
+                TF32 を有効化（`cuda_tf32`）
+              </label>
+              <p class="hint">主に RTX/Ampere 以降向け。GTX 10xx では通常OFF推奨です。</p>
             </div>
             <div class="field">
               <label for="ortIntraThreads">ORT intra threads（0=auto）</label>

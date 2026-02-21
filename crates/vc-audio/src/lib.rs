@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
         Arc,
     },
@@ -18,7 +18,6 @@ use vc_signal::{resample_hq_into, HqResampler};
 const MIN_INFERENCE_BLOCK: usize = 8_192;
 const MIN_OUTPUT_CROSSFADE_SAMPLES: usize = 256;
 const MAX_OUTPUT_CROSSFADE_SAMPLES: usize = 1_024;
-const SOLA_SEARCH_MS: f32 = 10.0;
 const OLA_MIN_OVERLAP_RATIO: f32 = 0.25;
 const OLA_MAX_OVERLAP_RATIO: f32 = 0.50;
 const OUTPUT_SLICE_AUDIT_BLOCKS: u64 = 30;
@@ -26,6 +25,7 @@ const FRAME_GRID_SEC: f64 = 0.02; // 20ms per frame
 const INPUT_DC_BLOCK_COEFF: f32 = 0.995;
 const DEFAULT_DECODER_NEW_AUDIO_OFFSET_SAMPLES: usize = 31_680;
 const FIXED_PROCESS_WINDOW_SAMPLES: usize = 48_000;
+const DEBUG_DUMP_MAX_SECONDS: usize = 20;
 
 /// Returns the minimum `extra_inference_ms` value that avoids buffer deadlock.
 ///
@@ -42,6 +42,16 @@ pub fn min_extra_inference_ms(process_window: usize, block_size: usize, sample_r
     }
     let ms_per_sample = 1000.0 / sample_rate as f64;
     (samples_needed as f64 * ms_per_sample).ceil() as u32
+}
+
+/// Converts `target_buffer_ms` into samples at a given sample-rate.
+pub fn target_buffer_samples_from_ms(target_buffer_ms: u32, sample_rate: u32) -> usize {
+    if sample_rate == 0 {
+        return 0;
+    }
+    (target_buffer_ms as usize)
+        .saturating_mul(sample_rate as usize)
+        .saturating_div(1000)
 }
 
 /// Validates that the audio buffer sizing is physically consistent.
@@ -123,21 +133,23 @@ pub struct AudioStreamOptions {
     /// The backend now allocates the requested process window directly.
     /// Dynamic auto-grow/shrink behavior is no longer used.
     pub allow_process_window_grow: bool,
-    /// Milliseconds of audio buffered ahead of inference.
+    /// Legacy inference overlap tuning (milliseconds).
     ///
-    /// Must satisfy:
-    ///   extra_inference_ms >= ceil((process_window - block_size) / (sr / 1000))
-    ///
-    /// With process_window=1.0s, block_size=8192, sr=48000:
-    ///   process_window = 48000, minimum = 830ms
-    ///
-    /// Recommended = minimum + actual_inference_ms + 20ms jitter margin.
+    /// This value is used for overlap/fade heuristics in post-processing.
+    /// Playback queue sizing is controlled by `target_buffer_ms`.
     pub extra_inference_ms: u32,
+    /// Playback/output queue target size in milliseconds.
+    ///
+    /// Larger values increase stability and latency.
+    /// This is independent from the model context window (`process_window`).
+    pub target_buffer_ms: u32,
     pub response_threshold: f32,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
+    pub sola_search_ms: u32,
     pub output_tail_offset_ms: u32,
     pub output_slice_offset_samples: usize,
+    pub record_dump: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -220,15 +232,18 @@ where
     let requested_block_size = options.block_size.max(1);
     let _allow_process_window_grow = options.allow_process_window_grow;
     let extra_inference_ms = options.extra_inference_ms;
+    let target_buffer_ms = options.target_buffer_ms.max(1);
     let response_threshold = normalize_response_threshold(options.response_threshold);
     let fade_in_ms = options.fade_in_ms;
     let fade_out_ms = options.fade_out_ms;
+    let sola_search_ms = options.sola_search_ms.max(1);
     let output_tail_offset_ms = options.output_tail_offset_ms;
     let output_slice_offset_samples = if options.output_slice_offset_samples == 0 {
         DEFAULT_DECODER_NEW_AUDIO_OFFSET_SAMPLES
     } else {
         options.output_slice_offset_samples
     };
+    let record_dump = options.record_dump;
 
     let input_device = find_input_device(&host, options.input_device_name.as_deref())?;
     let output_device = find_output_device(&host, options.output_device_name.as_deref())?;
@@ -249,7 +264,7 @@ where
     let output_rate = output_stream_config.sample_rate.0;
     let input_channels = input_stream_config.channels as usize;
     let output_channels = output_stream_config.channels as usize;
-    let sola_search_output = sola_search_samples(output_rate);
+    let sola_search_output = sola_search_samples(output_rate, sola_search_ms);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
     let warmup_inference_block_size = requested_block_size
@@ -267,15 +282,18 @@ where
         requested_block_size
     );
     eprintln!(
-        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} tail_offset_ms={} slice_offset_samples={}",
+        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} record_dump={}",
         input_device.name().unwrap_or_else(|_| "unknown-input".to_string()),
         output_device.name().unwrap_or_else(|_| "unknown-output".to_string()),
         extra_inference_ms,
+        target_buffer_ms,
         response_threshold,
         fade_in_ms,
         fade_out_ms,
+        sola_search_ms,
         output_tail_offset_ms,
-        output_slice_offset_samples
+        output_slice_offset_samples,
+        record_dump
     );
     // Warm up the model before starting audio streams to avoid first-block stalls
     // (notably large on GPU providers like DirectML during graph compilation).
@@ -327,35 +345,41 @@ where
             process_window_samples
         ));
     }
-    let effective_extra_inference_ms = extra_inference_ms;
-    let effective_extra_samples = (effective_extra_inference_ms as usize)
-        .saturating_mul(model_sample_rate as usize)
-        .saturating_div(1000);
-    let target_buffer_samples = block_size.saturating_add(effective_extra_samples);
-    if process_window_samples != target_buffer_samples {
-        eprintln!(
-            "[vc-audio] process_window fixed: requested={} using={} (fixed model context)",
-            target_buffer_samples, process_window_samples
-        );
-    }
-    let min_extra_ms =
-        min_extra_inference_ms(process_window_samples, block_size, model_sample_rate);
-    let headroom_samples = target_buffer_samples.saturating_sub(process_window_samples);
-    let sr_per_ms = model_sample_rate as f64 / 1000.0;
+    let requested_target_buffer_out_samples =
+        target_buffer_samples_from_ms(target_buffer_ms, output_rate).max(1);
+    let requested_target_buffer_model_samples = map_output_samples_to_model(
+        requested_target_buffer_out_samples,
+        model_sample_rate,
+        output_rate,
+    );
+    let min_target_buffer_model_samples = process_window_samples.saturating_add(block_size);
+    let target_buffer_samples =
+        requested_target_buffer_model_samples.max(min_target_buffer_model_samples);
+    let target_buffer_out_samples =
+        map_model_samples_to_output(target_buffer_samples, model_sample_rate, output_rate);
+    let target_buffer_effective_ms = if output_rate > 0 {
+        (target_buffer_out_samples as f64) * 1000.0 / output_rate as f64
+    } else {
+        0.0
+    };
+    let headroom_samples =
+        target_buffer_samples.saturating_sub(process_window_samples.saturating_add(block_size));
+    let sr_per_ms = model_sample_rate.max(1) as f64 / 1000.0;
     let headroom_ms = if sr_per_ms > 0.0 {
         headroom_samples as f64 / sr_per_ms
     } else {
         0.0
     };
     eprintln!(
-        "[vc-audio] buffer_geometry: block={}smp process_window={}smp target_buffer={}smp extra_ms={}ms headroom={}smp ({:.1}ms) min_extra_ms={}ms",
+        "[vc-audio] buffer_geometry: block={}smp process_window={}smp target_buffer={}smp (~{:.1}ms) independent requested_target_ms={} floor={}smp headroom={}smp ({:.1}ms)",
         block_size,
         process_window_samples,
         target_buffer_samples,
-        effective_extra_inference_ms,
+        target_buffer_effective_ms,
+        target_buffer_ms,
+        min_target_buffer_model_samples,
         headroom_samples,
-        headroom_ms,
-        min_extra_ms
+        headroom_ms
     );
     let needed_input_frames = ((target_buffer_samples as f64) * (input_rate as f64)
         / (model_sample_rate as f64))
@@ -387,8 +411,16 @@ where
     let running = Arc::new(AtomicBool::new(true));
     let input_rms = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
     let input_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+    let playback_ready = Arc::new(AtomicBool::new(false));
+    let queued_output_samples = Arc::new(AtomicUsize::new(0));
 
-    let output_data_fn = build_output_callback(Arc::clone(&running), output_rx);
+    let output_data_fn = build_output_callback(
+        Arc::clone(&running),
+        output_rx,
+        Arc::clone(&playback_ready),
+        Arc::clone(&queued_output_samples),
+        output_channels,
+    );
     let input_stream = match input_sample_format {
         cpal::SampleFormat::F32 => input_device.build_input_stream(
             &input_stream_config,
@@ -436,6 +468,8 @@ where
     let running_worker = Arc::clone(&running);
     let input_rms_worker = Arc::clone(&input_rms);
     let input_peak_worker = Arc::clone(&input_peak);
+    let playback_ready_worker = Arc::clone(&playback_ready);
+    let queued_output_samples_worker = Arc::clone(&queued_output_samples);
     let (worker_control_tx, worker_control_rx) = sync_channel::<WorkerControl>(1);
     let (worker_shutdown_ack_tx, worker_shutdown_ack_rx) = sync_channel::<()>(1);
     let worker_thread = thread::spawn(move || {
@@ -451,16 +485,21 @@ where
             input_rate,
             output_rate,
             output_channels,
-            effective_extra_inference_ms,
+            extra_inference_ms,
+            target_buffer_samples,
             response_threshold,
             fade_in_ms,
             fade_out_ms,
+            sola_search_ms,
             output_tail_offset_ms,
             output_slice_offset_samples,
+            record_dump,
             process_window_samples,
             &running_worker,
             &input_rms_worker,
             &input_peak_worker,
+            &playback_ready_worker,
+            &queued_output_samples_worker,
             &mut level_meter,
         );
     });
@@ -600,6 +639,9 @@ where
 fn build_output_callback(
     running: Arc<AtomicBool>,
     output_rx: Receiver<Vec<f32>>,
+    playback_ready: Arc<AtomicBool>,
+    queued_output_samples: Arc<AtomicUsize>,
+    output_channels: usize,
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut pending = VecDeque::<f32>::new();
     let mut underruns = 0usize;
@@ -624,11 +666,19 @@ fn build_output_callback(
             }
         }
 
+        if !playback_ready.load(Ordering::Acquire) {
+            data.fill(0.0);
+            return;
+        }
+
+        let channels = output_channels.max(1);
+        let mut consumed_interleaved = 0usize;
         let mut callback_underrun = false;
         for sample in data {
             if let Some(v) = pending.pop_front() {
                 *sample = v;
                 last_sample = v;
+                consumed_interleaved += 1;
             } else {
                 // Smoothly decay towards silence to avoid periodic clicks/tones on underrun.
                 last_sample *= 0.995;
@@ -645,7 +695,43 @@ fn build_output_callback(
                 eprintln!("[vc-audio] output underrun callbacks={underruns}");
             }
         }
+        let consumed_output_samples = consumed_interleaved / channels;
+        atomic_saturating_sub(&queued_output_samples, consumed_output_samples);
     }
+}
+
+fn atomic_saturating_sub(cell: &AtomicUsize, by: usize) {
+    if by == 0 {
+        return;
+    }
+    let _ = cell.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+        Some(cur.saturating_sub(by))
+    });
+}
+
+fn append_samples_limited(dst: &mut Vec<f32>, src: &[f32], limit: usize) {
+    if src.is_empty() || dst.len() >= limit {
+        return;
+    }
+    let remaining = limit.saturating_sub(dst.len());
+    let take = remaining.min(src.len());
+    dst.extend_from_slice(&src[..take]);
+}
+
+fn write_debug_wav_i16(path: &str, sample_rate: u32, samples: &[f32]) -> Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: sample_rate.max(1),
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    for &sample in samples {
+        let s = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+        writer.write_sample(s)?;
+    }
+    writer.finalize()?;
+    Ok(())
 }
 
 fn resolve_output_tail_offset_samples(
@@ -675,28 +761,30 @@ fn worker_loop<E>(
     output_rate: u32,
     output_channels: usize,
     extra_inference_ms: u32,
+    configured_target_buffer_samples: usize,
     response_threshold: f32,
     fade_in_ms: u32,
     fade_out_ms: u32,
+    sola_search_ms: u32,
     output_tail_offset_ms: u32,
     output_slice_offset_samples: usize,
+    record_dump: bool,
     configured_process_window_samples: usize,
     running: &Arc<AtomicBool>,
     input_rms: &Arc<AtomicU32>,
     input_peak: &Arc<AtomicU32>,
+    playback_ready: &Arc<AtomicBool>,
+    queued_output_samples: &Arc<AtomicUsize>,
     level_meter: &mut LevelMeter,
 ) where
     E: InferenceEngine,
 {
     let mut shutdown_prepared = false;
-    let extra_samples = (extra_inference_ms as usize)
-        .saturating_mul(model_sample_rate as usize)
-        .saturating_div(1000);
     let io_block_size = block_size.max(1);
     let output_step_samples =
         map_model_samples_to_output(io_block_size, model_sample_rate, output_rate);
     let crossfade_samples = default_output_crossfade_samples(output_rate).min(output_step_samples);
-    let sola_search_output = sola_search_samples(output_rate);
+    let sola_search_output = sola_search_samples(output_rate, sola_search_ms);
     let edge_guard_samples = crossfade_samples.max(sola_search_output / 2);
     let output_tail_offset_samples =
         resolve_output_tail_offset_samples(output_rate, edge_guard_samples, output_tail_offset_ms);
@@ -705,8 +793,11 @@ fn worker_loop<E>(
     let inference_block_size = io_block_size
         .max(MIN_INFERENCE_BLOCK)
         .saturating_add(sola_search_model);
-    let target_buffer_samples = io_block_size.saturating_add(extra_samples);
     let process_window_samples = configured_process_window_samples;
+    let target_buffer_samples = configured_target_buffer_samples.max(process_window_samples);
+    let prefill_target_samples =
+        map_model_samples_to_output(target_buffer_samples, model_sample_rate, output_rate)
+            .max(output_step_samples);
     let process_window_cap = process_window_samples;
     let mut smoothed_elapsed_ms = 0.0_f64;
     let mut model_rate_buf = Vec::<f32>::new();
@@ -733,6 +824,25 @@ fn worker_loop<E>(
         fade_out_ms,
         model_sample_rate,
     );
+    let max_recorded_in_samples = (input_rate as usize).saturating_mul(DEBUG_DUMP_MAX_SECONDS);
+    let max_recorded_out_samples = (output_rate as usize).saturating_mul(DEBUG_DUMP_MAX_SECONDS);
+    let mut recorded_in = record_dump.then(Vec::new);
+    let mut recorded_out = record_dump.then(Vec::new);
+    playback_ready.store(false, Ordering::Release);
+    queued_output_samples.store(0, Ordering::Release);
+    eprintln!(
+        "[vc-audio] startup: target_buffer={}smp ({:.0}ms) prefill={}smp ({:.0}ms) block={}smp",
+        target_buffer_samples,
+        target_buffer_samples as f64 / model_sample_rate.max(1) as f64 * 1000.0,
+        prefill_target_samples,
+        prefill_target_samples as f64 / output_rate.max(1) as f64 * 1000.0,
+        io_block_size
+    );
+    eprintln!(
+        "[vc-audio] pre-fill: waiting for queue={}smp ({}ms) before playback",
+        prefill_target_samples,
+        (prefill_target_samples as u64).saturating_mul(1000) / output_rate.max(1) as u64
+    );
     eprintln!(
         "[vc-audio] inference_block_size={} io_block_size={} target_buffer_samples={} process_window_samples={} block_budget_ms={:.2} sola_search_out={} edge_guard_out={}",
         inference_block_size,
@@ -752,23 +862,10 @@ fn worker_loop<E>(
     );
     if process_window_samples != target_buffer_samples {
         eprintln!(
-            "[vc-audio] process_window fixed: requested={} using={} (fixed model context)",
-            target_buffer_samples, process_window_samples
+            "[vc-audio] target_buffer independent: process_window={} target_buffer={}",
+            process_window_samples, target_buffer_samples
         );
     }
-    // Prime output queue to cover startup buffering and first inference warm-up.
-    let prefill_target_samples = target_buffer_samples.max(process_window_samples);
-    let prefill_model_samples = if model_sample_rate != output_rate {
-        ((prefill_target_samples.saturating_add(io_block_size) as f64) * output_rate as f64
-            / model_sample_rate as f64)
-            .round()
-            .max(1.0) as usize
-    } else {
-        prefill_target_samples.saturating_add(io_block_size)
-    };
-    let prefill_frames = prefill_model_samples * output_channels * 2;
-    let _ = output_tx.try_send(vec![0.0; prefill_frames]);
-
     while running.load(Ordering::Relaxed) {
         if !shutdown_prepared {
             match worker_control_rx.try_recv() {
@@ -791,6 +888,9 @@ fn worker_loop<E>(
                 break;
             }
         };
+        if let Some(samples) = recorded_in.as_mut() {
+            append_samples_limited(samples, &mono, max_recorded_in_samples);
+        }
         if response_threshold > 0.0 {
             gate.process_block(&mut mono);
         }
@@ -803,10 +903,13 @@ fn worker_loop<E>(
         }
 
         while model_input_queue.len() >= process_window_samples {
+            let queue_len = model_input_queue.len();
+            let window_start = queue_len.saturating_sub(process_window_samples);
             model_block.clear();
             model_block.extend(
                 model_input_queue
                     .iter()
+                    .skip(window_start)
                     .take(process_window_samples)
                     .copied(),
             );
@@ -931,14 +1034,20 @@ fn worker_loop<E>(
                 previous_output_tail
                     .extend_from_slice(&smoothed_output[smoothed_output.len() - keep..]);
             }
+            if let Some(samples) = recorded_out.as_mut() {
+                append_samples_limited(samples, &smoothed_output, max_recorded_out_samples);
+            }
 
             level_meter.push_block(&smoothed_output);
             input_rms.store(level_meter.rms().to_bits(), Ordering::Relaxed);
             input_peak.store(level_meter.peak().to_bits(), Ordering::Relaxed);
 
             let output_interleaved = upmix_from_mono(&smoothed_output, output_channels);
+            let produced_output_samples = smoothed_output.len();
             match output_tx.try_send(output_interleaved) {
-                Ok(()) => {}
+                Ok(()) => {
+                    queued_output_samples.fetch_add(produced_output_samples, Ordering::AcqRel);
+                }
                 Err(TrySendError::Full(_)) => {
                     eprintln!("[vc-audio] output queue full");
                 }
@@ -948,9 +1057,25 @@ fn worker_loop<E>(
                     break;
                 }
             }
+            if !playback_ready.load(Ordering::Acquire) {
+                let queued = queued_output_samples.load(Ordering::Acquire);
+                eprintln!(
+                    "[vc-audio] pre-fill progress: queue={}smp / {}smp",
+                    queued.min(prefill_target_samples),
+                    prefill_target_samples
+                );
+                if queued >= prefill_target_samples {
+                    playback_ready.store(true, Ordering::Release);
+                    eprintln!(
+                        "[vc-audio] pre-fill complete: queue={}smp playback starting",
+                        queued
+                    );
+                }
+            }
 
             processed_blocks += 1;
-            for _ in 0..io_block_size {
+            let keep_samples = process_window_samples.saturating_sub(io_block_size);
+            while model_input_queue.len() > keep_samples {
                 let _ = model_input_queue.pop_front();
             }
             let elapsed = start.elapsed();
@@ -969,7 +1094,7 @@ fn worker_loop<E>(
                     model_input_queue.len()
                 );
             }
-            let queue_ms =
+            let input_queue_ms =
                 model_input_queue.len() as f64 / model_sample_rate.max(1) as f64 * 1000.0;
             let expected_steady_queue = process_window_samples.saturating_sub(io_block_size);
             if model_input_queue.len() + 64 < expected_steady_queue
@@ -978,19 +1103,24 @@ fn worker_loop<E>(
                 eprintln!(
                     "[vc-audio] low input queue headroom: queue={} (~{:.2}ms) expected_steady={} (~{:.2}ms)",
                     model_input_queue.len(),
-                    queue_ms,
+                    input_queue_ms,
                     expected_steady_queue,
                     expected_steady_queue as f64 / model_sample_rate.max(1) as f64 * 1000.0
                 );
                 last_low_queue_warn = Instant::now();
             }
             if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+                let queued = queued_output_samples.load(Ordering::Relaxed);
+                let queue_ms = queued as f64 / output_rate.max(1) as f64 * 1000.0;
+                let prefill_now = queued.min(prefill_target_samples);
                 eprintln!(
-                    "[vc-audio] heartbeat blocks={} queue={} queue_ms={:.2} budget_ms={:.2} rms={:.4} peak={:.4} silence_skips={}",
+                    "[vc-audio] heartbeat blocks={} queue={} queue_ms={:.2} budget_ms={:.2} prefill={}/{} rms={:.4} peak={:.4} silence_skips={}",
                     processed_blocks,
-                    model_input_queue.len(),
+                    queued,
                     queue_ms,
                     budget_ms,
+                    prefill_now,
+                    prefill_target_samples,
                     level_meter.rms(),
                     level_meter.peak(),
                     silence_skips
@@ -1004,6 +1134,34 @@ fn worker_loop<E>(
             eprintln!("[vc-audio] warning: inference shutdown hook failed: {e}");
         }
         let _ = worker_shutdown_ack_tx.try_send(());
+    }
+    if record_dump {
+        let input_len = recorded_in.as_ref().map_or(0, |v| v.len());
+        let output_len = recorded_out.as_ref().map_or(0, |v| v.len());
+        eprintln!(
+            "[vc-audio] dump summary: input_samples={} output_samples={} max_seconds={}",
+            input_len, output_len, DEBUG_DUMP_MAX_SECONDS
+        );
+        if let Some(samples) = recorded_in.as_ref() {
+            if let Err(err) = write_debug_wav_i16("debug_input.wav", input_rate, samples) {
+                eprintln!("[vc-audio] warning: failed to write debug_input.wav: {err}");
+            } else {
+                eprintln!(
+                    "[vc-audio] wrote debug_input.wav ({} samples)",
+                    samples.len()
+                );
+            }
+        }
+        if let Some(samples) = recorded_out.as_ref() {
+            if let Err(err) = write_debug_wav_i16("debug_output.wav", output_rate, samples) {
+                eprintln!("[vc-audio] warning: failed to write debug_output.wav: {err}");
+            } else {
+                eprintln!(
+                    "[vc-audio] wrote debug_output.wav ({} samples)",
+                    samples.len()
+                );
+            }
+        }
     }
     eprintln!("[vc-audio] worker loop stopped");
 }
@@ -1130,10 +1288,11 @@ fn map_output_samples_to_model(output_samples: usize, model_rate: u32, output_ra
         .max(1.0) as usize
 }
 
-fn sola_search_samples(output_rate: u32) -> usize {
-    ((output_rate as f32) * (SOLA_SEARCH_MS / 1000.0))
+fn sola_search_samples(output_rate: u32, sola_search_ms: u32) -> usize {
+    let ms = sola_search_ms.max(1);
+    ((output_rate as f32) * (ms as f32 / 1000.0))
         .round()
-        .clamp(128.0, 1_024.0) as usize
+        .clamp(128.0, 4_096.0) as usize
 }
 
 fn default_output_crossfade_samples(output_rate: u32) -> usize {
@@ -1510,11 +1669,17 @@ mod tests {
 
     #[test]
     fn test_target_buffer_geometry_from_runtime_request() {
-        let block_size = 32_768usize;
-        let extra_ms = 1_400usize;
-        let sample_rate = 48_000usize;
-        let target_buffer = block_size + (extra_ms * sample_rate / 1000);
-        assert_eq!(target_buffer, 99_968);
+        assert_eq!(target_buffer_samples_from_ms(2_000, 48_000), 96_000);
+        assert_eq!(target_buffer_samples_from_ms(500, 48_000), 24_000);
+    }
+
+    #[test]
+    fn test_target_buffer_floor_from_process_window_plus_block() {
+        let process_window = 48_000usize;
+        let block = 24_000usize;
+        let requested = target_buffer_samples_from_ms(1_000, 48_000); // 48_000
+        let effective = requested.max(process_window + block);
+        assert_eq!(effective, 72_000);
     }
 
     #[test]

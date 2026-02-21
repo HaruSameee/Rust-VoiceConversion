@@ -135,6 +135,48 @@ select:focus {
   box-shadow: 0 0 0 2px rgba(56, 212, 255, 0.2);
 }
 
+.field-inline {
+  align-self: end;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+  color: var(--text);
+}
+
+.checkbox-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  border-radius: 4px;
+  accent-color: var(--accent-2);
+}
+
+/* Backward-compatible checkbox layout for GPU section ids. */
+label[for="cudaWs"],
+label[for="cudaTf32"] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+  color: var(--text);
+}
+
+#cudaWs,
+#cudaTf32 {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  border-radius: 4px;
+  accent-color: var(--accent-2);
+  flex: 0 0 16px;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

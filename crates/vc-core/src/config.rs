@@ -25,21 +25,26 @@ pub struct RuntimeConfig {
     pub pitch_smooth_alpha: f32,
     pub rms_mix_rate: f32,
     pub f0_median_filter_radius: usize,
-    /// Milliseconds of audio buffered ahead of inference.
+    /// Legacy overlap tuning (ms).
     ///
-    /// # Physical Constraint
-    /// Must satisfy:
-    ///   extra_inference_ms >= ceil((process_window - block_size) / (sr / 1000))
-    ///
-    /// For process_window=16000, block_size=8192, sr=48000:
-    ///   minimum = 163ms
-    ///
-    /// Recommended = minimum + actual_inference_ms + 20ms jitter margin.
-    /// Default 250ms assumes ~60ms inference latency.
+    /// Used by post-processing overlap/fade heuristics.
+    /// Playback queue depth is configured by `target_buffer_ms`.
     pub extra_inference_ms: u32,
+    /// Playback/output queue target size in milliseconds.
+    ///
+    /// Larger values improve underrun resistance at the cost of latency.
+    /// This is independent from `process_window` (model context window).
+    pub target_buffer_ms: u32,
     pub response_threshold: f32,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
+    /// SOLA search range in milliseconds (output sample-rate domain).
+    ///
+    /// 48kHz reference:
+    /// - 10ms = 480 samples
+    /// - 20ms = 960 samples
+    /// - 40ms = 1920 samples
+    pub sola_search_ms: u32,
     /// Extra right-edge safety offset (ms) when slicing decoder output tails.
     ///
     /// 0 means "disable right-edge trimming".
@@ -49,6 +54,11 @@ pub struct RuntimeConfig {
     /// For 48kHz/100-frame decoder outputs, a practical initial value is 31680.
     /// 0 means "use engine default".
     pub output_slice_offset_samples: usize,
+    /// Enables debug WAV dump output from `vc-audio`.
+    ///
+    /// When true, the engine writes synchronized input/output WAV files
+    /// (`debug_input.wav`, `debug_output.wav`) on shutdown.
+    pub record_dump: bool,
     pub speaker_id: i64,
     pub sample_rate: u32,
     pub block_size: usize,
@@ -64,7 +74,11 @@ pub struct RuntimeConfig {
     pub hubert_output_layer: i64,
     pub hubert_upsample_factor: usize,
     pub cuda_conv_algo: String,
-    pub cuda_conv_max_workspace: bool,
+    /// Enables CUDA EP max-workspace conv path.
+    ///
+    /// When true, inference code treats GPU memory limit as unlimited (0).
+    #[serde(alias = "cuda_conv_max_workspace")]
+    pub cuda_ws: bool,
     pub cuda_conv1d_pad_to_nc1d: bool,
     pub cuda_tf32: bool,
     pub index_bin_dim: usize,
@@ -89,11 +103,14 @@ impl Default for RuntimeConfig {
             rms_mix_rate: 0.2,
             f0_median_filter_radius: 3,
             extra_inference_ms: 250,
+            target_buffer_ms: 2_000,
             response_threshold: 0.0,
             fade_in_ms: 12,
             fade_out_ms: 120,
+            sola_search_ms: 10,
             output_tail_offset_ms: 0,
             output_slice_offset_samples: 31_680,
+            record_dump: false,
             speaker_id: 0,
             sample_rate: 48_000,
             block_size: 8_192,
@@ -107,7 +124,7 @@ impl Default for RuntimeConfig {
             hubert_output_layer: 12,
             hubert_upsample_factor: 2,
             cuda_conv_algo: "default".to_string(),
-            cuda_conv_max_workspace: false,
+            cuda_ws: false,
             cuda_conv1d_pad_to_nc1d: false,
             cuda_tf32: false,
             index_bin_dim: 768,
