@@ -922,183 +922,191 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
 impl InferenceEngine for RvcOrtEngine {
     fn infer_frame(&mut self, frame: &[f32], config: &RuntimeConfig) -> Result<Vec<f32>> {
         let mut infer = || -> Result<Vec<f32>> {
-            let waveform = frame.to_vec();
-            let hop_input_len = config.block_size.max(1).min(waveform.len());
-            let hop_input_start = waveform.len().saturating_sub(hop_input_len);
-            let hop_input = &waveform[hop_input_start..];
-            let target_hop_samples_16k =
-                estimate_hop_samples_16k(config.block_size.max(1), config.sample_rate.max(1));
-            if target_hop_samples_16k != self.hop_samples_16k {
-                let context_samples =
-                    STRICT_ONNX_INPUT_SAMPLES_16K.saturating_sub(target_hop_samples_16k);
-                eprintln!(
-                    "[vc-inference] sliding_window hop sync: hop={}smp context={}smp @ 16kHz (block_size={} sr={})",
-                    target_hop_samples_16k,
-                    context_samples,
-                    config.block_size,
-                    config.sample_rate
-                );
-            }
-            let (mut hubert_source_16k, mut rmvpe_source_16k) = self.prepare_inference_inputs_16k(
-                hop_input,
-                config.sample_rate,
-                target_hop_samples_16k,
-            )?;
-            if hubert_source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
-                return Err(VcError::Inference(format!(
-                    "strict HuBERT source length mismatch: got={}, expected={}",
-                    hubert_source_16k.len(),
-                    STRICT_ONNX_INPUT_SAMPLES_16K
-                )));
-            }
-            if rmvpe_source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
-                return Err(VcError::Inference(format!(
-                    "strict RMVPE source length mismatch: got={}, expected={}",
-                    rmvpe_source_16k.len(),
-                    STRICT_ONNX_INPUT_SAMPLES_16K
-                )));
-            }
-            let hubert_norm_stats = normalize_for_onnx_input(&mut hubert_source_16k);
-            let rmvpe_norm_stats = normalize_for_onnx_input(&mut rmvpe_source_16k);
-            if tensor_stats_enabled() {
-                eprintln!(
-                    "[vc-inference] stats source_16k_norm_hubert: rms_before={:.6e} peak_before={:.6e} rms_after={:.6e} peak_after={:.6e} gain={:.6e}",
-                    hubert_norm_stats.rms_before,
-                    hubert_norm_stats.peak_before,
-                    hubert_norm_stats.rms_after,
-                    hubert_norm_stats.peak_after,
-                    hubert_norm_stats.gain_applied
-                );
-                eprintln!(
-                    "[vc-inference] stats source_16k_norm_rmvpe: rms_before={:.6e} peak_before={:.6e} rms_after={:.6e} peak_after={:.6e} gain={:.6e}",
-                    rmvpe_norm_stats.rms_before,
-                    rmvpe_norm_stats.peak_before,
-                    rmvpe_norm_stats.rms_after,
-                    rmvpe_norm_stats.peak_after,
-                    rmvpe_norm_stats.gain_applied
-                );
-            }
-            let hubert_source_stats = tensor_stats_from_iter(hubert_source_16k.iter().copied());
-            maybe_log_tensor_stats("source_16k_hubert", hubert_source_stats);
-            ensure_tensor_finite("source_16k_hubert", hubert_source_stats)?;
-            let rmvpe_source_stats = tensor_stats_from_iter(rmvpe_source_16k.iter().copied());
-            maybe_log_tensor_stats("source_16k_rmvpe", rmvpe_source_stats);
-            ensure_tensor_finite("source_16k_rmvpe", rmvpe_source_stats)?;
-            let rmvpe_threshold = if config.rmvpe_threshold.is_finite() {
-                config.rmvpe_threshold
-            } else {
-                DEFAULT_RMVPE_THRESHOLD
-            };
-            let finalize_output = |out: &[f32]| -> Result<Vec<f32>> {
-                let out_stats = tensor_stats_from_iter(out.iter().copied());
-                maybe_log_tensor_stats("rvc_wave", out_stats);
-                ensure_tensor_finite("rvc_wave", out_stats)?;
-                let mixed = apply_rms_mix(&waveform, out, config.rms_mix_rate, config.sample_rate);
-                let mixed_stats = tensor_stats_from_iter(mixed.iter().copied());
-                maybe_log_tensor_stats("mixed_wave", mixed_stats);
-                ensure_tensor_finite("mixed_wave", mixed_stats)?;
-                let processed = postprocess_generated_audio(&mixed);
-                let post_stats = tensor_stats_from_iter(processed.iter().copied());
-                maybe_log_tensor_stats("post_wave", post_stats);
-                ensure_tensor_finite("post_wave", post_stats)?;
-                // Return decoder output as-is; vc-audio slices the latest region.
-                Ok(processed)
-            };
-            let zero_copy_result = if let Some(engine) = self.zero_copy_engine.as_ref() {
-                let run = engine
-                    .lock()
-                    .map_err(|_| VcError::Inference("zero-copy engine mutex poisoned".to_string()))
-                    .and_then(|mut guard| {
-                        guard.run(
-                            &hubert_source_16k,
-                            &rmvpe_source_16k,
-                            config.speaker_id,
-                            rmvpe_threshold,
-                        )
-                    });
-                Some(run)
-            } else {
-                None
-            };
-            if let Some(result) = zero_copy_result {
-                match result {
-                    Ok(out) => return finalize_output(&out),
+            let mut infer_hop = |hop_input: &[f32]| -> Result<Vec<f32>> {
+                let waveform = hop_input.to_vec();
+                let target_hop_samples_16k =
+                    estimate_hop_samples_16k(hop_input.len().max(1), config.sample_rate.max(1));
+                if target_hop_samples_16k != self.hop_samples_16k {
+                    let context_samples =
+                        STRICT_ONNX_INPUT_SAMPLES_16K.saturating_sub(target_hop_samples_16k);
+                    eprintln!(
+                        "[vc-inference] sliding_window hop sync: hop={}smp context={}smp @ 16kHz (input_len={} sr={})",
+                        target_hop_samples_16k,
+                        context_samples,
+                        hop_input.len(),
+                        config.sample_rate
+                    );
+                }
+                let (mut hubert_source_16k, mut rmvpe_source_16k) = self
+                    .prepare_inference_inputs_16k(
+                        hop_input,
+                        config.sample_rate,
+                        target_hop_samples_16k,
+                    )?;
+                if hubert_source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
+                    return Err(VcError::Inference(format!(
+                        "strict HuBERT source length mismatch: got={}, expected={}",
+                        hubert_source_16k.len(),
+                        STRICT_ONNX_INPUT_SAMPLES_16K
+                    )));
+                }
+                if rmvpe_source_16k.len() != STRICT_ONNX_INPUT_SAMPLES_16K {
+                    return Err(VcError::Inference(format!(
+                        "strict RMVPE source length mismatch: got={}, expected={}",
+                        rmvpe_source_16k.len(),
+                        STRICT_ONNX_INPUT_SAMPLES_16K
+                    )));
+                }
+                let hubert_norm_stats = normalize_for_onnx_input(&mut hubert_source_16k);
+                let rmvpe_norm_stats = normalize_for_onnx_input(&mut rmvpe_source_16k);
+                if tensor_stats_enabled() {
+                    eprintln!(
+                        "[vc-inference] stats source_16k_norm_hubert: rms_before={:.6e} peak_before={:.6e} rms_after={:.6e} peak_after={:.6e} gain={:.6e}",
+                        hubert_norm_stats.rms_before,
+                        hubert_norm_stats.peak_before,
+                        hubert_norm_stats.rms_after,
+                        hubert_norm_stats.peak_after,
+                        hubert_norm_stats.gain_applied
+                    );
+                    eprintln!(
+                        "[vc-inference] stats source_16k_norm_rmvpe: rms_before={:.6e} peak_before={:.6e} rms_after={:.6e} peak_after={:.6e} gain={:.6e}",
+                        rmvpe_norm_stats.rms_before,
+                        rmvpe_norm_stats.peak_before,
+                        rmvpe_norm_stats.rms_after,
+                        rmvpe_norm_stats.peak_after,
+                        rmvpe_norm_stats.gain_applied
+                    );
+                }
+                let hubert_source_stats = tensor_stats_from_iter(hubert_source_16k.iter().copied());
+                maybe_log_tensor_stats("source_16k_hubert", hubert_source_stats);
+                ensure_tensor_finite("source_16k_hubert", hubert_source_stats)?;
+                let rmvpe_source_stats = tensor_stats_from_iter(rmvpe_source_16k.iter().copied());
+                maybe_log_tensor_stats("source_16k_rmvpe", rmvpe_source_stats);
+                ensure_tensor_finite("source_16k_rmvpe", rmvpe_source_stats)?;
+                let rmvpe_threshold = if config.rmvpe_threshold.is_finite() {
+                    config.rmvpe_threshold
+                } else {
+                    DEFAULT_RMVPE_THRESHOLD
+                };
+                let finalize_output = |out: &[f32]| -> Result<Vec<f32>> {
+                    let out_stats = tensor_stats_from_iter(out.iter().copied());
+                    maybe_log_tensor_stats("rvc_wave", out_stats);
+                    ensure_tensor_finite("rvc_wave", out_stats)?;
+                    let mixed =
+                        apply_rms_mix(&waveform, out, config.rms_mix_rate, config.sample_rate);
+                    let mixed_stats = tensor_stats_from_iter(mixed.iter().copied());
+                    maybe_log_tensor_stats("mixed_wave", mixed_stats);
+                    ensure_tensor_finite("mixed_wave", mixed_stats)?;
+                    let processed = postprocess_generated_audio(&mixed);
+                    let post_stats = tensor_stats_from_iter(processed.iter().copied());
+                    maybe_log_tensor_stats("post_wave", post_stats);
+                    ensure_tensor_finite("post_wave", post_stats)?;
+                    // Return decoder output as-is; vc-audio slices the latest region.
+                    Ok(processed)
+                };
+                let zero_copy_result = if let Some(engine) = self.zero_copy_engine.as_ref() {
+                    let run = engine
+                        .lock()
+                        .map_err(|_| {
+                            VcError::Inference("zero-copy engine mutex poisoned".to_string())
+                        })
+                        .and_then(|mut guard| {
+                            guard.run(
+                                &hubert_source_16k,
+                                &rmvpe_source_16k,
+                                config.speaker_id,
+                                rmvpe_threshold,
+                            )
+                        });
+                    Some(run)
+                } else {
+                    None
+                };
+                if let Some(result) = zero_copy_result {
+                    match result {
+                        Ok(out) => return finalize_output(&out),
+                        Err(err) => {
+                            eprintln!(
+                                "[vc-inference] warning: zero-copy path failed; disabling it for this session. cause={err}"
+                            );
+                            self.zero_copy_engine = None;
+                        }
+                    }
+                }
+                let mut phone = self.extract_phone_features(&hubert_source_16k)?;
+                let f0 = self.estimate_pitch(&rmvpe_source_16k, rmvpe_threshold)?;
+                let mut phone_raw = None;
+                if config.protect < 0.5 {
+                    phone_raw = Some(phone.clone());
+                }
+                self.blend_phone_with_index(&mut phone, config);
+                let frame_count = phone.shape()[1].max(1);
+                if f0.len() != frame_count {
+                    return Err(VcError::Inference(format!(
+                        "strict frame contract mismatch: hubert_frames={} rmvpe_frames={}",
+                        frame_count,
+                        f0.len()
+                    )));
+                }
+                if let Some(raw) = phone_raw.take() {
+                    apply_unvoiced_protect(&mut phone, &raw, &f0, config.protect);
+                }
+
+                let mut pitchf = f0;
+                stabilize_sparse_pitch_track(&mut pitchf);
+                smooth_pitch_track_gaussian_inplace(&mut pitchf, 2);
+                apply_pitch_shift_inplace(&mut pitchf, config.pitch_shift_semitones);
+                let f0_median_radius = config.f0_median_filter_radius;
+                if f0_median_radius > 0 {
+                    median_filter_pitch_track_inplace(&mut pitchf, f0_median_radius);
+                }
+                let pitch_smooth_alpha = if config.pitch_smooth_alpha.is_finite() {
+                    config.pitch_smooth_alpha.max(0.0)
+                } else {
+                    self.default_pitch_smooth_alpha
+                };
+                if pitch_smooth_alpha > 0.0 {
+                    smooth_pitch_track(&mut pitchf, &mut self.last_pitch_hz, pitch_smooth_alpha);
+                }
+                let pitch = coarse_pitch_from_f0(&pitchf);
+                let rnd = self.make_rnd_tensor(frame_count);
+                let wave = Array3::from_shape_vec((1, 1, waveform.len()), waveform.clone())
+                    .map_err(|e| {
+                        VcError::Inference(format!("failed to shape waveform as [1,1,T]: {e}"))
+                    })?;
+
+                let out = match self.run_rvc(
+                    &phone,
+                    &pitchf,
+                    &pitch,
+                    config.speaker_id,
+                    frame_count as i64,
+                    &rnd,
+                    &wave,
+                ) {
+                    Ok(out) => out,
                     Err(err) => {
-                        eprintln!(
-                            "[vc-inference] warning: zero-copy path failed; disabling it for this session. cause={err}"
-                        );
-                        self.zero_copy_engine = None;
+                        if !self.try_rvc_runtime_cpu_fallback(&err)? {
+                            return Err(err);
+                        }
+                        self.run_rvc(
+                            &phone,
+                            &pitchf,
+                            &pitch,
+                            config.speaker_id,
+                            frame_count as i64,
+                            &rnd,
+                            &wave,
+                        )?
                     }
-                }
-            }
-            let mut phone = self.extract_phone_features(&hubert_source_16k)?;
-            let f0 = self.estimate_pitch(&rmvpe_source_16k, rmvpe_threshold)?;
-            let mut phone_raw = None;
-            if config.protect < 0.5 {
-                phone_raw = Some(phone.clone());
-            }
-            self.blend_phone_with_index(&mut phone, config);
-            let frame_count = phone.shape()[1].max(1);
-            if f0.len() != frame_count {
-                return Err(VcError::Inference(format!(
-                    "strict frame contract mismatch: hubert_frames={} rmvpe_frames={}",
-                    frame_count,
-                    f0.len()
-                )));
-            }
-            if let Some(raw) = phone_raw.take() {
-                apply_unvoiced_protect(&mut phone, &raw, &f0, config.protect);
-            }
-
-            let mut pitchf = f0;
-            stabilize_sparse_pitch_track(&mut pitchf);
-            smooth_pitch_track_gaussian_inplace(&mut pitchf, 2);
-            apply_pitch_shift_inplace(&mut pitchf, config.pitch_shift_semitones);
-            let f0_median_radius = config.f0_median_filter_radius;
-            if f0_median_radius > 0 {
-                median_filter_pitch_track_inplace(&mut pitchf, f0_median_radius);
-            }
-            let pitch_smooth_alpha = if config.pitch_smooth_alpha.is_finite() {
-                config.pitch_smooth_alpha.max(0.0)
-            } else {
-                self.default_pitch_smooth_alpha
+                };
+                finalize_output(&out)
             };
-            if pitch_smooth_alpha > 0.0 {
-                smooth_pitch_track(&mut pitchf, &mut self.last_pitch_hz, pitch_smooth_alpha);
-            }
-            let pitch = coarse_pitch_from_f0(&pitchf);
-            let rnd = self.make_rnd_tensor(frame_count);
-            let wave =
-                Array3::from_shape_vec((1, 1, waveform.len()), waveform.clone()).map_err(|e| {
-                    VcError::Inference(format!("failed to shape waveform as [1,1,T]: {e}"))
-                })?;
 
-            let out = match self.run_rvc(
-                &phone,
-                &pitchf,
-                &pitch,
-                config.speaker_id,
-                frame_count as i64,
-                &rnd,
-                &wave,
-            ) {
-                Ok(out) => out,
-                Err(err) => {
-                    if !self.try_rvc_runtime_cpu_fallback(&err)? {
-                        return Err(err);
-                    }
-                    self.run_rvc(
-                        &phone,
-                        &pitchf,
-                        &pitch,
-                        config.speaker_id,
-                        frame_count as i64,
-                        &rnd,
-                        &wave,
-                    )?
-                }
-            };
-            finalize_output(&out)
+            if frame.is_empty() {
+                return Ok(Vec::new());
+            }
+            infer_hop(frame)
         };
         infer()
     }
