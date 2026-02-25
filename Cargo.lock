@@ -4103,6 +4103,7 @@ dependencies = [
 name = "vc-signal"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "ndarray",
  "rustfft",
 ]

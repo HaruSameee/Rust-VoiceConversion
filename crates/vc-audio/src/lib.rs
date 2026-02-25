@@ -22,8 +22,8 @@ const OUTPUT_SLICE_AUDIT_BLOCKS: u64 = 30;
 const FRAME_GRID_SEC: f64 = 0.02; // 20ms per frame
 const INPUT_DC_BLOCK_COEFF: f32 = 0.995;
 const VAD_RECOVERY_FADE_MS: u32 = 5;
-const DEFAULT_DECODER_NEW_AUDIO_OFFSET_SAMPLES: usize = 6_054;
-const FIXED_PROCESS_WINDOW_SAMPLES: usize = 48_000;
+const FIXED_BOUNDARY_MICROFADE_SAMPLES: usize = 32;
+const PROCESS_WINDOW_BLOCK_MULTIPLIER: usize = 2;
 const DEBUG_DUMP_MAX_SECONDS: usize = 20;
 
 /// Legacy helper for minimum `extra_inference_ms` style budgeting.
@@ -134,10 +134,10 @@ pub struct AudioStreamOptions {
     /// Dynamic auto-grow/shrink behavior is no longer used. The runtime keeps
     /// a fixed model context window and manages queue depth independently.
     pub allow_process_window_grow: bool,
-    /// Inference overlap tuning hint (milliseconds).
+    /// Legacy compatibility field (milliseconds).
     ///
-    /// This value is used for overlap/fade heuristics in post-processing.
     /// Playback queue sizing is controlled by `target_buffer_ms`.
+    /// Kept for backward compatibility and diagnostics.
     pub extra_inference_ms: u32,
     /// Playback/output queue target size in milliseconds.
     ///
@@ -150,6 +150,8 @@ pub struct AudioStreamOptions {
     pub sola_search_ms: u32,
     pub output_tail_offset_ms: u32,
     pub output_slice_offset_samples: usize,
+    /// Bypass output slicing and emit full decoder output as-is.
+    pub bypass_slicing: bool,
     /// Enables debug WAV dump output at shutdown.
     pub record_dump: bool,
 }
@@ -241,11 +243,8 @@ where
     let fade_out_ms = options.fade_out_ms;
     let sola_search_ms = options.sola_search_ms.max(1);
     let output_tail_offset_ms = options.output_tail_offset_ms;
-    let output_slice_offset_samples = if options.output_slice_offset_samples == 0 {
-        DEFAULT_DECODER_NEW_AUDIO_OFFSET_SAMPLES
-    } else {
-        options.output_slice_offset_samples
-    };
+    let requested_output_slice_offset_samples = options.output_slice_offset_samples;
+    let bypass_slicing = options.bypass_slicing;
     let record_dump = options.record_dump;
 
     let input_device = find_input_device(&host, options.input_device_name.as_deref())?;
@@ -270,9 +269,26 @@ where
     let sola_search_output = sola_search_samples(output_rate, sola_search_ms);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
-    let warmup_inference_block_size = requested_block_size
-        .max(MIN_INFERENCE_BLOCK)
-        .saturating_add(sola_search_model);
+    let frame_grid = frame_grid_samples(model_sample_rate);
+    let mut block_size = align_down(requested_block_size.max(1), frame_grid);
+    block_size = block_size.max(1);
+    if block_size != requested_block_size {
+        eprintln!(
+            "[vc-audio] block_size aligned to frame grid: pre_align={} aligned={} frame_grid={}samples",
+            requested_block_size, block_size, frame_grid
+        );
+    }
+    voice_changer.set_effective_block_size(block_size);
+    eprintln!(
+        "[vc-audio] synced effective block_size to inference config: {} samples",
+        block_size
+    );
+    let process_window_samples = block_size
+        .saturating_mul(PROCESS_WINDOW_BLOCK_MULTIPLIER)
+        .max(block_size);
+    // Warmup must use the same steady-state model input shape, especially when
+    // CUDA Graph capture is enabled.
+    let warmup_inference_block_size = process_window_samples.max(MIN_INFERENCE_BLOCK);
     eprintln!(
         "[vc-audio] input_rate={} output_rate={} input_ch={} output_ch={} input_fmt={:?} output_fmt={:?} model_rate={} block_size_requested={}",
         input_rate,
@@ -285,7 +301,7 @@ where
         requested_block_size
     );
     eprintln!(
-        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} record_dump={}",
+        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
         input_device.name().unwrap_or_else(|_| "unknown-input".to_string()),
         output_device.name().unwrap_or_else(|_| "unknown-output".to_string()),
         extra_inference_ms,
@@ -295,7 +311,8 @@ where
         fade_out_ms,
         sola_search_ms,
         output_tail_offset_ms,
-        output_slice_offset_samples,
+        requested_output_slice_offset_samples,
+        bypass_slicing,
         record_dump
     );
     // Warm up the model before starting audio streams to avoid first-block stalls
@@ -322,32 +339,17 @@ where
             elapsed_ms
         }
     };
-
-    let frame_grid = frame_grid_samples(model_sample_rate);
-    let mut block_size = align_down(requested_block_size.max(1), frame_grid);
-    block_size = block_size.max(1);
-    if block_size != requested_block_size {
-        eprintln!(
-            "[vc-audio] block_size aligned to frame grid: pre_align={} aligned={} frame_grid={}samples",
-            requested_block_size, block_size, frame_grid
-        );
-    }
-    voice_changer.set_effective_block_size(block_size);
+    let inference_block_size = process_window_samples.saturating_add(sola_search_model);
+    let output_slice_offset_samples = requested_output_slice_offset_samples;
     eprintln!(
-        "[vc-audio] synced effective block_size to inference config: {} samples",
+        "[vc-audio] resolved output_slice_offset_samples={} (runtime-config controlled)",
+        output_slice_offset_samples,
+    );
+    eprintln!(
+        "[vc-audio] process_window={}smp (2x block_size={})",
+        process_window_samples,
         block_size
     );
-    let inference_block_size = block_size
-        .max(MIN_INFERENCE_BLOCK)
-        .saturating_add(sola_search_model);
-    let process_window_samples = FIXED_PROCESS_WINDOW_SAMPLES;
-    if inference_block_size > process_window_samples {
-        return Err(anyhow!(
-            "invalid realtime geometry: inference_block_size({}) > fixed_process_window({})",
-            inference_block_size,
-            process_window_samples
-        ));
-    }
     let requested_target_buffer_out_samples =
         target_buffer_samples_from_ms(target_buffer_ms, output_rate).max(1);
     let requested_target_buffer_model_samples = map_output_samples_to_model(
@@ -496,6 +498,7 @@ where
             sola_search_ms,
             output_tail_offset_ms,
             output_slice_offset_samples,
+            bypass_slicing,
             record_dump,
             process_window_samples,
             &running_worker,
@@ -771,6 +774,7 @@ fn worker_loop<E>(
     sola_search_ms: u32,
     output_tail_offset_ms: u32,
     output_slice_offset_samples: usize,
+    bypass_slicing: bool,
     record_dump: bool,
     configured_process_window_samples: usize,
     running: &Arc<AtomicBool>,
@@ -794,10 +798,11 @@ fn worker_loop<E>(
         resolve_output_tail_offset_samples(output_rate, edge_guard_samples, output_tail_offset_ms);
     let sola_search_model =
         map_output_samples_to_model(sola_search_output, model_sample_rate, output_rate);
-    let inference_block_size = io_block_size
-        .max(MIN_INFERENCE_BLOCK)
-        .saturating_add(sola_search_model);
+    let boundary_fade_samples = FIXED_BOUNDARY_MICROFADE_SAMPLES.min(output_step_samples.max(1));
     let process_window_samples = configured_process_window_samples;
+    let inference_block_size = process_window_samples
+        .max(io_block_size.max(MIN_INFERENCE_BLOCK))
+        .saturating_add(sola_search_model);
     let target_buffer_samples = configured_target_buffer_samples.max(process_window_samples);
     let prefill_target_samples =
         map_model_samples_to_output(target_buffer_samples, model_sample_rate, output_rate)
@@ -808,8 +813,8 @@ fn worker_loop<E>(
     let mut model_input_queue = VecDeque::<f32>::new();
     let mut model_block = Vec::<f32>::with_capacity(process_window_cap.max(inference_block_size));
     let mut previous_input = vec![0.0_f32; io_block_size];
-    let mut output_rate_buf = Vec::<f32>::new();
     let mut previous_output_tail = Vec::<f32>::new();
+    let mut output_rate_buf = Vec::<f32>::new();
     let input_to_model_resampler = HqResampler::new(input_rate, model_sample_rate);
     let model_to_output_resampler = HqResampler::new(model_sample_rate, output_rate);
     let mut sola_correlator = SolaFftCorrelator::default();
@@ -920,7 +925,8 @@ fn worker_loop<E>(
             }
             let step_len = io_block_size.min(model_block.len());
             let step_start = model_block.len().saturating_sub(step_len);
-            let step_input = &model_block[step_start..];
+            let step_end = step_start.saturating_add(step_len).min(model_block.len());
+            let step_input = &model_block[step_start..step_end];
             let current_input = step_input.to_vec();
 
             let mut sum_sq = 0.0_f32;
@@ -945,8 +951,7 @@ fn worker_loop<E>(
                 previous_input.fill(0.0);
                 vec![0.0_f32; expected_len]
             } else {
-                let mut padded_input =
-                    Vec::<f32>::with_capacity(previous_input.len() + current_input.len());
+                let mut padded_input = Vec::<f32>::with_capacity(previous_input.len() + current_input.len());
                 padded_input.extend_from_slice(&previous_input);
                 padded_input.extend_from_slice(&current_input);
                 let model_out = match voice_changer.process_frame(&padded_input) {
@@ -963,137 +968,172 @@ fn worker_loop<E>(
                 } else {
                     &model_out
                 };
-                // Strict slicing contract:
-                // always emit exactly `expected_len` samples from [final_start..final_end).
-                let max_guard = output_mono.len().saturating_sub(1);
-                let applied_guard = output_tail_offset_samples.min(max_guard);
-                let source_end = output_mono.len().saturating_sub(applied_guard);
-                let configured_start =
-                    output_slice_offset_samples.saturating_add(previous_input.len());
-                let max_start = source_end.saturating_sub(expected_len);
-                let base_start = configured_start.min(max_start);
-                if configured_start > max_start && processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
-                    eprintln!(
-                        "[vc-audio] output-slice warning: configured_start={} exceeds max_start={} for model_out_len={} (expected_len={}, tail_offset={}); clamping",
-                        configured_start,
-                        max_start,
-                        output_mono.len(),
-                        expected_len,
-                        applied_guard
-                    );
-                }
-
-                let mut final_start = base_start;
-                let mut final_end = final_start.saturating_add(expected_len);
-                let mut search_limit = 0usize;
-                let mut source_region_len = 0usize;
-                if source_end >= expected_len {
-                    // Symmetric SOLA search around the nominal slice start (phase alignment).
-                    let backward_limit = sola_search_output.min(base_start);
-                    let forward_limit =
-                        sola_search_output.min(max_start.saturating_sub(base_start));
-                    let region_start = base_start.saturating_sub(backward_limit);
-                    let region_end = base_start
-                        .saturating_add(expected_len)
-                        .saturating_add(forward_limit)
-                        .min(source_end);
-                    let source_region = &output_mono[region_start..region_end];
-                    source_region_len = source_region.len();
-                    let max_offset = source_region.len().saturating_sub(expected_len);
-                    let nominal_offset = backward_limit.min(max_offset);
-                    let crossfade_for_search = crossfade_samples
-                        .min(previous_output_tail.len())
-                        .min(source_region.len());
-                    let mut offset = nominal_offset;
-                    if max_offset > 0 && crossfade_for_search >= 16 {
-                        offset = sola_correlator.find_best_offset(
-                            &previous_output_tail,
-                            source_region,
-                            crossfade_for_search,
-                            max_offset,
+                // Optional bypass mode: forward full decoder output without slicing.
+                if bypass_slicing {
+                    if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                        eprintln!(
+                            "[vc-audio] output-slice bypass block={} model_out_len={} forwarded_full_output=true",
+                            processed_blocks + 1,
+                            output_mono.len()
                         );
                     }
-                    search_limit = max_offset;
-                    final_start = region_start.saturating_add(offset);
-                    final_end = final_start.saturating_add(expected_len);
-                    if final_end > source_end {
+                    output_mono.to_vec()
+                } else {
+                    // Strict slicing contract:
+                    // always emit exactly `expected_len` samples from [final_start..final_end).
+                    let max_guard = output_mono.len().saturating_sub(1);
+                    let applied_guard = output_tail_offset_samples.min(max_guard);
+                    let source_end = output_mono.len().saturating_sub(applied_guard);
+                    // For dynamic models, output_mono.len() often equals process_window_samples.
+                    // In that case `output_slice_offset_samples` is already absolute.
+                    // Keep context_shift only for legacy models emitting more than process-window.
+                    let context_shift = if output_mono.len() > process_window_samples {
+                        previous_input.len()
+                    } else {
+                        0
+                    };
+                    let configured_start = output_slice_offset_samples.saturating_add(context_shift);
+                    let max_start = source_end.saturating_sub(expected_len);
+                    // `base_start` is the nominal slice anchor before SOLA correction.
+                    let base_start = configured_start.min(max_start);
+                    if configured_start > max_start && processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                        eprintln!(
+                            "[vc-audio] output-slice warning: configured_start={} exceeds max_start={} for model_out_len={} (expected_len={}, tail_offset={}); clamping",
+                            configured_start,
+                            max_start,
+                            output_mono.len(),
+                            expected_len,
+                            applied_guard
+                        );
+                    }
+
+                    let mut final_start = base_start;
+                    let mut final_end = final_start.saturating_add(expected_len);
+                    let mut search_limit = 0usize;
+                    let mut source_region_len = 0usize;
+                    if source_end >= expected_len {
+                        // Symmetric SOLA search around the nominal slice start (phase alignment).
+                        // We search only a bounded region to keep latency stable.
+                        let backward_limit = sola_search_output.min(base_start);
+                        let forward_limit =
+                            sola_search_output.min(max_start.saturating_sub(base_start));
+                        let region_start = base_start.saturating_sub(backward_limit);
+                        let region_end = base_start
+                            .saturating_add(expected_len)
+                            .saturating_add(forward_limit)
+                            .min(source_end);
+                        let source_region = &output_mono[region_start..region_end];
+                        source_region_len = source_region.len();
+                        let max_offset = source_region.len().saturating_sub(expected_len);
+                        let nominal_offset = backward_limit.min(max_offset);
+                        let crossfade_for_search = crossfade_samples
+                            .min(previous_output_tail.len())
+                            .min(source_region.len());
+                        let mut offset = nominal_offset;
+                        if max_offset > 0 && crossfade_for_search >= 16 {
+                            offset = sola_correlator.find_best_offset(
+                                &previous_output_tail,
+                                source_region,
+                                crossfade_for_search,
+                                max_offset,
+                            );
+                        }
+                        search_limit = max_offset;
+                        final_start = region_start.saturating_add(offset);
+                        final_end = final_start.saturating_add(expected_len);
+                        if final_end > source_end {
+                            if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                                eprintln!(
+                                    "[vc-audio] output-slice warning: final_end={} exceeds source_end={} (final_start={}, expected_len={}); clamping start",
+                                    final_end,
+                                    source_end,
+                                    final_start,
+                                    expected_len
+                                );
+                            }
+                            final_start = max_start;
+                            final_end = final_start.saturating_add(expected_len);
+                        }
+                    }
+
+                    if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                        eprintln!(
+                            "[vc-audio] output-slice-audit block={} model_out_len={} source_end={} source_region_len={} expected_len={} tail_offset={} configured_start={} max_start={} base_start={} final_start={} final_end={} search_limit={} bypass={} was_active_prev={}",
+                            processed_blocks + 1,
+                            output_mono.len(),
+                            source_end,
+                            source_region_len,
+                            expected_len,
+                            applied_guard,
+                            configured_start,
+                            max_start,
+                            base_start,
+                            final_start,
+                            final_end,
+                            search_limit,
+                            bypass_inference,
+                            was_active
+                        );
+                    }
+
+                    if source_end >= expected_len {
+                        output_mono[final_start..final_end].to_vec()
+                    } else {
                         if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
                             eprintln!(
-                                "[vc-audio] output-slice warning: final_end={} exceeds source_end={} (final_start={}, expected_len={}); clamping start",
-                                final_end,
+                                "[vc-audio] output-slice warning: source_end={} < expected_len={}; zero-padding missing samples",
                                 source_end,
-                                final_start,
                                 expected_len
                             );
                         }
-                        final_start = max_start;
-                        final_end = final_start.saturating_add(expected_len);
+                        let mut out = vec![0.0_f32; expected_len];
+                        let available = source_end.min(expected_len);
+                        if available > 0 {
+                            out[expected_len - available..expected_len]
+                                .copy_from_slice(&output_mono[source_end - available..source_end]);
+                        }
+                        out
                     }
-                }
-
-                if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
-                    eprintln!(
-                        "[vc-audio] output-slice-audit block={} model_out_len={} source_end={} source_region_len={} expected_len={} tail_offset={} configured_start={} max_start={} base_start={} final_start={} final_end={} search_limit={} bypass={}",
-                        processed_blocks + 1,
-                        output_mono.len(),
-                        source_end,
-                        source_region_len,
-                        expected_len,
-                        applied_guard,
-                        configured_start,
-                        max_start,
-                        base_start,
-                        final_start,
-                        final_end,
-                        search_limit,
-                        bypass_inference
-                    );
-                }
-
-                if source_end >= expected_len {
-                    output_mono[final_start..final_end].to_vec()
-                } else {
-                    if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
-                        eprintln!(
-                            "[vc-audio] output-slice warning: source_end={} < expected_len={}; zero-padding missing samples",
-                            source_end,
-                            expected_len
-                        );
-                    }
-                    let mut out = vec![0.0_f32; expected_len];
-                    let available = source_end.min(expected_len);
-                    if available > 0 {
-                        out[expected_len - available..expected_len]
-                            .copy_from_slice(&output_mono[source_end - available..source_end]);
-                    }
-                    out
                 }
             };
-            debug_assert_eq!(
-                smoothed_output.len(),
-                expected_len,
-                "slice contract violated: final output length must equal expected_len"
-            );
-            if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
-                eprintln!(
-                    "[vc-audio] output-slice-final block={} final_len={} expected_len={}",
-                    processed_blocks + 1,
-                    smoothed_output.len(),
-                    expected_len
-                );
-            }
             let overlap = ola_overlap_samples
                 .min(smoothed_output.len())
                 .min(previous_output_tail.len());
             if overlap > 0 && (!bypass_inference || was_active) {
                 apply_equal_power_overlap(&previous_output_tail, &mut smoothed_output, overlap);
             }
+            let boundary_overlap = boundary_fade_samples
+                .min(smoothed_output.len())
+                .min(previous_output_tail.len());
+            if boundary_overlap > 0 {
+                apply_fixed_boundary_microfade(
+                    &previous_output_tail,
+                    &mut smoothed_output,
+                    boundary_overlap,
+                );
+            }
             if !bypass_inference && !was_active {
                 let recovery_fade_samples =
                     compute_vad_recovery_fade_samples(output_rate).min(smoothed_output.len());
                 apply_head_fade_in(&mut smoothed_output, recovery_fade_samples);
             }
-            let keep = ola_overlap_samples.min(smoothed_output.len());
+            if !bypass_slicing {
+                debug_assert_eq!(
+                    smoothed_output.len(),
+                    expected_len,
+                    "slice contract violated: final output length must equal expected_len"
+                );
+            }
+            if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                eprintln!(
+                    "[vc-audio] output-slice-final block={} final_len={} expected_len={} bypass_slicing={}",
+                    processed_blocks + 1,
+                    smoothed_output.len(),
+                    expected_len,
+                    bypass_slicing
+                );
+            }
+            let keep = ola_overlap_samples.max(boundary_fade_samples).min(smoothed_output.len());
             previous_output_tail.clear();
             if keep > 0 {
                 previous_output_tail
@@ -1423,6 +1463,18 @@ fn apply_equal_power_overlap(previous_tail: &[f32], current: &mut [f32], overlap
         let w_prev = phase.cos();
         let w_curr = phase.sin();
         current[i] = previous_tail[prev_start + i] * w_prev + current[i] * w_curr;
+    }
+}
+
+fn apply_fixed_boundary_microfade(previous_tail: &[f32], current: &mut [f32], overlap: usize) {
+    if overlap == 0 || previous_tail.len() < overlap || current.len() < overlap {
+        return;
+    }
+    let prev_start = previous_tail.len() - overlap;
+    let inv = 1.0_f32 / (overlap + 1) as f32;
+    for i in 0..overlap {
+        let w = (i + 1) as f32 * inv;
+        current[i] = previous_tail[prev_start + i] * (1.0 - w) + current[i] * w;
     }
 }
 

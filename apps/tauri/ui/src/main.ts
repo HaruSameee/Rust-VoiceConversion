@@ -24,6 +24,7 @@ interface RuntimeConfig {
   rmvpe_threshold: number;
   pitch_smooth_alpha: number;
   rms_mix_rate: number;
+  post_filter_alpha: number;
   f0_median_filter_radius: number;
   extra_inference_ms: number;
   target_buffer_ms: number;
@@ -33,6 +34,7 @@ interface RuntimeConfig {
   sola_search_ms: number;
   output_tail_offset_ms: number;
   output_slice_offset_samples: number;
+  bypass_slicing: boolean;
   record_dump: boolean;
   speaker_id: number;
   sample_rate: number;
@@ -119,6 +121,8 @@ const ui = {
   fadeOutMs: $("fadeOutMs") as HTMLInputElement,
   solaSearchMs: $("solaSearchMs") as HTMLInputElement,
   outputTailOffsetMs: $("outputTailOffsetMs") as HTMLInputElement,
+  sliceOffsetSamples: $("sliceOffsetSamples") as HTMLInputElement,
+  bypassSlicing: $("bypassSlicing") as HTMLInputElement,
   recordDump: $("recordDump") as HTMLInputElement,
   speakerId: $("speakerId") as HTMLInputElement,
   sampleRate: $("sampleRate") as HTMLInputElement,
@@ -151,8 +155,8 @@ let runtimeCache: RuntimeConfig | null = null;
 const PRESET_STORAGE_KEY = "rust_vc_presets_v1";
 let presetStore: PresetStore = {};
 const MAX_ORT_THREADS = Math.max(1, Math.round(Number(navigator.hardwareConcurrency) || 4));
-const LEGACY_SLICE_OFFSET_SAMPLES = 31680;
 const DEFAULT_SLICE_OFFSET_SAMPLES = 6054;
+const MAX_SLICE_OFFSET_SAMPLES = 48_000;
 
 function now(): string {
   return new Date().toISOString();
@@ -208,11 +212,7 @@ function intAtLeast(value: number, min: number, fallback: number): number {
 }
 
 function normalizeSliceOffsetSamples(value: number | null | undefined): number {
-  const normalized = intAtLeast(Number(value), 0, DEFAULT_SLICE_OFFSET_SAMPLES);
-  if (normalized === LEGACY_SLICE_OFFSET_SAMPLES) {
-    return DEFAULT_SLICE_OFFSET_SAMPLES;
-  }
-  return normalized;
+  return Math.round(clamp(Number(value), 0, MAX_SLICE_OFFSET_SAMPLES, DEFAULT_SLICE_OFFSET_SAMPLES));
 }
 
 function clamp(value: number, min: number, max: number, fallback: number): number {
@@ -350,20 +350,14 @@ function initPresetUi(): void {
   let migrated = false;
   for (const [name, entry] of Object.entries(presetStore)) {
     const runtimeSanitized = sanitizeRuntime(entry.runtime);
-    const before = entry.runtime.output_slice_offset_samples;
-    const after = runtimeSanitized.output_slice_offset_samples;
-    if (before !== after) {
+    if (JSON.stringify(entry.runtime) !== JSON.stringify(runtimeSanitized)) {
       presetStore[name] = { ...entry, runtime: runtimeSanitized };
       migrated = true;
     }
   }
   if (migrated) {
     writePresetStore(presetStore);
-    log("INFO", "preset runtime migrated", {
-      field: "output_slice_offset_samples",
-      from: LEGACY_SLICE_OFFSET_SAMPLES,
-      to: DEFAULT_SLICE_OFFSET_SAMPLES
-    });
+    log("INFO", "preset runtime migrated", { reason: "sanitized fields" });
   }
   renderPresetSelect();
 }
@@ -384,6 +378,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     pitch_smooth_alpha: atLeast(raw.pitch_smooth_alpha, 0.0, 0.12),
     // 0.0 = strongest input envelope inheritance, 1.0 = almost disabled.
     rms_mix_rate: clamp(raw.rms_mix_rate, 0.0, 1.0, 0.2),
+    post_filter_alpha: clamp(raw.post_filter_alpha, 0.0, 0.999, 0.96),
     f0_median_filter_radius: intAtLeast(raw.f0_median_filter_radius, 0, 3),
     extra_inference_ms: intAtLeast(raw.extra_inference_ms, 0, 0),
     target_buffer_ms: intAtLeast(raw.target_buffer_ms, 500, 2000),
@@ -393,6 +388,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     sola_search_ms: intAtLeast(raw.sola_search_ms, 1, 10),
     output_tail_offset_ms: intAtLeast(raw.output_tail_offset_ms, 0, 0),
     output_slice_offset_samples: normalizeSliceOffsetSamples(raw.output_slice_offset_samples),
+    bypass_slicing: Boolean(raw.bypass_slicing),
     record_dump: Boolean(raw.record_dump),
     speaker_id: Math.round(finiteOr(raw.speaker_id, 0)),
     sample_rate: intAtLeast(raw.sample_rate, 1, 48000),
@@ -445,6 +441,7 @@ function runtimeFromInputs(): RuntimeConfig {
     rmvpe_threshold: Number(ui.rmvpeThreshold.value),
     pitch_smooth_alpha: Number(ui.pitchSmoothAlpha.value),
     rms_mix_rate: Number(ui.rmsMixRate.value),
+    post_filter_alpha: base?.post_filter_alpha ?? 0.96,
     f0_median_filter_radius: Number(ui.f0MedianFilterRadius.value),
     extra_inference_ms: Number(ui.extraInferenceMs.value),
     target_buffer_ms: Number(ui.targetBufferMs.value),
@@ -453,7 +450,8 @@ function runtimeFromInputs(): RuntimeConfig {
     fade_out_ms: Number(ui.fadeOutMs.value),
     sola_search_ms: Number(ui.solaSearchMs.value),
     output_tail_offset_ms: Number(ui.outputTailOffsetMs.value),
-    output_slice_offset_samples: normalizeSliceOffsetSamples(base?.output_slice_offset_samples),
+    output_slice_offset_samples: Number(ui.sliceOffsetSamples.value),
+    bypass_slicing: ui.bypassSlicing.checked,
     record_dump: ui.recordDump.checked,
     speaker_id: Number(ui.speakerId.value),
     sample_rate: Number(ui.sampleRate.value),
@@ -506,6 +504,8 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.fadeOutMs.value = String(config.fade_out_ms);
   ui.solaSearchMs.value = String(config.sola_search_ms);
   ui.outputTailOffsetMs.value = String(config.output_tail_offset_ms);
+  ui.sliceOffsetSamples.value = String(normalizeSliceOffsetSamples(config.output_slice_offset_samples));
+  ui.bypassSlicing.checked = Boolean(config.bypass_slicing);
   ui.recordDump.checked = Boolean(config.record_dump);
   ui.speakerId.value = String(config.speaker_id);
   ui.sampleRate.value = String(config.sample_rate);
@@ -571,6 +571,14 @@ async function saveAll(): Promise<void> {
   const runtimeArgs: SetRuntimeConfigArgs = { config: runtime };
   await invoke("set_runtime_config_cmd", runtimeArgs);
   log("INFO", "saveAll done");
+}
+
+async function saveRuntimeOnly(): Promise<void> {
+  const runtimeRaw = runtimeFromInputs();
+  const runtime = sanitizeRuntime(runtimeRaw);
+  const runtimeArgs: SetRuntimeConfigArgs = { config: runtime };
+  await invoke("set_runtime_config_cmd", runtimeArgs);
+  runtimeCache = runtime;
 }
 
 async function startEngine(): Promise<void> {
@@ -662,6 +670,12 @@ ui.clearLogBtn.addEventListener("click", () => {
 });
 ui.cudaWs.addEventListener("change", () => {
   syncCudaWsUiState();
+});
+ui.sliceOffsetSamples.addEventListener("input", () => {
+  void runAction("save_runtime_live_slice", saveRuntimeOnly);
+});
+ui.bypassSlicing.addEventListener("change", () => {
+  void runAction("save_runtime_live_bypass", saveRuntimeOnly);
 });
 for (const btn of ui.tabButtons) {
   btn.addEventListener("click", () => {

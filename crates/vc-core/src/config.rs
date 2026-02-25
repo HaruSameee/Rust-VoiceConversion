@@ -24,12 +24,17 @@ pub struct RuntimeConfig {
     pub rmvpe_threshold: f32,
     pub pitch_smooth_alpha: f32,
     pub rms_mix_rate: f32,
-    pub f0_median_filter_radius: usize,
-    /// Overlap/fade tuning hint in milliseconds.
+    /// Mild generator-output smoothing filter strength.
     ///
-    /// This value is used by `vc-audio` post-processing heuristics
-    /// (e.g. OLA overlap shaping). It is not the playback queue depth.
-    /// Queue depth is configured by `target_buffer_ms`.
+    /// Range:
+    /// - `0.0` disables post-filter
+    /// - `0.9..0.999` enables progressively lighter smoothing
+    pub post_filter_alpha: f32,
+    pub f0_median_filter_radius: usize,
+    /// Legacy compatibility field (milliseconds).
+    ///
+    /// Runtime queue sizing is controlled by `target_buffer_ms`.
+    /// This value is retained for backward compatibility and diagnostics.
     pub extra_inference_ms: u32,
     /// Playback/output queue target size in milliseconds.
     ///
@@ -54,10 +59,16 @@ pub struct RuntimeConfig {
     pub output_tail_offset_ms: u32,
     /// Decoder output slice start offset in samples (output domain).
     ///
-    /// For 48kHz/100-frame decoder outputs, a practical initial value is model-dependent.
-    /// Current measured default in this project: 6054.
+    /// For 3-block center-window slicing, default is one block (24_000 @ 48kHz block=24_000),
+    /// i.e. start of the center block.
     /// 0 means "use engine default".
+    #[serde(alias = "slice_offset_samples")]
     pub output_slice_offset_samples: usize,
+    /// Bypass output slicing and emit full decoder output as-is.
+    ///
+    /// When true, `output_slice_offset_samples` and strict hop-length slicing
+    /// are skipped in `vc-audio`.
+    pub bypass_slicing: bool,
     /// Enables debug WAV dump output from `vc-audio`.
     ///
     /// Toggled from runtime config/UI. When true, the engine writes
@@ -106,6 +117,7 @@ impl Default for RuntimeConfig {
             rmvpe_threshold: 0.01,
             pitch_smooth_alpha: 0.12,
             rms_mix_rate: 0.2,
+            post_filter_alpha: 0.96,
             f0_median_filter_radius: 3,
             extra_inference_ms: 250,
             target_buffer_ms: 2_000,
@@ -114,7 +126,8 @@ impl Default for RuntimeConfig {
             fade_out_ms: 120,
             sola_search_ms: 10,
             output_tail_offset_ms: 0,
-            output_slice_offset_samples: 6_054,
+            output_slice_offset_samples: 24_000,
+            bypass_slicing: false,
             record_dump: false,
             speaker_id: 0,
             sample_rate: 48_000,

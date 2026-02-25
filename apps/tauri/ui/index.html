@@ -9,7 +9,7 @@
     <main class="container">
       <header>
         <h1>Rust VC</h1>
-        <p class="sub">リアルタイム音声変換コントロールパネル</p>
+        <p class="sub">Realtime Voice Conversion Control Panel</p>
       </header>
 
       <nav class="tabs" id="settingsTabs" aria-label="設定タブ">
@@ -22,35 +22,28 @@
       <section class="tab-panel active" data-tab-panel="model">
         <section class="card">
           <h2>モデル設定</h2>
-          <p class="section-hint">モデル不一致は機械感やノイズ増加の主因です。最初は標準構成をそのまま使ってください。</p>
-
-          <label for="modelPath">RVCモデル (`model.onnx`)</label>
+          <label for="modelPath">RVC Model (`model.onnx`)</label>
           <input id="modelPath" type="text" placeholder="model/model.onnx" />
-          <p class="hint">変換本体です。別モデルに替えると声質が大きく変わります。</p>
 
           <label for="hubertPath">HuBERT (`hubert.onnx`)</label>
           <input id="hubertPath" type="text" placeholder="model/hubert.onnx" />
-          <p class="hint">発話内容の特徴抽出です。不一致だと発音が崩れます。</p>
 
           <label for="rmvpePath">RMVPE (`rmvpe.onnx`)</label>
           <input id="rmvpePath" type="text" placeholder="model/rmvpe.onnx" />
-          <p class="hint">ピッチ推定です。不安定だとロボット感や音程ブレが増えます。</p>
 
-          <label for="indexPath">インデックス (`.bin` 推奨 / `.index` も可)</label>
+          <label for="indexPath">Index (`model_vectors.bin` / `.index`)</label>
           <input id="indexPath" type="text" placeholder="model/model_vectors.bin" />
-          <p class="hint">`.bin` は高速で安定です。`.index` は初回に Python + faiss が必要です。</p>
         </section>
 
         <section class="card">
           <h2>オーディオデバイス</h2>
-          <p class="section-hint">入出力デバイスの取り違えは「無音」「常時ノイズ」の頻出原因です。</p>
           <div class="grid">
             <div class="field">
-              <label for="inputDevice">入力デバイス（マイク）</label>
+              <label for="inputDevice">入力デバイス</label>
               <select id="inputDevice"></select>
             </div>
             <div class="field">
-              <label for="outputDevice">出力デバイス（スピーカー）</label>
+              <label for="outputDevice">出力デバイス</label>
               <select id="outputDevice"></select>
             </div>
           </div>
@@ -59,58 +52,47 @@
 
       <section class="tab-panel" data-tab-panel="quality">
         <section class="card">
-          <h2>音質・声質</h2>
-          <p class="section-hint">機械感が強いときは `protect`, `index_rate`, `pitch_smooth`, `rms_mix` を優先調整してください。</p>
+          <h2>音質設定</h2>
           <div class="grid">
             <div class="field">
-              <label for="pitchShift">ピッチ変更（半音）</label>
+              <label for="pitchShift">Pitch Shift</label>
               <input id="pitchShift" type="number" step="1" min="-24" max="24" />
-              <p class="hint">上下に振りすぎると不自然になります。まずは -2 から +2 を推奨。</p>
             </div>
             <div class="field">
-              <label for="protect">子音保護（protect）</label>
+              <label for="protect">Protect</label>
               <input id="protect" type="number" step="0.01" min="0" />
-              <p class="hint">上げると発音崩れを抑えますが、変換量は弱くなります（0.33-0.50目安）。</p>
             </div>
             <div class="field">
-              <label for="indexRate">インデックス比率（index_rate）</label>
+              <label for="indexRate">Index Rate</label>
               <input id="indexRate" type="number" step="0.05" min="0" />
-              <p class="hint">上げるほど学習声質に寄ります。高すぎるとノイズ/息成分が増えます。</p>
             </div>
             <div class="field">
-              <label for="indexSmoothAlpha">インデックス平滑化（index_smooth）</label>
+              <label for="indexSmoothAlpha">Index Smooth</label>
               <input id="indexSmoothAlpha" type="number" step="0.01" min="0" />
-              <p class="hint">上げると突然の声質ジャンプを抑制します（0.75-0.92目安）。</p>
             </div>
             <div class="field">
-              <label for="indexTopK">近傍数（top_k）</label>
+              <label for="indexTopK">Top K</label>
               <input id="indexTopK" type="number" step="1" min="1" />
-              <p class="hint">増やすと平均化されやすくなり、音色変化がマイルドになります。</p>
             </div>
             <div class="field">
-              <label for="indexSearchRows">検索行数（index_rows）</label>
+              <label for="indexSearchRows">Index Rows</label>
               <input id="indexSearchRows" type="number" step="256" min="0" />
-              <p class="hint">上げると参照精度は上がりますが遅延/途切れが増えます（1024-4096目安）。</p>
             </div>
             <div class="field">
-              <label for="rmvpeThreshold">無声音しきい値（rmvpe_th）</label>
+              <label for="rmvpeThreshold">RMVPE Threshold</label>
               <input id="rmvpeThreshold" type="number" step="0.005" min="0" />
-              <p class="hint">上げるとノイズF0を無視しやすくなりますが、声が抜けることがあります。</p>
             </div>
             <div class="field">
-              <label for="pitchSmoothAlpha">ピッチ平滑化（pitch_smooth）</label>
+              <label for="pitchSmoothAlpha">Pitch Smooth</label>
               <input id="pitchSmoothAlpha" type="number" step="0.01" min="0" />
-              <p class="hint">上げるとガタつきを抑えます。上げすぎると抑揚が減ります。</p>
             </div>
             <div class="field">
-              <label for="f0MedianFilterRadius">F0メディアン半径（f0_med_r）</label>
+              <label for="f0MedianFilterRadius">F0 Median Radius</label>
               <input id="f0MedianFilterRadius" type="number" step="1" min="0" />
-              <p class="hint">3-5でジッタ軽減。大きすぎると反応が鈍くなります。</p>
             </div>
             <div class="field">
-              <label for="rmsMixRate">RMS Mix（入力エンベロープ継承）</label>
-              <input id="rmsMixRate" type="number" step="0.05" min="0" />
-              <p class="hint">上げると強弱が残り、機械感が減りやすくなります（0.15-0.35目安）。</p>
+              <label for="rmsMixRate">RMS Mix Rate</label>
+              <input id="rmsMixRate" type="number" step="0.05" min="0" max="1" />
             </div>
           </div>
         </section>
@@ -118,60 +100,59 @@
 
       <section class="tab-panel" data-tab-panel="realtime">
         <section class="card">
-          <h2>リアルタイム安定化</h2>
-          <p class="section-hint">途切れが出る場合は `block_size` と `extra_ms` を上げ、しきい値を下げる方向で調整します。</p>
+          <h2>リアルタイム設定</h2>
           <div class="grid">
             <div class="field">
-              <label for="sampleRate">モデルサンプルレート</label>
+              <label for="sampleRate">Sample Rate</label>
               <input id="sampleRate" type="number" step="1000" />
-              <p class="hint">通常は 48000 固定推奨。特殊値は音程崩れの原因になります。</p>
             </div>
             <div class="field">
-              <label for="blockSize">ブロックサイズ</label>
+              <label for="blockSize">Block Size</label>
               <input id="blockSize" type="number" step="16" />
-              <p class="hint">上げるほど安定、下げるほど低遅延。8192 以上が安全です。</p>
             </div>
             <div class="field">
-              <label for="extraInferenceMs">追加推論時間（ms）</label>
+              <label for="extraInferenceMs">Extra Inference (ms)</label>
               <input id="extraInferenceMs" type="number" step="5" min="0" />
-              <p class="hint">上げるとバッファ余裕が増え途切れが減りますが、遅延は増えます。</p>
             </div>
             <div class="field">
-              <label for="targetBufferMs">Playback Buffer（ms）</label>
+              <label for="targetBufferMs">Target Buffer (ms)</label>
               <input id="targetBufferMs" type="number" step="100" min="500" max="5000" value="2000" />
-              <p class="hint">再生キュー長。大きいほど安定（高遅延）、小さいほど低遅延（不安定化しやすい）。</p>
             </div>
             <div class="field">
-              <label for="responseThreshold">反応しきい値（dBFS または線形）</label>
+              <label for="responseThreshold">Threshold (dBFS/linear)</label>
               <input id="responseThreshold" type="number" step="0.001" min="-90" />
-              <p class="hint">負値は dBFS（例: -50）。上げすぎると語頭/語尾が切れやすくなります。</p>
             </div>
             <div class="field">
-              <label for="fadeInMs">フェードイン（ms）</label>
+              <label for="fadeInMs">Fade In (ms)</label>
               <input id="fadeInMs" type="number" step="1" min="0" />
-              <p class="hint">小さすぎると立ち上がりノイズが出る場合があります。</p>
             </div>
             <div class="field">
-              <label for="fadeOutMs">フェードアウト（ms）</label>
+              <label for="fadeOutMs">Fade Out (ms)</label>
               <input id="fadeOutMs" type="number" step="1" min="0" />
-              <p class="hint">大きいほど自然に消えますが、語尾が伸びることがあります。</p>
             </div>
             <div class="field">
-              <label for="solaSearchMs">SOLA Search（ms）</label>
+              <label for="solaSearchMs">SOLA Search (ms)</label>
               <input id="solaSearchMs" type="number" step="1" min="1" />
-              <p class="hint">SOLA探索幅。48kHzでは 10ms=480 / 20ms=960 / 40ms=1920 サンプル。</p>
             </div>
             <div class="field">
-              <label for="outputTailOffsetMs">出力末尾オフセット（ms）</label>
+              <label for="outputTailOffsetMs">Output Tail Offset (ms)</label>
               <input id="outputTailOffsetMs" type="number" step="1" min="0" />
-              <p class="hint">デコーダ出力の末尾から何ms手前を採用するか。0で自動（エッジガード）。</p>
+            </div>
+            <div class="field">
+              <label for="sliceOffsetSamples">Slice Offset (samples)</label>
+              <input id="sliceOffsetSamples" type="number" step="1" min="0" max="48000" />
+            </div>
+            <div class="field">
+              <label for="bypassSlicing">
+                <input id="bypassSlicing" type="checkbox" />
+                Bypass Slicing
+              </label>
             </div>
             <div class="field">
               <label for="recordDump">
                 <input id="recordDump" type="checkbox" />
-                録音ダンプ（debug_input.wav / debug_output.wav）
+                Record debug WAV dump
               </label>
-              <p class="hint">停止時にデバッグ用WAVを書き出します（同期検証用）。</p>
             </div>
           </div>
         </section>
@@ -180,101 +161,89 @@
       <section class="tab-panel" data-tab-panel="advanced">
         <section class="card">
           <h2>GPU / 詳細設定</h2>
-          <p class="section-hint">まずは `ort_provider=auto` 推奨。GPUが不安定なときだけ CPU 固定を試してください。</p>
           <div class="grid">
             <div class="field">
-              <label for="inputGain">入力ゲイン</label>
+              <label for="inputGain">Input Gain</label>
               <input id="inputGain" type="number" step="0.1" />
-              <p class="hint">入力が小さいときだけ少し上げます。上げすぎると割れます。</p>
             </div>
             <div class="field">
-              <label for="outputGain">出力ゲイン</label>
+              <label for="outputGain">Output Gain</label>
               <input id="outputGain" type="number" step="0.1" />
-              <p class="hint">最終音量です。1.0基準で微調整してください。</p>
             </div>
             <div class="field">
-              <label for="speakerId">話者ID</label>
+              <label for="speakerId">Speaker ID</label>
               <input id="speakerId" type="number" step="1" />
-              <p class="hint">マルチ話者モデルのみ有効です。</p>
             </div>
             <div class="field">
-              <label for="ortProvider">推論プロバイダ（ONNX Runtime）</label>
+              <label for="ortProvider">ORT Provider</label>
               <select id="ortProvider">
-                <option value="cuda">CUDA（推奨 / NVIDIA）</option>
-                <option value="directml">DirectML（対応 / Windows GPU）</option>
-                <option value="auto">自動（環境に応じて選択）</option>
-                <option value="cpu">CPU（非推奨）</option>
+                <option value="cuda">CUDA</option>
+                <option value="directml">DirectML</option>
+                <option value="auto">Auto</option>
+                <option value="cpu">CPU</option>
               </select>
-              <p class="hint">基本は CUDA 推奨です。CUDA が使えない環境は DirectML を使用し、CPU は検証用途を推奨します。</p>
             </div>
             <div class="field">
-              <label for="ortDeviceId">GPUデバイス番号</label>
+              <label for="ortDeviceId">GPU Device ID</label>
               <input id="ortDeviceId" type="number" step="1" min="0" />
-              <p class="hint">複数GPU環境向けです。通常は 0 のままで問題ありません。</p>
             </div>
             <div class="field">
-              <label for="ortGpuMemLimitMb">GPU VRAM上限（MB / 0で無制限）</label>
+              <label for="ortGpuMemLimitMb">GPU VRAM Limit (MB)</label>
               <input id="ortGpuMemLimitMb" type="number" step="128" min="0" />
-              <p class="hint">他アプリ併用時に有効です。低すぎると初期化失敗します。</p>
             </div>
             <div class="field">
-              <label for="cudaConvAlgo">CUDA conv algorithm</label>
+              <label for="cudaConvAlgo">CUDA Conv Algorithm</label>
               <select id="cudaConvAlgo">
                 <option value="default">default</option>
                 <option value="exhaustive">exhaustive</option>
               </select>
-              <p class="hint">GTX 10xxでは `exhaustive` が有効な場合があります（初回ウォームアップは重くなります）。</p>
             </div>
             <div class="field">
               <label for="cudaWs">
                 <input id="cudaWs" type="checkbox" />
-                CUDA workspace を有効化（`cuda_ws`）
+                CUDA Workspace (`cuda_ws`)
               </label>
-              <p class="hint">ONで VRAM 上限を 0（無制限）として扱います。</p>
             </div>
             <div class="field">
               <label for="cudaTf32">
                 <input id="cudaTf32" type="checkbox" />
-                TF32 を有効化（`cuda_tf32`）
+                TF32 (`cuda_tf32`)
               </label>
-              <p class="hint">主に RTX/Ampere 以降向け。GTX 10xx では通常OFF推奨です。</p>
             </div>
             <div class="field">
-              <label for="ortIntraThreads">ORT intra threads（0=auto）</label>
+              <label for="ortIntraThreads">ORT Intra Threads</label>
               <input id="ortIntraThreads" type="number" step="1" min="0" />
-              <p class="hint">0 は ORT デフォルト。1..CPUコア数で固定できます。</p>
             </div>
             <div class="field">
-              <label for="ortInterThreads">ORT inter threads</label>
+              <label for="ortInterThreads">ORT Inter Threads</label>
               <input id="ortInterThreads" type="number" step="1" min="1" />
-              <p class="hint">通常は 1 推奨。必要時のみ増やしてください。</p>
             </div>
           </div>
         </section>
       </section>
 
       <section class="card">
-        <h2>エンジン操作</h2>
+        <h2>エンジン制御</h2>
         <div class="grid">
           <div class="field">
-            <label for="presetSelect">プリセット</label>
+            <label for="presetSelect">Preset</label>
             <select id="presetSelect"></select>
           </div>
           <div class="field">
-            <label for="presetName">保存名</label>
+            <label for="presetName">Preset Name</label>
             <input id="presetName" type="text" placeholder="my-preset" />
           </div>
         </div>
         <div class="actions">
-          <button id="presetSaveBtn">プリセット保存</button>
-          <button id="presetApplyBtn">プリセット適用</button>
-          <button id="presetDeleteBtn">プリセット削除</button>
+          <button id="presetSaveBtn">Save Preset</button>
+          <button id="presetApplyBtn">Apply Preset</button>
+          <button id="presetDeleteBtn">Delete Preset</button>
         </div>
         <div class="actions">
-          <button id="reloadBtn">再読込</button>
-          <button id="saveBtn">保存</button>
-          <button id="startBtn" class="primary">開始</button>
-          <button id="stopBtn">停止</button>
+          <button id="reloadBtn">Reload</button>
+          <button id="saveBtn">Save</button>
+          <button id="startBtn" class="primary">Start</button>
+          <button id="stopBtn">Stop</button>
         </div>
         <p id="statusLine">status: idle</p>
         <p id="levelLine">input level: rms 0.0000 / peak 0.0000</p>
@@ -283,8 +252,8 @@
 
       <section class="card log-card">
         <div class="log-head">
-          <h2>デバッグログ</h2>
-          <button id="clearLogBtn">クリア</button>
+          <h2>ログ</h2>
+          <button id="clearLogBtn">Clear</button>
         </div>
         <pre id="logBox"></pre>
       </section>

@@ -1,209 +1,373 @@
 """
-Export HuBERT, RMVPE, and RVC Generator with dynamic axes.
-Standalone Version: Depends ONLY on local infer_pack/ and rmvpe/ folders.
+Export HuBERT / RMVPE / RVC Generator to ONNX with dynamic axes.
+
+This script is self-contained for this repository layout:
+  - scripts/hubert_base.pt
+  - scripts/rmvpe.pt
+  - scripts/rv_e250_s36750.pth
+  - scripts/infer_pack/*
+  - scripts/rmvpe.py
 """
+
+from __future__ import annotations
+
 import argparse
 import sys
-import os
+import types
+from pathlib import Path
+from typing import Dict, Iterable, Mapping, Sequence
+
 import torch
-import numpy as np
+import torch.nn.functional as F
 
-#  PyTorch 2.6 セキュリティ制限解除パッチ 
-_orig_load = torch.load
-def _safe_load(*args, **kwargs):
-    kwargs["weights_only"] = False
-    return _orig_load(*args, **kwargs)
-torch.load = _safe_load
 
-# scriptsフォルダ自身をPythonパスの先頭に追加
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
+def _ensure_utf8_stdio() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
 
-# ──────────────────────────────────────────
-# 1. HuBERT
-# ──────────────────────────────────────────
+
+def _torch_load(path: Path):
+    # torch>=2.6 defaults to weights_only=True. Explicitly disable for legacy checkpoints.
+    return torch.load(str(path), map_location="cpu", weights_only=False)
+
+def _force_torch_load_weights_only_false() -> None:
+    # fairseq internally calls torch.load without weights_only=..., so patch it once.
+    original_load = torch.load
+
+    def patched_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    torch.load = patched_load
+
+
+def _add_scripts_to_path(project_root: Path) -> None:
+    scripts_dir = project_root / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+
+def _ensure_lib_infer_pack_alias() -> None:
+    # models_onnx.py imports `lib.infer_pack`. Create lightweight alias.
+    import infer_pack
+
+    lib_mod = types.ModuleType("lib")
+    lib_mod.infer_pack = infer_pack
+    sys.modules["lib"] = lib_mod
+    sys.modules["lib.infer_pack"] = infer_pack
+
+
 class HubertWrapper(torch.nn.Module):
-    def __init__(self, hubert):
+    def __init__(self, hubert_model: torch.nn.Module):
         super().__init__()
-        self.hubert = hubert
-    def forward(self, x):
-        return self.hubert(source=x, padding_mask=None, mask=False, features_only=True)["x"]
+        self.hubert = hubert_model
 
-def export_hubert(pt_path: str, out_path: str):
-    print(f"\n[hubert] loading {pt_path}")
+    def forward(self, source: torch.Tensor) -> torch.Tensor:
+        # Output is [B, T, C] where C=768 for HuBERT base.
+        return self.hubert(
+            source=source,
+            padding_mask=None,
+            mask=False,
+            features_only=True,
+        )["x"]
+
+
+class RmvpeWaveformToF0(torch.nn.Module):
+    def __init__(
+        self,
+        rmvpe_model: torch.nn.Module,
+        mel_extractor: torch.nn.Module,
+        threshold: float = 0.03,
+    ):
+        super().__init__()
+        self.rmvpe_model = rmvpe_model
+        self.mel_extractor = mel_extractor
+        self.threshold = float(threshold)
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        # waveform: [B, samples] @ 16kHz
+        mel = self.mel_extractor(waveform, center=True)  # [B, 128, frames]
+        n_frames = mel.shape[-1]
+        padded_frames = 32 * ((n_frames - 1) // 32 + 1)
+        if padded_frames > n_frames:
+            mel = F.pad(mel, (0, padded_frames - n_frames), mode="reflect")
+        salience = self.rmvpe_model(mel).float()[:, :n_frames, :]  # [B, frames, 360]
+        conf, idx = torch.max(salience, dim=2)  # [B, frames], [B, frames]
+        cents = 1997.3794 + idx.float() * 20.0
+        f0 = 10.0 * torch.pow(torch.tensor(2.0, device=waveform.device), cents / 1200.0)
+        return torch.where(conf > self.threshold, f0, torch.zeros_like(f0))
+
+
+class RmvpeMelToF0(torch.nn.Module):
+    def __init__(self, rmvpe_model: torch.nn.Module, threshold: float = 0.03):
+        super().__init__()
+        self.rmvpe_model = rmvpe_model
+        self.threshold = float(threshold)
+
+    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+        # mel: [B, 128, n_frames]
+        n_frames = mel.shape[-1]
+        padded_frames = 32 * ((n_frames - 1) // 32 + 1)
+        if padded_frames > n_frames:
+            mel = F.pad(mel, (0, padded_frames - n_frames), mode="reflect")
+        salience = self.rmvpe_model(mel).float()[:, :n_frames, :]  # [B, frames, 360]
+        conf, idx = torch.max(salience, dim=2)
+        cents = 1997.3794 + idx.float() * 20.0
+        f0 = 10.0 * torch.pow(torch.tensor(2.0, device=mel.device), cents / 1200.0)
+        return torch.where(conf > self.threshold, f0, torch.zeros_like(f0))
+
+
+class RvcOnnxWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        phone: torch.Tensor,
+        phone_lengths: torch.Tensor,
+        pitch: torch.Tensor,
+        pitchf: torch.Tensor,
+        sid: torch.Tensor,
+        rnd: torch.Tensor,
+    ) -> torch.Tensor:
+        # model output: [B, 1, n_samples]
+        audio = self.model(phone, phone_lengths, pitch, pitchf, sid, rnd)
+        if audio.dim() == 3 and audio.shape[1] == 1:
+            audio = audio[:, 0, :]
+        return audio
+
+
+def _unwrap_state_dict(ckpt) -> Mapping[str, torch.Tensor]:
+    if isinstance(ckpt, Mapping):
+        for key in ("weight", "state_dict", "model"):
+            value = ckpt.get(key)
+            if isinstance(value, Mapping):
+                return value
+    if isinstance(ckpt, Mapping):
+        return ckpt
+    raise RuntimeError("checkpoint does not contain a usable state_dict mapping")
+
+
+def export_hubert(hubert_pt: Path, out_path: Path, opset: int, device: str) -> None:
     from fairseq import checkpoint_utils
-    models, _, _ = checkpoint_utils.load_model_ensemble_and_task([pt_path])
-    model = models[0].eval()
-    wrapped_model = HubertWrapper(model)
 
-    dummy = torch.zeros(1, 16000)
+    print(f"[hubert] loading {hubert_pt}")
+    models, _, _ = checkpoint_utils.load_model_ensemble_and_task([str(hubert_pt)])
+    model = models[0].to(device).eval()
+    wrapper = HubertWrapper(model).eval()
+    dummy = torch.zeros(1, 16000, dtype=torch.float32, device=device)
+
+    hubert_opset = max(opset, 18)
+    rmvpe_opset = max(opset, 18)
     torch.onnx.export(
-        wrapped_model, (dummy,), out_path,
-        input_names=["source"], output_names=["features"],
-        dynamic_axes={"source": {0: "batch", 1: "n_samples"}, "features": {0: "batch", 1: "n_frames"}},
-        opset_version=17, do_constant_folding=True,
-    )
-    print(f"[hubert] -> {out_path}")
-
-# ──────────────────────────────────────────
-# 2. RMVPE 
-# ──────────────────────────────────────────
-def export_rmvpe(pt_path: str, out_path: str):
-    print(f"\n[rmvpe] loading {pt_path}")
-    try:
-        from rmvpe.rmvpe import RMVPE
-    except ImportError:
-        import rmvpe as rmvpe_module
-        RMVPE = rmvpe_module.RMVPE
-
-    model = RMVPE(pt_path, is_half=False, device="cpu")
-    model.model.eval()
-
-    # n_mels=128, n_frames=128 (32の倍数)
-    dummy = torch.zeros(1, 128, 128)
-
-    torch.onnx.export(
-        model.model,
+        wrapper,
         (dummy,),
-        out_path,
+        str(out_path),
+        input_names=["source"],
+        output_names=["features"],
+        dynamic_axes={
+            "source": {0: "batch", 1: "samples"},
+            "features": {0: "batch", 1: "n_frames"},
+        },
+        opset_version=hubert_opset,
+        do_constant_folding=True,
+        dynamo=True,
+    )
+    print(f"[hubert] exported -> {out_path}")
+
+
+def export_rmvpe(rmvpe_pt: Path, out_path: Path, opset: int, device: str) -> None:
+    print(f"[rmvpe] loading {rmvpe_pt}")
+    from rmvpe import E2E, MelSpectrogram
+
+    ckpt = _torch_load(rmvpe_pt)
+    state = _unwrap_state_dict(ckpt)
+
+    model = E2E(4, 1, (2, 2))
+    model.load_state_dict(state, strict=False)
+    model = model.to(device).eval()
+    mel_extractor = MelSpectrogram(
+        False,
+        128,
+        16000,
+        1024,
+        160,
+        None,
+        30,
+        8000,
+    ).to(device)
+    rmvpe_opset = max(opset, 18)
+
+    # Primary target: waveform input [B, samples] with dynamic samples.
+    try:
+        waveform_wrapper = RmvpeWaveformToF0(model, mel_extractor).eval()
+        dummy_waveform = torch.zeros(1, 16000, dtype=torch.float32, device=device)
+        torch.onnx.export(
+            waveform_wrapper,
+            (dummy_waveform,),
+            str(out_path),
+            input_names=["waveform"],
+            output_names=["f0"],
+            dynamic_axes={
+                "waveform": {0: "batch", 1: "samples"},
+                "f0": {0: "batch", 1: "n_frames"},
+            },
+            opset_version=rmvpe_opset,
+            do_constant_folding=True,
+            dynamo=True,
+        )
+        print(f"[rmvpe] exported waveform-dynamic -> {out_path}")
+        return
+    except Exception as err:
+        print(
+            "[rmvpe] warning: waveform-dynamic export failed; "
+            f"falling back to mel-dynamic export. cause={err}"
+        )
+
+    # Fallback: mel input [B, 128, n_frames] with dynamic n_frames.
+    mel_wrapper = RmvpeMelToF0(model).eval()
+    dummy_mel = torch.zeros(1, 128, 128, dtype=torch.float32, device=device)
+    torch.onnx.export(
+        mel_wrapper,
+        (dummy_mel,),
+        str(out_path),
         input_names=["mel"],
         output_names=["f0"],
         dynamic_axes={
-            "mel": {0: "batch", 2: "n_frames"}, # 軸2がフレーム
-            "f0":  {0: "batch", 1: "n_frames"},
+            "mel": {0: "batch", 2: "n_frames"},
+            "f0": {0: "batch", 1: "n_frames"},
         },
-        opset_version=18,
+        opset_version=opset,
         do_constant_folding=True,
-        dynamo=False,  
+        dynamo=False,
     )
-    print(f"[rmvpe] -> {out_path}")
-# ──────────────────────────────────────────
-# 3. Generator
-# ──────────────────────────────────────────
-def resolve_generator_class(sd: dict):
-    import sys
-    import infer_pack
-    sys.modules["lib"] = type("DummyLib", (), {})()
-    sys.modules["lib.infer_pack"] = infer_pack
-    from infer_pack import models as rvc_models
+    print(f"[rmvpe] exported mel-dynamic fallback -> {out_path}")
 
-    if "enc_p.emb_phone.weight" in sd:
-        hidden_dim = sd["enc_p.emb_phone.weight"].shape[1]
-    else:
-        hidden_dim = 256 # 安全のためのフォールバック
 
-    version = "v2" if hidden_dim == 768 else "v1"
-    
-    # ピッチ(F0)の有無は、ピッチ埋め込み層(emb_pitch)の存在で確定させる
-    has_f0 = any("emb_pitch" in k for k in sd.keys())
+def export_generator(generator_pth: Path, out_path: Path, opset: int, device: str) -> None:
+    print(f"[generator] loading {generator_pth}")
+    from infer_pack.models_onnx import SynthesizerTrnMsNSFsidM
 
-    name = {
-        ("v1", True):  "SynthesizerTrnMs256NSFsid",
-        ("v1", False): "SynthesizerTrnMs256NSFsid_nono",
-        ("v2", True):  "SynthesizerTrnMs768NSFsid",
-        ("v2", False): "SynthesizerTrnMs768NSFsid_nono",
-    }.get((version, has_f0), "SynthesizerTrnMs768NSFsid")
-    
-    print(f"[generator] auto-selected class: {name} (Dim: {hidden_dim}, F0: {has_f0})")
-    return getattr(rvc_models, name), version
+    ckpt = _torch_load(generator_pth)
+    if not isinstance(ckpt, Mapping):
+        raise RuntimeError("generator checkpoint must be a mapping")
 
-def export_generator(pth_path: str, out_path: str, sr: int = 48000):
-    print(f"\n[generator] loading {pth_path}")
-    ckpt = torch.load(pth_path, map_location="cpu")
-    sd = ckpt.get("weight", ckpt.get("state_dict", ckpt.get("model", ckpt)))
-    Cls, version = resolve_generator_class(sd)
-    
-    cfg = ckpt.get("config", None)
-    if cfg is None: raise RuntimeError("checkpointにconfigが見つかりません。")
+    state = _unwrap_state_dict(ckpt)
+    config = ckpt.get("config")
+    if not isinstance(config, Sequence):
+        raise RuntimeError("generator checkpoint missing list-like config")
+    version = str(ckpt.get("version", "v2"))
 
-    model = Cls(*cfg, is_half=False)
-    model.load_state_dict(sd, strict=False)
-    model.eval().remove_weight_norm()
-
-    n_frames = 100
-    hidden_dim = 768 if version == "v2" else 256
-    
-    # テンソルの準備
-    phone   = torch.zeros(1, n_frames, hidden_dim)
-    phone_l = torch.LongTensor([n_frames])
-    pitch   = torch.zeros(1, n_frames, dtype=torch.long)
-    pitchf  = torch.zeros(1, n_frames)
-    sid     = torch.zeros(1, dtype=torch.long)
-    rnd     = torch.zeros(1, 192, n_frames)
-    ds      = torch.zeros(1, n_frames) 
-
-    # 💥 ここがポイント！ argsを空のタプル () にして、kwargsで名前を明示して渡す！
-    dummy_args = ()
-    dummy_kwargs = {
-        "phone": phone,
-        "phone_lengths": phone_l,
-        "pitch": pitch,
-        "pitchf": pitchf,
-        "sid": sid,
-        "ds": ds,     
-        "rnd": rnd
-    }
-
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        # kwargsを使ってエクスポート
-        torch.onnx.export(
-            model,
-            args=dummy_args,
-            kwargs=dummy_kwargs,
-            f=out_path,
-            input_names=["phone", "phone_lengths", "pitch", "pitchf", "sid", "ds", "rnd"],
-            output_names=["audio"],
-            dynamic_axes={
-                "phone":  {0: "batch", 1: "n_frames"},
-                "pitch":  {0: "batch", 1: "n_frames"},
-                "pitchf": {0: "batch", 1: "n_frames"},
-                "ds":     {0: "batch", 1: "n_frames"},
-                "rnd":    {0: "batch", 2: "n_frames"}, 
-                "audio":  {0: "batch", 2: "n_samples"},
-            },
-            opset_version=18,
-            do_constant_folding=True,
-            dynamo=False, 
+    model = SynthesizerTrnMsNSFsidM(*config, version=version, is_half=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[generator] warning: missing keys={len(missing)} (showing first 5): {missing[:5]}")
+    if unexpected:
+        print(
+            f"[generator] warning: unexpected keys={len(unexpected)} "
+            f"(showing first 5): {unexpected[:5]}"
         )
-    print(f"[generator] -> {out_path}")
+    model = model.to(device).eval()
+    model.remove_weight_norm()
+    wrapper = RvcOnnxWrapper(model).eval()
 
-# ──────────────────────────────────────────
-# main
-# ──────────────────────────────────────────
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--hubert",    default="scripts/hubert_base.pt")
-    ap.add_argument("--rmvpe",     default="scripts/rmvpe.pt")
-    ap.add_argument("--generator", default="scripts/rv_e250_s36750.pth")
-    ap.add_argument("--out-dir",   default="model/dynamic")
-    ap.add_argument("--sr",        type=int, default=48000)
-    ap.add_argument("--verify",    action="store_true")
-    args = ap.parse_args()
+    hidden_dim = 768 if version == "v2" else 256
+    t = 100
+    phone = torch.zeros(1, t, hidden_dim, dtype=torch.float32, device=device)
+    phone_lengths = torch.tensor([t], dtype=torch.int64, device=device)
+    pitch = torch.zeros(1, t, dtype=torch.int64, device=device)
+    pitchf = torch.zeros(1, t, dtype=torch.float32, device=device)
+    sid = torch.zeros(1, dtype=torch.int64, device=device)
+    rnd = torch.randn(1, 192, t, dtype=torch.float32, device=device)
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    torch.onnx.export(
+        wrapper,
+        (phone, phone_lengths, pitch, pitchf, sid, rnd),
+        str(out_path),
+        input_names=["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd"],
+        output_names=["audio"],
+        dynamic_axes={
+            "phone": {0: "batch", 1: "n_frames"},
+            "phone_lengths": {0: "batch"},
+            "pitch": {0: "batch", 1: "n_frames"},
+            "pitchf": {0: "batch", 1: "n_frames"},
+            "sid": {0: "batch"},
+            "rnd": {0: "batch", 2: "n_frames"},
+            "audio": {0: "batch", 1: "n_samples"},
+        },
+        opset_version=opset,
+        do_constant_folding=True,
+        dynamo=False,
+    )
+    print(f"[generator] exported -> {out_path}")
 
-    export_hubert(args.hubert, os.path.join(args.out_dir, "hubert_dynamic.onnx"))
-    export_rmvpe(args.rmvpe, os.path.join(args.out_dir, "rmvpe_dynamic.onnx"))
-    export_generator(args.generator, os.path.join(args.out_dir, "model_dynamic.onnx"), sr=args.sr)
 
+def _shape_summary(value_info) -> str:
+    shape = value_info.type.tensor_type.shape
+    dims = []
+    for d in shape.dim:
+        if d.dim_param:
+            dims.append(d.dim_param)
+        elif d.dim_value:
+            dims.append(str(d.dim_value))
+        else:
+            dims.append("?")
+    return f"[{', '.join(dims)}]"
+
+
+def verify_dynamic_axes(onnx_paths: Iterable[Path]) -> None:
+    import onnx
+
+    print("\n[verify] ONNX symbolic shape summary")
+    for path in onnx_paths:
+        model = onnx.load(str(path))
+        print(f"  {path}")
+        for inp in model.graph.input:
+            print(f"    input  {inp.name:14s} {_shape_summary(inp)}")
+        for out in model.graph.output:
+            print(f"    output {out.name:14s} {_shape_summary(out)}")
+
+
+def main() -> None:
+    _ensure_utf8_stdio()
+    _force_torch_load_weights_only_false()
+    parser = argparse.ArgumentParser(description="Export dynamic ONNX models for Rust-VC")
+    parser.add_argument("--project-root", type=Path, default=Path("."))
+    parser.add_argument("--hubert", type=Path, default=Path("scripts/hubert_base.pt"))
+    parser.add_argument("--rmvpe", type=Path, default=Path("scripts/rmvpe.pt"))
+    parser.add_argument("--generator", type=Path, default=Path("scripts/rv_e250_s36750.pth"))
+    parser.add_argument("--out-dir", type=Path, default=Path("model"))
+    parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--verify", action="store_true")
+    args = parser.parse_args()
+
+    project_root = args.project_root.resolve()
+    _add_scripts_to_path(project_root)
+    _ensure_lib_infer_pack_alias()
+
+    out_dir = (project_root / args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    hubert_out = out_dir / "hubert_dynamic.onnx"
+    rmvpe_out = out_dir / "rmvpe_dynamic.onnx"
+    generator_out = out_dir / "model_dynamic.onnx"
+
+    export_hubert((project_root / args.hubert).resolve(), hubert_out, args.opset, args.device)
+    export_rmvpe((project_root / args.rmvpe).resolve(), rmvpe_out, args.opset, args.device)
+    export_generator(
+        (project_root / args.generator).resolve(),
+        generator_out,
+        args.opset,
+        args.device,
+    )
+
+    verify_dynamic_axes([hubert_out, rmvpe_out, generator_out])
     if args.verify:
-        import onnxruntime as ort
-        print("\n[verify] checking model_dynamic.onnx with variable length...")
-        sess = ort.InferenceSession(os.path.join(args.out_dir, "model_dynamic.onnx"), providers=["CPUExecutionProvider"])
-        hidden_dim = sess.get_inputs()[0].shape[2] 
-        for n_frames in [50, 100, 200]:
-            out = sess.run(None, {
-                "phone":         np.zeros((1, n_frames, hidden_dim), dtype=np.float32),
-                "phone_lengths": np.array([n_frames], dtype=np.int64),
-                "pitch":         np.zeros((1, n_frames), dtype=np.int64),
-                "pitchf":        np.zeros((1, n_frames), dtype=np.float32),
-                "sid":           np.zeros((1,), dtype=np.int64),
-                "rnd":           np.zeros((1, 192, n_frames), dtype=np.float32),
-            })
-            print(f"  n_frames={n_frames} -> audio.shape={out[0].shape}")
-        print("\n✨ [verify] ALL OK")
+        print("[verify] completed")
+
 
 if __name__ == "__main__":
     main()

@@ -21,8 +21,7 @@ pub const RMVPE_FRAME_ALIGN: usize = 32;
 const HQ_RESAMPLE_HALF_TAPS: isize = 60;
 const HQ_RESAMPLE_PHASES: usize = 512;
 const HQ_DOWNSAMPLE_CUTOFF_GUARD: f32 = 0.96;
-const RMVPE_MEL_MAG_GAIN_BASE: f32 = 10.0;
-const RMVPE_MEL_MAG_GAIN_MAX: f32 = 20.0;
+const RMVPE_MEL_LOG_CLAMP: f32 = 1.0e-5;
 static HQ_RESAMPLE_BANK_CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<HqResampleBank>>>> =
     OnceLock::new();
 static RMVPE_MEL_SCALE_LOGGED: OnceLock<()> = OnceLock::new();
@@ -551,7 +550,9 @@ pub fn rmvpe_mel_from_audio_with_resampler(
         };
     }
     let (audio_16k_rms, audio_16k_peak) = signal_rms_peak(&audio_16k);
-    let mel_mag_gain = rmvpe_mel_mag_gain(audio_16k_rms, audio_16k_peak);
+    // Keep RMVPE mel magnitude scale consistent with Python reference.
+    // Dynamic pre-log gain made parity drift and destabilized F0.
+    let mel_mag_gain = 1.0_f32;
 
     let spec = stft_magnitude(&audio_16k, RVC_N_FFT, RVC_HOP_LENGTH);
     let frames = spec.ncols();
@@ -585,7 +586,7 @@ pub fn rmvpe_mel_from_audio_with_resampler(
                 let scaled_mag = mag * mel_mag_gain;
                 acc += mel_bank[(m, b)] * scaled_mag;
             }
-            let clamped = acc.max(1e-5);
+            let clamped = acc.max(RMVPE_MEL_LOG_CLAMP);
             prelog_min = prelog_min.min(clamped);
             prelog_max = prelog_max.max(clamped);
             prelog_sum += clamped as f64;
@@ -598,13 +599,13 @@ pub fn rmvpe_mel_from_audio_with_resampler(
     }
     if mel_count > 0 {
         let prelog_mean = (prelog_sum / mel_count as f64) as f32;
-        let all_floor = prelog_max <= 1.0001e-5;
+        let all_floor = prelog_max <= RMVPE_MEL_LOG_CLAMP * 1.0001;
         if all_floor {
             let seen = RMVPE_MEL_FLOOR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if seen <= 8 || seen % 64 == 0 {
                 eprintln!(
                     "[vc-signal] warning: rmvpe mel is floor-only (all {:.1e}); likely near-silence or gated input. src_rate={} len_16k={} rms={:.3e} peak={:.3e} count={}",
-                    1.0e-5_f32,
+                    RMVPE_MEL_LOG_CLAMP,
                     src_rate,
                     audio_16k.len(),
                     audio_16k_rms,
@@ -764,13 +765,13 @@ fn mel_filter_bank(
 ) -> Array2<f32> {
     let n_fft = (stft_bins.saturating_sub(1)) * 2;
     let sr = sample_rate as f32;
-    let mel_min = hz_to_mel_slaney(fmin.max(0.0));
-    let mel_max = hz_to_mel_slaney(fmax.min(sr * 0.5));
+    let mel_min = hz_to_mel_htk(fmin.max(0.0));
+    let mel_max = hz_to_mel_htk(fmax.min(sr * 0.5));
 
     let mut mel_points = vec![0.0_f32; mel_bins + 2];
     for (i, v) in mel_points.iter_mut().enumerate() {
         let frac = i as f32 / (mel_bins + 1) as f32;
-        *v = mel_to_hz_slaney(mel_min + frac * (mel_max - mel_min));
+        *v = mel_to_hz_htk(mel_min + frac * (mel_max - mel_min));
     }
 
     let mut fb = Array2::<f32>::zeros((mel_bins, stft_bins));
@@ -794,7 +795,7 @@ fn mel_filter_bank(
             fb[(m, b)] = lower.min(upper).max(0.0);
         }
 
-        // Match librosa(norm="slaney"):
+        // Match librosa.filters.mel(..., htk=True, norm="slaney"):
         // scale each triangular filter by 2 / (f_right - f_left).
         let enorm = 2.0_f32 / (right_hz - left_hz).max(1.0e-12);
         for b in 0..stft_bins {
@@ -804,32 +805,14 @@ fn mel_filter_bank(
     fb
 }
 
-fn hz_to_mel_slaney(hz: f32) -> f32 {
-    // librosa default (htk=False) / Slaney Auditory Toolbox scale.
-    // piecewise-linear below 1kHz, logarithmic above.
-    let f_sp = 200.0_f32 / 3.0_f32;
-    let min_log_hz = 1_000.0_f32;
-    let min_log_mel = min_log_hz / f_sp;
-    let logstep = (6.4_f32).ln() / 27.0_f32;
-
-    if hz < min_log_hz {
-        hz / f_sp
-    } else {
-        min_log_mel + (hz / min_log_hz).ln() / logstep
-    }
+fn hz_to_mel_htk(hz: f32) -> f32 {
+    // librosa(htk=True): 2595 * log10(1 + hz/700)
+    2595.0_f32 * (1.0_f32 + hz.max(0.0) / 700.0_f32).log10()
 }
 
-fn mel_to_hz_slaney(mel: f32) -> f32 {
-    let f_sp = 200.0_f32 / 3.0_f32;
-    let min_log_hz = 1_000.0_f32;
-    let min_log_mel = min_log_hz / f_sp;
-    let logstep = (6.4_f32).ln() / 27.0_f32;
-
-    if mel < min_log_mel {
-        mel * f_sp
-    } else {
-        min_log_hz * ((mel - min_log_mel) * logstep).exp()
-    }
+fn mel_to_hz_htk(mel: f32) -> f32 {
+    // librosa(htk=True) inverse
+    700.0_f32 * (10.0_f32.powf(mel / 2595.0_f32) - 1.0_f32)
 }
 
 fn align_up(value: usize, align: usize) -> usize {
@@ -850,24 +833,6 @@ fn signal_rms_peak(samples: &[f32]) -> (f32, f32) {
         peak = peak.max(s.abs());
     }
     ((sum_sq / samples.len() as f32).sqrt(), peak)
-}
-
-fn rmvpe_mel_mag_gain(rms: f32, peak: f32) -> f32 {
-    // Keep base gain at 10x and allow up to 20x for low-energy inputs.
-    // This improves voiced detection in whisper/decay regions without
-    // permanently over-amplifying already-strong frames.
-    let peak_boost = if peak > 1.0e-4 {
-        (0.2 / peak).clamp(1.0, 2.0)
-    } else {
-        2.0
-    };
-    let rms_boost = if rms > 1.0e-5 {
-        (0.02 / rms).clamp(1.0, 2.0)
-    } else {
-        2.0
-    };
-    let boost = peak_boost.max(rms_boost);
-    (RMVPE_MEL_MAG_GAIN_BASE * boost).clamp(RMVPE_MEL_MAG_GAIN_BASE, RMVPE_MEL_MAG_GAIN_MAX)
 }
 
 fn reflect_pad_center(signal: &[f32], pad: usize) -> Vec<f32> {
@@ -973,13 +938,13 @@ mod tests {
     }
 
     #[test]
-    fn slaney_mel_known_points_match_librosa_definition() {
-        // librosa(hkt=False) reference points:
-        // 1000 Hz <-> 15 mel
-        let mel_1k = hz_to_mel_slaney(1_000.0);
-        assert!((mel_1k - 15.0).abs() < 1e-4);
-        let hz_15 = mel_to_hz_slaney(15.0);
-        assert!((hz_15 - 1_000.0).abs() < 1e-3);
+    fn htk_mel_known_points_match_librosa_definition() {
+        // librosa(htk=True) reference points:
+        // 1000 Hz <-> ~1000 mel
+        let mel_1k = hz_to_mel_htk(1_000.0);
+        assert!((mel_1k - 1_000.0).abs() < 5e-2);
+        let hz_1k_mel = mel_to_hz_htk(1_000.0);
+        assert!((hz_1k_mel - 1_000.0).abs() < 5e-2);
     }
 
     #[test]

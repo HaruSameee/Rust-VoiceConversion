@@ -1,6 +1,7 @@
 //! audio_pipeline.rs
 //! DSP post-processing for RVC real-time inference.
-//! Fixes: feature resampling (49→50 frames), symmetric OLA crossfade,
+//! This module keeps legacy 50-frame feature helpers plus OLA/F0 utilities.
+//! Fixes: feature resampling (49->50 frames), symmetric OLA crossfade,
 //!        F0 smoothing with log-domain EMA and voiced hysteresis.
 
 use ndarray::{Array2, ArrayView2};
@@ -40,9 +41,8 @@ fn allocate_dst(features: ArrayView2<'_, f32>, dst_frames: usize) -> Array2<f32>
     Array2::<f32>::zeros((dst_frames, features.shape()[1]))
 }
 
-/// Resamples feature frames to the decoder contract using linear interpolation.
-///
-/// The destination frame count is fixed to 50 for RVC decoder input.
+/// Resamples feature frames to the legacy 50-frame decoder contract
+/// using linear interpolation.
 #[inline]
 pub fn resample_features_linear(features: ArrayView2<f32>) -> Array2<f32> {
     resample_features_linear_to(features, DECODER_FRAMES)
@@ -80,9 +80,8 @@ fn resample_features_linear_to(features: ArrayView2<'_, f32>, dst_frames: usize)
     out
 }
 
-/// Resamples feature frames to the decoder contract using Catmull-Rom spline interpolation.
-///
-/// The destination frame count is fixed to 50 for RVC decoder input.
+/// Resamples feature frames to the legacy 50-frame decoder contract
+/// using Catmull-Rom spline interpolation.
 #[inline]
 pub fn resample_features_catmull_rom(features: ArrayView2<f32>) -> Array2<f32> {
     resample_features_catmull_rom_to(features, DECODER_FRAMES)
@@ -308,7 +307,7 @@ impl InferencePipeline {
         }
     }
 
-    /// Resamples HuBERT features to decoder frame contract.
+    /// Resamples HuBERT features with the legacy 50-frame helper.
     #[inline]
     pub fn prepare_features(&self, raw_features: ArrayView2<f32>) -> Array2<f32> {
         resample_features_catmull_rom(raw_features)

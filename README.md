@@ -1,41 +1,59 @@
-﻿# Rust-VC
+# Rust-VC
 
-## 日本語
-Rust + Tauri で構成した、リアルタイム RVC 推論エンジンです。  
-ONNX Runtime で `HuBERT / RMVPE / RVC Decoder` を実行します。
+Rust + Tauri real-time RVC inference engine (ONNX Runtime).
 
-### 主な構成
-- `crates/vc-core`: 共通設定・トレイト・パイプライン定義
-- `crates/vc-signal`: リサンプル/DSP
-- `crates/vc-inference`: ONNX 推論エンジン
-- `crates/vc-audio`: リアルタイム音声 I/O とバッファ制御
-- `apps/tauri/src-tauri`: Tauri バックエンド
-- `apps/tauri/ui`: フロントエンド
-- `scripts`: エクスポート/検証スクリプト
+## Repository Layout
+- `crates/vc-core`: runtime/model config and shared types
+- `crates/vc-signal`: DSP utilities (resample, mel, f0 helpers)
+- `crates/vc-inference`: HuBERT / RMVPE / Generator inference
+- `crates/vc-audio`: realtime IO, queueing, SOLA/OLA, VAD flow
+- `apps/tauri/src-tauri`: backend commands and app lifecycle
+- `apps/tauri/ui`: frontend settings UI
+- `scripts`: export / verification tooling
 
-### ドキュメント
-- 実行手順: `RUN.md`
-- 開発タスク: `TODO.md`
+## Getting Started
+Run guide is in `RUN.md`.
 
-### 補足
-- デバッグ WAV ダンプ（`debug_input.wav` / `debug_output.wav`）は UI の `record_dump` で ON/OFF できます。
+Quick start:
+```powershell
+npm --prefix apps/tauri/ui install
+cargo tauri dev
+```
 
-## English
-Rust-VC is a real-time RVC inference engine built with Rust + Tauri.  
-It runs `HuBERT / RMVPE / RVC Decoder` on ONNX Runtime.
+## Runtime Notes
+- `process_window` is computed in `vc-audio` from block geometry.
+- Playback queue size is controlled by `target_buffer_ms` (independent from process window).
+- Decoder slice tuning is controlled by:
+  - `output_slice_offset_samples`
+  - `sola_search_ms`
+  - `output_tail_offset_ms`
+- Debug dump can be enabled with `record_dump=true` (writes `debug_input.wav` / `debug_output.wav`).
 
-### Project layout
-- `crates/vc-core`: shared config/traits/pipeline
-- `crates/vc-signal`: resampling and DSP helpers
-- `crates/vc-inference`: ONNX inference engine
-- `crates/vc-audio`: real-time audio I/O and buffering
-- `apps/tauri/src-tauri`: Tauri backend
-- `apps/tauri/ui`: frontend
-- `scripts`: export/patch/verification scripts
+## Alignment / Parity Workflow
+1. Enable `record_dump` in UI, speak a few seconds, stop engine.
+2. Measure lag:
+```powershell
+python scripts/verify_alignment.py --input debug_input.wav --output debug_output.wav --sample-rate 48000 --current-slice-offset 6054
+```
+3. Compare RMVPE mel parity:
+```powershell
+python scripts/verify_rmvpe_mel_parity.py --input apps/tauri/src-tauri/debug_input.wav --run-rust-dump --rust-csv rust_mel.csv --save-prefix mel_parity
+```
 
-### Docs
-- Run guide: `RUN.md`
-- Development tasks: `TODO.md`
+## Git Hygiene
+- Model artifacts and large local assets under `model/` are ignored by `.gitignore`.
+- Local debug dumps (`debug_*.wav`, `mel_parity_*.npy`, logs) are ignored.
+- Before commit, run:
+```powershell
+cargo check -p vc-inference
+cargo check -p vc-audio
+cargo check -p rust-vc-tauri
+```
 
-### Note
-- Debug WAV dump (`debug_input.wav` / `debug_output.wav`) is toggled by the UI `record_dump` option.
+## Dev Build Performance
+Workspace enables higher `dev` optimization for hot crates to keep `cargo tauri dev` usable:
+- `vc-inference`
+- `vc-audio`
+- `vc-signal`
+- `ort`
+- `ndarray`

@@ -160,7 +160,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.inter_threads = clamped_inter;
     }
     log_debug(&format!(
-        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
         config.sample_rate,
         config.block_size,
         config.input_device_name,
@@ -173,6 +173,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.sola_search_ms,
         config.output_tail_offset_ms,
         config.output_slice_offset_samples,
+        config.bypass_slicing,
         config.record_dump,
         config.pitch_shift_semitones,
         config.index_rate,
@@ -183,6 +184,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.rmvpe_threshold,
         config.pitch_smooth_alpha,
         config.rms_mix_rate,
+        config.post_filter_alpha,
         config.f0_median_filter_radius,
         config.ort_provider,
         config.ort_device_id,
@@ -256,7 +258,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             std::env::var("ORT_DYLIB_PATH").ok()
         ));
         log_debug(&format!(
-            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
             model.model_path,
             model.hubert_path,
             model.pitch_extractor_path,
@@ -273,6 +275,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.sola_search_ms,
             runtime_config.output_tail_offset_ms,
             runtime_config.output_slice_offset_samples,
+            runtime_config.bypass_slicing,
             runtime_config.record_dump,
             runtime_config.pitch_shift_semitones,
             runtime_config.index_rate,
@@ -283,6 +286,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.rmvpe_threshold,
             runtime_config.pitch_smooth_alpha,
             runtime_config.rms_mix_rate,
+            runtime_config.post_filter_alpha,
             runtime_config.f0_median_filter_radius,
             runtime_config.ort_provider,
             runtime_config.ort_device_id,
@@ -320,6 +324,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
                 sola_search_ms: runtime_config.sola_search_ms,
                 output_tail_offset_ms: runtime_config.output_tail_offset_ms,
                 output_slice_offset_samples: runtime_config.output_slice_offset_samples,
+                bypass_slicing: runtime_config.bypass_slicing,
                 record_dump: runtime_config.record_dump,
             },
         )
@@ -546,8 +551,11 @@ fn default_runtime_config() -> RuntimeConfig {
     if let Some(v) = env_usize("RUST_VC_OUTPUT_SLICE_OFFSET_SAMPLES") {
         cfg.output_slice_offset_samples = v;
     }
+    if let Some(v) = env_bool("RUST_VC_BYPASS_SLICING") {
+        cfg.bypass_slicing = v;
+    }
     log_debug(&format!(
-        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} target_buffer_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} record_dump={}",
+        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} target_buffer_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
         cfg.ort_provider,
         cfg.ort_device_id,
         cfg.ort_gpu_mem_limit_mb,
@@ -567,6 +575,7 @@ fn default_runtime_config() -> RuntimeConfig {
         cfg.sola_search_ms,
         cfg.output_tail_offset_ms,
         cfg.output_slice_offset_samples,
+        cfg.bypass_slicing,
         cfg.record_dump
     ));
 

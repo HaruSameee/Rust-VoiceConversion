@@ -37,3 +37,6 @@ opt-level = 3
 
 [profile.dev.package.ort]
 opt-level = 3
+
+[profile.dev.package.ndarray]
+opt-level = 3
