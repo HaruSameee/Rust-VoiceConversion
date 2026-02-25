@@ -159,8 +159,44 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         ));
         config.inter_threads = clamped_inter;
     }
+    let clamped_rows = config.index_search_rows.max(1);
+    if clamped_rows != config.index_search_rows {
+        log_debug(&format!(
+            "set_runtime_config_cmd index_search_rows clamped: {} -> {}",
+            config.index_search_rows, clamped_rows
+        ));
+        config.index_search_rows = clamped_rows;
+    }
+    if config.index_search_rows > 10_000 {
+        log_debug(&format!(
+            "warning: large index_search_rows={} may increase CPU time significantly",
+            config.index_search_rows
+        ));
+    }
+    let clamped_top_k = config.index_top_k.max(1).min(config.index_search_rows);
+    if clamped_top_k != config.index_top_k {
+        log_debug(&format!(
+            "set_runtime_config_cmd index_top_k clamped: {} -> {} (rows={})",
+            config.index_top_k, clamped_top_k, config.index_search_rows
+        ));
+        config.index_top_k = clamped_top_k;
+    }
+    if !config.vad_on_threshold.is_finite() {
+        config.vad_on_threshold = config.response_threshold;
+    }
+    if config.vad_on_threshold == 0.0 && config.response_threshold != 0.0 {
+        config.vad_on_threshold = config.response_threshold;
+    }
+    if !config.vad_off_threshold.is_finite() {
+        config.vad_off_threshold = derive_vad_off_threshold(config.vad_on_threshold);
+    }
+    if config.vad_off_threshold == 0.0 && config.vad_on_threshold != 0.0 {
+        config.vad_off_threshold = derive_vad_off_threshold(config.vad_on_threshold);
+    }
+    // Keep legacy field aligned for older subsystems and saved presets.
+    config.response_threshold = config.vad_on_threshold;
     log_debug(&format!(
-        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
         config.sample_rate,
         config.block_size,
         config.input_device_name,
@@ -168,6 +204,8 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.extra_inference_ms,
         config.target_buffer_ms,
         config.response_threshold,
+        config.vad_on_threshold,
+        config.vad_off_threshold,
         config.fade_in_ms,
         config.fade_out_ms,
         config.sola_search_ms,
@@ -210,7 +248,16 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
             "changing intra_threads/inter_threads requires model reload; stop_engine_cmd first, then call set_runtime_config_cmd again.".to_string(),
         );
     }
+    let running = guard.running;
+    let index_rows = config.index_search_rows;
+    let index_top_k = config.index_top_k;
     guard.config = config;
+    if running {
+        if let Some(task) = guard.engine_task.as_ref() {
+            task.update_index_search_params(index_rows, index_top_k)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -258,7 +305,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             std::env::var("ORT_DYLIB_PATH").ok()
         ));
         log_debug(&format!(
-            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
             model.model_path,
             model.hubert_path,
             model.pitch_extractor_path,
@@ -270,6 +317,8 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.extra_inference_ms,
             runtime_config.target_buffer_ms,
             runtime_config.response_threshold,
+            runtime_config.vad_on_threshold,
+            runtime_config.vad_off_threshold,
             runtime_config.fade_in_ms,
             runtime_config.fade_out_ms,
             runtime_config.sola_search_ms,
@@ -319,6 +368,8 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
                 extra_inference_ms: runtime_config.extra_inference_ms,
                 target_buffer_ms: runtime_config.target_buffer_ms,
                 response_threshold: runtime_config.response_threshold,
+                vad_on_threshold: runtime_config.vad_on_threshold,
+                vad_off_threshold: runtime_config.vad_off_threshold,
                 fade_in_ms: runtime_config.fade_in_ms,
                 fade_out_ms: runtime_config.fade_out_ms,
                 sola_search_ms: runtime_config.sola_search_ms,
@@ -542,6 +593,22 @@ fn default_runtime_config() -> RuntimeConfig {
     if let Some(v) = env_u32("RUST_VC_TARGET_BUFFER_MS") {
         cfg.target_buffer_ms = v.max(1);
     }
+    if let Some(v) = env_f32("RUST_VC_RESPONSE_THRESHOLD") {
+        cfg.response_threshold = v;
+    }
+    if let Some(v) = env_f32("RUST_VC_VAD_ON_THRESHOLD") {
+        cfg.vad_on_threshold = v;
+        cfg.response_threshold = v;
+    } else {
+        cfg.vad_on_threshold = cfg.response_threshold;
+    }
+    if let Some(v) = env_f32("RUST_VC_VAD_OFF_THRESHOLD") {
+        cfg.vad_off_threshold = v;
+    } else if cfg.vad_on_threshold != 0.0 {
+        cfg.vad_off_threshold = derive_vad_off_threshold(cfg.vad_on_threshold);
+    } else {
+        cfg.vad_off_threshold = 0.0;
+    }
     if let Some(v) = env_u32("RUST_VC_SOLA_SEARCH_MS") {
         cfg.sola_search_ms = v.max(1);
     }
@@ -555,7 +622,7 @@ fn default_runtime_config() -> RuntimeConfig {
         cfg.bypass_slicing = v;
     }
     log_debug(&format!(
-        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} target_buffer_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
+        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
         cfg.ort_provider,
         cfg.ort_device_id,
         cfg.ort_gpu_mem_limit_mb,
@@ -572,6 +639,9 @@ fn default_runtime_config() -> RuntimeConfig {
         cfg.index_bin_dim,
         cfg.index_max_vectors,
         cfg.target_buffer_ms,
+        cfg.response_threshold,
+        cfg.vad_on_threshold,
+        cfg.vad_off_threshold,
         cfg.sola_search_ms,
         cfg.output_tail_offset_ms,
         cfg.output_slice_offset_samples,
@@ -580,6 +650,17 @@ fn default_runtime_config() -> RuntimeConfig {
     ));
 
     cfg
+}
+
+fn derive_vad_off_threshold(vad_on_threshold: f32) -> f32 {
+    if !vad_on_threshold.is_finite() || vad_on_threshold == 0.0 {
+        return 0.0;
+    }
+    if vad_on_threshold < 0.0 {
+        (vad_on_threshold - 15.0).max(-120.0)
+    } else {
+        (vad_on_threshold * 0.177_827_94).max(0.0)
+    }
 }
 
 fn resolve_model_config_for_start(mut model: ModelConfig) -> Result<ModelConfig, String> {

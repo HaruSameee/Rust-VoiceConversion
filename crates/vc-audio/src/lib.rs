@@ -25,6 +25,8 @@ const VAD_RECOVERY_FADE_MS: u32 = 5;
 const FIXED_BOUNDARY_MICROFADE_SAMPLES: usize = 32;
 const PROCESS_WINDOW_BLOCK_MULTIPLIER: usize = 2;
 const DEBUG_DUMP_MAX_SECONDS: usize = 20;
+const VAD_OFF_FALLBACK_RATIO: f32 = 0.177_827_94; // ~= -15dB
+const SOLA_START_CONTINUITY_WEIGHT: f32 = 0.8; // 80% previous, 20% configured center
 
 /// Legacy helper for minimum `extra_inference_ms` style budgeting.
 ///
@@ -144,7 +146,15 @@ pub struct AudioStreamOptions {
     /// Larger values increase stability and latency.
     /// This is independent from the model context window (`process_window`).
     pub target_buffer_ms: u32,
+    /// Legacy compatibility threshold field.
+    ///
+    /// Negative values are interpreted as dBFS, positive values are linear.
+    /// Used as fallback for `vad_on_threshold` when the new fields are unset.
     pub response_threshold: f32,
+    /// VAD open threshold. Negative=dBFS, positive=linear.
+    pub vad_on_threshold: f32,
+    /// VAD close threshold. Negative=dBFS, positive=linear.
+    pub vad_off_threshold: f32,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
     pub sola_search_ms: u32,
@@ -159,6 +169,7 @@ pub struct AudioStreamOptions {
 #[derive(Debug, Clone, Copy)]
 enum WorkerControl {
     PrepareShutdown,
+    UpdateIndexSearch { rows: usize, top_k: usize },
 }
 
 impl RealtimeAudioEngine {
@@ -175,6 +186,14 @@ impl RealtimeAudioEngine {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+
+    pub fn update_index_search_params(&self, rows: usize, top_k: usize) -> Result<()> {
+        let Some(tx) = self.worker_control_tx.as_ref() else {
+            return Err(anyhow!("worker control channel is unavailable"));
+        };
+        tx.send(WorkerControl::UpdateIndexSearch { rows, top_k })
+            .map_err(|e| anyhow!("failed to send index search update to worker: {e}"))
     }
 
     fn prepare_inference_shutdown(&mut self) {
@@ -238,7 +257,12 @@ where
     let _allow_process_window_grow = options.allow_process_window_grow;
     let extra_inference_ms = options.extra_inference_ms;
     let target_buffer_ms = options.target_buffer_ms.max(1);
-    let response_threshold = normalize_response_threshold(options.response_threshold);
+    let legacy_response_threshold = normalize_response_threshold(options.response_threshold);
+    let (vad_on_threshold, vad_off_threshold) = resolve_vad_thresholds(
+        options.vad_on_threshold,
+        options.vad_off_threshold,
+        legacy_response_threshold,
+    );
     let fade_in_ms = options.fade_in_ms;
     let fade_out_ms = options.fade_out_ms;
     let sola_search_ms = options.sola_search_ms.max(1);
@@ -301,12 +325,14 @@ where
         requested_block_size
     );
     eprintln!(
-        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} target_buffer_ms={} threshold={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
+        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} target_buffer_ms={} threshold_legacy={:.4} vad_on={:.4} vad_off={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
         input_device.name().unwrap_or_else(|_| "unknown-input".to_string()),
         output_device.name().unwrap_or_else(|_| "unknown-output".to_string()),
         extra_inference_ms,
         target_buffer_ms,
-        response_threshold,
+        legacy_response_threshold,
+        vad_on_threshold,
+        vad_off_threshold,
         fade_in_ms,
         fade_out_ms,
         sola_search_ms,
@@ -347,8 +373,7 @@ where
     );
     eprintln!(
         "[vc-audio] process_window={}smp (2x block_size={})",
-        process_window_samples,
-        block_size
+        process_window_samples, block_size
     );
     let requested_target_buffer_out_samples =
         target_buffer_samples_from_ms(target_buffer_ms, output_rate).max(1);
@@ -492,7 +517,8 @@ where
             output_channels,
             extra_inference_ms,
             target_buffer_samples,
-            response_threshold,
+            vad_on_threshold,
+            vad_off_threshold,
             fade_in_ms,
             fade_out_ms,
             sola_search_ms,
@@ -768,7 +794,8 @@ fn worker_loop<E>(
     output_channels: usize,
     _extra_inference_ms: u32,
     configured_target_buffer_samples: usize,
-    response_threshold: f32,
+    vad_on_threshold: f32,
+    vad_off_threshold: f32,
     fade_in_ms: u32,
     fade_out_ms: u32,
     sola_search_ms: u32,
@@ -814,6 +841,7 @@ fn worker_loop<E>(
     let mut model_block = Vec::<f32>::with_capacity(process_window_cap.max(inference_block_size));
     let mut previous_input = vec![0.0_f32; io_block_size];
     let mut previous_output_tail = Vec::<f32>::new();
+    let mut last_final_start: Option<usize> = None;
     let mut output_rate_buf = Vec::<f32>::new();
     let input_to_model_resampler = HqResampler::new(input_rate, model_sample_rate);
     let model_to_output_resampler = HqResampler::new(model_sample_rate, output_rate);
@@ -822,11 +850,13 @@ fn worker_loop<E>(
     let silence_skips: u64 = 0;
     let mut was_active = false;
     let mut silence_streak: usize = 0;
+    let vad_gate_enabled = vad_on_threshold > 0.0;
     let mut last_heartbeat = Instant::now();
     let mut last_low_queue_warn = Instant::now();
     let block_budget = Duration::from_secs_f64(io_block_size as f64 / model_sample_rate as f64);
     let mut gate = ReactionGate::new(
-        response_threshold,
+        vad_on_threshold,
+        vad_off_threshold,
         fade_in_ms,
         fade_out_ms,
         model_sample_rate,
@@ -867,6 +897,13 @@ fn worker_loop<E>(
         edge_guard_samples,
         output_slice_offset_samples
     );
+    eprintln!(
+        "[vc-audio] vad: on_threshold={:.4} ({:.1}dB) off_threshold={:.4} ({:.1}dB)",
+        vad_on_threshold,
+        threshold_to_db(vad_on_threshold),
+        vad_off_threshold,
+        threshold_to_db(vad_off_threshold),
+    );
     if process_window_samples != target_buffer_samples {
         eprintln!(
             "[vc-audio] target_buffer independent: process_window={} target_buffer={}",
@@ -883,6 +920,15 @@ fn worker_loop<E>(
                     shutdown_prepared = true;
                     let _ = worker_shutdown_ack_tx.try_send(());
                 }
+                Ok(WorkerControl::UpdateIndexSearch { rows, top_k }) => {
+                    let clamped_rows = rows.max(1);
+                    let clamped_top_k = top_k.max(1).min(clamped_rows);
+                    voice_changer.update_index_search_params(clamped_top_k, clamped_rows);
+                    eprintln!(
+                        "[vc-audio] runtime update: index_search_rows={} index_top_k={}",
+                        clamped_rows, clamped_top_k
+                    );
+                }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {}
             }
@@ -898,7 +944,7 @@ fn worker_loop<E>(
         if let Some(samples) = recorded_in.as_mut() {
             append_samples_limited(samples, &mono, max_recorded_in_samples);
         }
-        if response_threshold > 0.0 {
+        if vad_gate_enabled {
             gate.process_block(&mut mono);
         }
 
@@ -934,11 +980,23 @@ fn worker_loop<E>(
                 sum_sq += s * s;
             }
             let block_rms = (sum_sq / step_input.len().max(1) as f32).sqrt();
-            let below_threshold = response_threshold > 0.0 && block_rms < response_threshold;
-            if below_threshold {
+            let vad_active = if !vad_gate_enabled {
+                true
+            } else if block_rms >= vad_on_threshold {
+                true
+            } else if block_rms < vad_off_threshold {
+                false
+            } else {
+                was_active
+            };
+            if vad_gate_enabled && !vad_active {
                 silence_streak = silence_streak.saturating_add(1);
             } else {
                 silence_streak = 0;
+            }
+            if was_active && !vad_active {
+                // Gate closed: clear SOLA anchor so the next activation re-centers.
+                last_final_start = None;
             }
 
             let start = Instant::now();
@@ -946,12 +1004,14 @@ fn worker_loop<E>(
             let expected_len = output_step_samples.max(1);
             let ola_overlap_samples = crossfade_samples.min(expected_len);
             // 1-block hangover: keep inference running for one extra block below threshold.
-            let bypass_inference = response_threshold > 0.0 && silence_streak > 1;
+            let bypass_inference = vad_gate_enabled && !vad_active && silence_streak > 1;
             let mut smoothed_output = if bypass_inference {
                 previous_input.fill(0.0);
+                last_final_start = None;
                 vec![0.0_f32; expected_len]
             } else {
-                let mut padded_input = Vec::<f32>::with_capacity(previous_input.len() + current_input.len());
+                let mut padded_input =
+                    Vec::<f32>::with_capacity(previous_input.len() + current_input.len());
                 padded_input.extend_from_slice(&previous_input);
                 padded_input.extend_from_slice(&current_input);
                 let model_out = match voice_changer.process_frame(&padded_input) {
@@ -968,16 +1028,52 @@ fn worker_loop<E>(
                 } else {
                     &model_out
                 };
-                // Optional bypass mode: forward full decoder output without slicing.
+                // Optional bypass mode: skip SOLA search/alignment but keep strict output length.
                 if bypass_slicing {
-                    if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
-                        eprintln!(
-                            "[vc-audio] output-slice bypass block={} model_out_len={} forwarded_full_output=true",
-                            processed_blocks + 1,
-                            output_mono.len()
-                        );
+                    last_final_start = None;
+                    let max_guard = output_mono.len().saturating_sub(1);
+                    let applied_guard = output_tail_offset_samples.min(max_guard);
+                    let source_end = output_mono.len().saturating_sub(applied_guard);
+                    let context_shift = if output_mono.len() > process_window_samples {
+                        previous_input.len()
+                    } else {
+                        0
+                    };
+                    let configured_start =
+                        output_slice_offset_samples.saturating_add(context_shift);
+                    let max_start = source_end.saturating_sub(expected_len);
+                    let slice_start = configured_start.min(max_start);
+
+                    if source_end >= expected_len {
+                        let slice_end = slice_start.saturating_add(expected_len);
+                        if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                            eprintln!(
+                                "[vc-audio] output-slice bypass block={} model_out_len={} source_end={} configured_start={} start={} len={}",
+                                processed_blocks + 1,
+                                output_mono.len(),
+                                source_end,
+                                configured_start,
+                                slice_start,
+                                expected_len
+                            );
+                        }
+                        output_mono[slice_start..slice_end].to_vec()
+                    } else {
+                        if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                            eprintln!(
+                                "[vc-audio] output-slice bypass warning: source_end={} < expected_len={}; zero-padding missing samples",
+                                source_end,
+                                expected_len
+                            );
+                        }
+                        let mut out = vec![0.0_f32; expected_len];
+                        let available = source_end.min(expected_len);
+                        if available > 0 {
+                            out[expected_len - available..expected_len]
+                                .copy_from_slice(&output_mono[source_end - available..source_end]);
+                        }
+                        out
                     }
-                    output_mono.to_vec()
                 } else {
                     // Strict slicing contract:
                     // always emit exactly `expected_len` samples from [final_start..final_end).
@@ -992,11 +1088,25 @@ fn worker_loop<E>(
                     } else {
                         0
                     };
-                    let configured_start = output_slice_offset_samples.saturating_add(context_shift);
+                    let configured_start =
+                        output_slice_offset_samples.saturating_add(context_shift);
                     let max_start = source_end.saturating_sub(expected_len);
+                    let configured_anchor = configured_start.min(max_start);
                     // `base_start` is the nominal slice anchor before SOLA correction.
-                    let base_start = configured_start.min(max_start);
-                    if configured_start > max_start && processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                    // Reuse previous `final_start` while active, but pull 20% back toward
+                    // configured center each block to avoid long-term drift.
+                    let base_start = match last_final_start {
+                        Some(prev) => {
+                            let prev_clamped = prev.min(max_start);
+                            let pulled = (prev_clamped as f32 * SOLA_START_CONTINUITY_WEIGHT
+                                + configured_anchor as f32 * (1.0 - SOLA_START_CONTINUITY_WEIGHT))
+                                .round() as usize;
+                            pulled.min(max_start)
+                        }
+                        None => configured_anchor,
+                    };
+                    if configured_start > max_start && processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS
+                    {
                         eprintln!(
                             "[vc-audio] output-slice warning: configured_start={} exceeds max_start={} for model_out_len={} (expected_len={}, tail_offset={}); clamping",
                             configured_start,
@@ -1077,8 +1187,10 @@ fn worker_loop<E>(
                     }
 
                     if source_end >= expected_len {
+                        last_final_start = Some(final_start);
                         output_mono[final_start..final_end].to_vec()
                     } else {
+                        last_final_start = None;
                         if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
                             eprintln!(
                                 "[vc-audio] output-slice warning: source_end={} < expected_len={}; zero-padding missing samples",
@@ -1099,13 +1211,13 @@ fn worker_loop<E>(
             let overlap = ola_overlap_samples
                 .min(smoothed_output.len())
                 .min(previous_output_tail.len());
-            if overlap > 0 && (!bypass_inference || was_active) {
+            if !bypass_slicing && overlap > 0 && (!bypass_inference || was_active) {
                 apply_equal_power_overlap(&previous_output_tail, &mut smoothed_output, overlap);
             }
             let boundary_overlap = boundary_fade_samples
                 .min(smoothed_output.len())
                 .min(previous_output_tail.len());
-            if boundary_overlap > 0 {
+            if !bypass_slicing && boundary_overlap > 0 {
                 apply_fixed_boundary_microfade(
                     &previous_output_tail,
                     &mut smoothed_output,
@@ -1133,11 +1245,15 @@ fn worker_loop<E>(
                     bypass_slicing
                 );
             }
-            let keep = ola_overlap_samples.max(boundary_fade_samples).min(smoothed_output.len());
             previous_output_tail.clear();
-            if keep > 0 {
-                previous_output_tail
-                    .extend_from_slice(&smoothed_output[smoothed_output.len() - keep..]);
+            if !bypass_slicing {
+                let keep = ola_overlap_samples
+                    .max(boundary_fade_samples)
+                    .min(smoothed_output.len());
+                if keep > 0 {
+                    previous_output_tail
+                        .extend_from_slice(&smoothed_output[smoothed_output.len() - keep..]);
+                }
             }
             if !bypass_inference {
                 previous_input.clear();
@@ -1288,12 +1404,18 @@ struct ReactionGate {
 }
 
 impl ReactionGate {
-    fn new(threshold: f32, fade_in_ms: u32, fade_out_ms: u32, sample_rate: u32) -> Self {
+    fn new(
+        threshold_open: f32,
+        threshold_close: f32,
+        fade_in_ms: u32,
+        fade_out_ms: u32,
+        sample_rate: u32,
+    ) -> Self {
         let sr = sample_rate.max(1) as f32;
         let attack_samples = ((fade_in_ms as f32 / 1000.0) * sr).max(1.0);
         let release_samples = ((fade_out_ms as f32 / 1000.0) * sr).max(1.0);
-        let open = threshold.clamp(0.0, 1.0);
-        let close = (open * 0.7).clamp(0.0, open);
+        let open = threshold_open.clamp(0.0, 1.0);
+        let close = threshold_close.clamp(0.0, open);
         let hold_samples = ((fade_out_ms as f32 / 1000.0) * sr * 0.5).round().max(1.0) as usize;
         Self {
             threshold_open: open,
@@ -1359,6 +1481,32 @@ fn normalize_response_threshold(raw: f32) -> f32 {
         return (10.0_f32.powf(db / 20.0)).clamp(0.0, 1.0);
     }
     raw.clamp(0.0, 1.0)
+}
+
+fn resolve_vad_thresholds(raw_on: f32, raw_off: f32, legacy_on: f32) -> (f32, f32) {
+    let mut on = normalize_response_threshold(raw_on);
+    if on <= 0.0 && legacy_on > 0.0 {
+        on = legacy_on;
+    }
+    if on <= 0.0 {
+        return (0.0, 0.0);
+    }
+
+    let mut off = normalize_response_threshold(raw_off);
+    if off <= 0.0 {
+        off = (on * VAD_OFF_FALLBACK_RATIO).clamp(0.0, on);
+    } else {
+        off = off.min(on);
+    }
+    (on, off)
+}
+
+fn threshold_to_db(threshold: f32) -> f32 {
+    if threshold <= 0.0 {
+        -120.0
+    } else {
+        20.0 * threshold.log10()
+    }
 }
 
 fn align_down(value: usize, align: usize) -> usize {
@@ -1874,6 +2022,22 @@ mod tests {
     #[test]
     fn response_threshold_keeps_linear_values() {
         assert_eq!(normalize_response_threshold(0.2), 0.2);
+    }
+
+    #[test]
+    fn resolve_vad_thresholds_uses_legacy_when_vad_on_is_unset() {
+        let legacy = normalize_response_threshold(-45.0);
+        let (on, off) = resolve_vad_thresholds(0.0, 0.0, legacy);
+        assert!((on - legacy).abs() < 1.0e-6);
+        assert!(off > 0.0);
+        assert!(off < on);
+    }
+
+    #[test]
+    fn resolve_vad_thresholds_disables_gate_when_all_inputs_zero() {
+        let (on, off) = resolve_vad_thresholds(0.0, 0.0, 0.0);
+        assert_eq!(on, 0.0);
+        assert_eq!(off, 0.0);
     }
 
     #[test]

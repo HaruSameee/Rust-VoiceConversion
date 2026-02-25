@@ -4,6 +4,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use crate::audio_pipeline::smooth_pitch_track_gaussian_inplace;
 use ndarray::{Array3, ArrayView2};
 use ort::{
     ep::{self, ArbitrarilyConfigurableExecutionProvider, ExecutionProviderDispatch},
@@ -805,36 +806,6 @@ fn update_features_buf_from_ndarray_impl(
         "failed to copy features host->CUDA",
         features_buf_host.copy_into(features_buf),
     )
-}
-
-fn smooth_pitch_track_gaussian_inplace(pitchf: &mut [f32], radius: usize) {
-    if radius == 0 || pitchf.len() < 3 {
-        return;
-    }
-    let src = pitchf.to_vec();
-    for i in 0..pitchf.len() {
-        if src[i] <= 0.0 {
-            continue;
-        }
-        let mut num = 0.0_f32;
-        let mut den = 0.0_f32;
-        let lo = i.saturating_sub(radius);
-        let hi = (i + radius + 1).min(src.len());
-        for j in lo..hi {
-            let v = src[j];
-            if v <= 0.0 {
-                continue;
-            }
-            let d = i.abs_diff(j) as f32;
-            let sigma = radius.max(1) as f32 * 0.75;
-            let w = (-0.5 * (d / sigma).powi(2)).exp();
-            num += v * w;
-            den += w;
-        }
-        if den > 1.0e-8 {
-            pitchf[i] = num / den;
-        }
-    }
 }
 
 fn next_u64(state: &mut u64) -> u64 {

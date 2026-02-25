@@ -72,11 +72,11 @@
             </div>
             <div class="field">
               <label for="indexTopK">Top K</label>
-              <input id="indexTopK" type="number" step="1" min="1" />
+              <input id="indexTopK" type="number" step="1" min="1" max="32" />
             </div>
             <div class="field">
               <label for="indexSearchRows">Index Rows</label>
-              <input id="indexSearchRows" type="number" step="256" min="0" />
+              <input id="indexSearchRows" type="number" step="100" min="100" max="20000" />
             </div>
             <div class="field">
               <label for="rmvpeThreshold">RMVPE Threshold</label>
@@ -119,8 +119,12 @@
               <input id="targetBufferMs" type="number" step="100" min="500" max="5000" value="2000" />
             </div>
             <div class="field">
-              <label for="responseThreshold">Threshold (dBFS/linear)</label>
-              <input id="responseThreshold" type="number" step="0.001" min="-90" />
+              <label for="vadOnThreshold">VAD ON Threshold (dBFS/linear)</label>
+              <input id="vadOnThreshold" type="number" step="0.001" min="-120" />
+            </div>
+            <div class="field">
+              <label for="vadOffThreshold">VAD OFF Threshold (dBFS/linear)</label>
+              <input id="vadOffThreshold" type="number" step="0.001" min="-120" />
             </div>
             <div class="field">
               <label for="fadeInMs">Fade In (ms)</label>

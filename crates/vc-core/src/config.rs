@@ -26,9 +26,11 @@ pub struct RuntimeConfig {
     pub rms_mix_rate: f32,
     /// Mild generator-output smoothing filter strength.
     ///
+    /// Note: this is the *current-sample* weight in
+    /// `y[n] = alpha*x[n] + (1-alpha)*y[n-1]` (not classic EMA naming).
     /// Range:
     /// - `0.0` disables post-filter
-    /// - `0.9..0.999` enables progressively lighter smoothing
+    /// - `0.9..0.999` keeps near pass-through with mild smoothing
     pub post_filter_alpha: f32,
     pub f0_median_filter_radius: usize,
     /// Legacy compatibility field (milliseconds).
@@ -43,7 +45,22 @@ pub struct RuntimeConfig {
     /// Runtime applies a safety floor so the effective queue is never smaller
     /// than the model context window plus one hop.
     pub target_buffer_ms: u32,
+    /// Legacy VAD threshold field.
+    ///
+    /// Backward compatibility alias for `vad_on_threshold`.
+    /// Negative values are interpreted as dBFS (e.g. `-40.0`), and
+    /// positive values are interpreted as linear amplitude.
     pub response_threshold: f32,
+    /// VAD open threshold.
+    ///
+    /// Negative values are interpreted as dBFS (e.g. `-40.0`), and
+    /// positive values are interpreted as linear amplitude.
+    pub vad_on_threshold: f32,
+    /// VAD close threshold.
+    ///
+    /// Negative values are interpreted as dBFS (e.g. `-55.0`), and
+    /// positive values are interpreted as linear amplitude.
+    pub vad_off_threshold: f32,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
     /// SOLA search range in milliseconds (output sample-rate domain).
@@ -121,10 +138,12 @@ impl Default for RuntimeConfig {
             f0_median_filter_radius: 3,
             extra_inference_ms: 250,
             target_buffer_ms: 2_000,
-            response_threshold: 0.0,
+            response_threshold: -40.0,
+            vad_on_threshold: -40.0,
+            vad_off_threshold: -55.0,
             fade_in_ms: 12,
             fade_out_ms: 120,
-            sola_search_ms: 10,
+            sola_search_ms: 40,
             output_tail_offset_ms: 0,
             output_slice_offset_samples: 24_000,
             bypass_slicing: false,

@@ -29,6 +29,8 @@ interface RuntimeConfig {
   extra_inference_ms: number;
   target_buffer_ms: number;
   response_threshold: number;
+  vad_on_threshold: number;
+  vad_off_threshold: number;
   fade_in_ms: number;
   fade_out_ms: number;
   sola_search_ms: number;
@@ -116,7 +118,8 @@ const ui = {
   f0MedianFilterRadius: $("f0MedianFilterRadius") as HTMLInputElement,
   extraInferenceMs: $("extraInferenceMs") as HTMLInputElement,
   targetBufferMs: $("targetBufferMs") as HTMLInputElement,
-  responseThreshold: $("responseThreshold") as HTMLInputElement,
+  vadOnThreshold: $("vadOnThreshold") as HTMLInputElement,
+  vadOffThreshold: $("vadOffThreshold") as HTMLInputElement,
   fadeInMs: $("fadeInMs") as HTMLInputElement,
   fadeOutMs: $("fadeOutMs") as HTMLInputElement,
   solaSearchMs: $("solaSearchMs") as HTMLInputElement,
@@ -198,8 +201,8 @@ function normalizeOptional(value: string): NullableString {
   return v.length > 0 ? v : null;
 }
 
-function finiteOr(value: number, fallback: number): number {
-  return Number.isFinite(value) ? value : fallback;
+function finiteOr(value: number | null | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function atLeast(value: number, min: number, fallback: number): number {
@@ -363,6 +366,20 @@ function initPresetUi(): void {
 }
 
 function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
+  const sanitizedIndexRows = Math.round(clamp(raw.index_search_rows, 100, 20000, 2048));
+  const sanitizedTopK = Math.round(clamp(raw.index_top_k, 1, 32, 8));
+  const normalizedVadOn = finiteOr(
+    (raw as Partial<RuntimeConfig>).vad_on_threshold,
+    finiteOr(raw.response_threshold, -40.0)
+  );
+  const normalizedVadOff = finiteOr(
+    (raw as Partial<RuntimeConfig>).vad_off_threshold,
+    normalizedVadOn === 0.0
+      ? 0.0
+      : normalizedVadOn < 0.0
+      ? Math.max(-120.0, normalizedVadOn - 15.0)
+      : Math.max(0.0, normalizedVadOn * 0.17782794)
+  );
   return {
     input_gain: atLeast(raw.input_gain, 0.0, 1.0),
     output_gain: atLeast(raw.output_gain, 0.0, 1.0),
@@ -371,8 +388,8 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     pitch_shift_semitones: clamp(raw.pitch_shift_semitones, -24.0, 24.0, 0.0),
     index_rate: atLeast(raw.index_rate, 0.0, 0.3),
     index_smooth_alpha: atLeast(raw.index_smooth_alpha, 0.0, 0.85),
-    index_top_k: intAtLeast(raw.index_top_k, 1, 8),
-    index_search_rows: intAtLeast(raw.index_search_rows, 0, 2048),
+    index_top_k: Math.min(sanitizedTopK, sanitizedIndexRows),
+    index_search_rows: sanitizedIndexRows,
     protect: atLeast(raw.protect, 0.0, 0.33),
     rmvpe_threshold: atLeast(raw.rmvpe_threshold, 0.0, 0.01),
     pitch_smooth_alpha: atLeast(raw.pitch_smooth_alpha, 0.0, 0.12),
@@ -382,10 +399,12 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     f0_median_filter_radius: intAtLeast(raw.f0_median_filter_radius, 0, 3),
     extra_inference_ms: intAtLeast(raw.extra_inference_ms, 0, 0),
     target_buffer_ms: intAtLeast(raw.target_buffer_ms, 500, 2000),
-    response_threshold: finiteOr(raw.response_threshold, -50.0),
+    response_threshold: normalizedVadOn,
+    vad_on_threshold: normalizedVadOn,
+    vad_off_threshold: normalizedVadOff,
     fade_in_ms: intAtLeast(raw.fade_in_ms, 0, 12),
     fade_out_ms: intAtLeast(raw.fade_out_ms, 0, 120),
-    sola_search_ms: intAtLeast(raw.sola_search_ms, 1, 10),
+    sola_search_ms: intAtLeast(raw.sola_search_ms, 1, 40),
     output_tail_offset_ms: intAtLeast(raw.output_tail_offset_ms, 0, 0),
     output_slice_offset_samples: normalizeSliceOffsetSamples(raw.output_slice_offset_samples),
     bypass_slicing: Boolean(raw.bypass_slicing),
@@ -445,7 +464,9 @@ function runtimeFromInputs(): RuntimeConfig {
     f0_median_filter_radius: Number(ui.f0MedianFilterRadius.value),
     extra_inference_ms: Number(ui.extraInferenceMs.value),
     target_buffer_ms: Number(ui.targetBufferMs.value),
-    response_threshold: Number(ui.responseThreshold.value),
+    response_threshold: Number(ui.vadOnThreshold.value),
+    vad_on_threshold: Number(ui.vadOnThreshold.value),
+    vad_off_threshold: Number(ui.vadOffThreshold.value),
     fade_in_ms: Number(ui.fadeInMs.value),
     fade_out_ms: Number(ui.fadeOutMs.value),
     sola_search_ms: Number(ui.solaSearchMs.value),
@@ -499,7 +520,8 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.f0MedianFilterRadius.value = String(config.f0_median_filter_radius);
   ui.extraInferenceMs.value = String(config.extra_inference_ms);
   ui.targetBufferMs.value = String(config.target_buffer_ms);
-  ui.responseThreshold.value = String(config.response_threshold);
+  ui.vadOnThreshold.value = String(config.vad_on_threshold);
+  ui.vadOffThreshold.value = String(config.vad_off_threshold);
   ui.fadeInMs.value = String(config.fade_in_ms);
   ui.fadeOutMs.value = String(config.fade_out_ms);
   ui.solaSearchMs.value = String(config.sola_search_ms);
@@ -676,6 +698,12 @@ ui.sliceOffsetSamples.addEventListener("input", () => {
 });
 ui.bypassSlicing.addEventListener("change", () => {
   void runAction("save_runtime_live_bypass", saveRuntimeOnly);
+});
+ui.indexSearchRows.addEventListener("input", () => {
+  void runAction("save_runtime_live_index_rows", saveRuntimeOnly);
+});
+ui.indexTopK.addEventListener("input", () => {
+  void runAction("save_runtime_live_index_top_k", saveRuntimeOnly);
 });
 for (const btn of ui.tabButtons) {
   btn.addEventListener("click", () => {

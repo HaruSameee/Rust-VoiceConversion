@@ -204,6 +204,12 @@ struct PitchEstimate {
     confidence: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct IndexBlendStats {
+    rows: usize,
+    top_k: usize,
+}
+
 pub struct RvcOrtEngine {
     model: ModelConfig,
     rvc_session: Session,
@@ -229,6 +235,9 @@ pub struct RvcOrtEngine {
     hop_samples_16k: usize,
     rnd_state: u64,
     infer_block_count: u64,
+    post_filter_prev_sample: f32,
+    post_filter_prev_valid: bool,
+    post_filter_sample_rate: u32,
 }
 
 impl RvcOrtEngine {
@@ -420,19 +429,14 @@ impl RvcOrtEngine {
             );
             eprintln!(
                 "[vc-inference] context_window initialized: {} zeros (context={}smp hop={}smp)",
-                context_samples,
-                context_samples,
-                hop_samples_16k
+                context_samples, context_samples, hop_samples_16k
             );
             let post_filter_alpha = if runtime_config.post_filter_alpha.is_finite() {
                 runtime_config.post_filter_alpha.clamp(0.0, 0.999)
             } else {
                 0.96
             };
-            eprintln!(
-                "[vc-inference] post_filter: alpha={:.2}",
-                post_filter_alpha
-            );
+            eprintln!("[vc-inference] post_filter: alpha={:.2}", post_filter_alpha);
             eprintln!(
                 "[vc-inference] confidence_gate: rmvpe_th={:.3} applied to index blend",
                 runtime_config.rmvpe_threshold.max(0.0)
@@ -477,6 +481,9 @@ impl RvcOrtEngine {
                 hop_samples_16k,
                 rnd_state: 0x9E37_79B9_7F4A_7C15,
                 infer_block_count: 0,
+                post_filter_prev_sample: 0.0,
+                post_filter_prev_valid: false,
+                post_filter_sample_rate: runtime_config.sample_rate.max(1),
             })
         }));
 
@@ -532,10 +539,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let input_name_lc = input_name.to_ascii_lowercase();
         let expects_mel = input_name_lc.contains("mel")
             || input_shape.as_ref().is_some_and(|shape| {
-                shape.len() == 3
-                    && shape
-                        .get(1)
-                        .is_some_and(|&d| d <= 0 || d as usize == 128)
+                shape.len() == 3 && shape.get(1).is_some_and(|&d| d <= 0 || d as usize == 128)
             });
         let input_tensor = if expects_mel {
             let mel = rmvpe_mel_from_audio(source_16k, RMVPE_SAMPLE_RATE);
@@ -639,10 +643,15 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             }
             let input_tensor = tensor_from_audio_rank_owned(rank.max(2), window.to_vec())?;
             let outputs = session
-                .run(vec![(input_name.clone(), SessionInputValue::from(input_tensor))])
+                .run(vec![(
+                    input_name.clone(),
+                    SessionInputValue::from(input_tensor),
+                )])
                 .map_err(|e| VcError::Inference(format!("hubert inference failed: {e}")))?;
             if outputs.len() == 0 {
-                return Err(VcError::Inference("hubert output tensor is empty".to_string()));
+                return Err(VcError::Inference(
+                    "hubert output tensor is empty".to_string(),
+                ));
             }
             let mut selected = None::<Array3<f32>>;
             for (_, output) in &outputs {
@@ -747,14 +756,16 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         );
         self.hubert_context_tail_16k = context_tail;
 
-        let total_frames = segments.iter().map(|seg| seg.shape()[1]).sum::<usize>().max(1);
+        let total_frames = segments
+            .iter()
+            .map(|seg| seg.shape()[1])
+            .sum::<usize>()
+            .max(1);
         let mut concat = Array3::<f32>::zeros((1, total_frames, phone_feature_dim));
         let mut pos = 0usize;
         for seg in &segments {
             let len = seg.shape()[1];
-            concat
-                .slice_mut(s![.., pos..pos + len, ..])
-                .assign(seg);
+            concat.slice_mut(s![.., pos..pos + len, ..]).assign(seg);
             pos += len;
         }
 
@@ -808,8 +819,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             if keep > 0 {
                 let src_start = self.hubert_context_tail_16k.len() - keep;
                 let dst_start = hubert_context_len - keep;
-                next[dst_start..]
-                    .copy_from_slice(&self.hubert_context_tail_16k[src_start..]);
+                next[dst_start..].copy_from_slice(&self.hubert_context_tail_16k[src_start..]);
             }
             self.hubert_context_tail_16k = next;
         }
@@ -853,14 +863,19 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         config: &RuntimeConfig,
         confidence: &[f32],
         rmvpe_threshold: f32,
-    ) {
+    ) -> IndexBlendStats {
+        let requested_rows = config.index_search_rows.max(1);
+        let requested_top_k = config.index_top_k.max(1).min(requested_rows);
         let Some(index) = &self.feature_index else {
             self.index_prev_vector.clear();
-            return;
+            return IndexBlendStats {
+                rows: requested_rows,
+                top_k: requested_top_k,
+            };
         };
         if index.vectors.nrows() == 0 || index.vectors.ncols() == 0 {
             self.index_prev_vector.clear();
-            return;
+            return IndexBlendStats { rows: 0, top_k: 0 };
         }
         let rate = if config.index_rate.is_finite() {
             config.index_rate.max(0.0)
@@ -869,32 +884,21 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         };
         if rate <= f32::EPSILON {
             self.index_prev_vector.clear();
-            return;
+            return IndexBlendStats {
+                rows: requested_rows.min(index.vectors.nrows()),
+                top_k: requested_top_k.min(index.vectors.nrows().max(1)),
+            };
         }
         let index_smooth = if config.index_smooth_alpha.is_finite() {
             config.index_smooth_alpha.max(0.0)
         } else {
             0.0
         };
-        let top_k = config.index_top_k.max(1);
-
         let frames = phone.shape()[1];
         let dims = phone.shape()[2];
         let total_rows = index.vectors.nrows();
-        // `index_search_rows=0` means full index scan.
-        // Non-zero values intentionally cap search width for latency control.
-        let mut search_rows = if config.index_search_rows == 0 {
-            total_rows
-        } else {
-            config.index_search_rows.min(total_rows)
-        }
-        .max(top_k);
-        // Lower index influence should also lower search cost.
-        // This keeps CPU work proportional when index blend is nearly disabled.
-        if rate < 1.0 {
-            let scaled = ((search_rows as f32) * rate.max(0.15)).round() as usize;
-            search_rows = scaled.max(top_k).min(total_rows);
-        }
+        let search_rows = requested_rows.min(total_rows);
+        let top_k = requested_top_k.min(search_rows.max(1));
         let frame_search_stride = if search_rows >= 4_096 {
             3
         } else if search_rows >= 2_048 {
@@ -910,9 +914,12 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
                 index.vectors_t.nrows()
             );
             self.index_prev_vector.clear();
-            return;
+            return IndexBlendStats {
+                rows: search_rows,
+                top_k,
+            };
         }
-        let search_rows = search_rows.min(index.vectors_t.ncols());
+        let search_rows = search_rows.min(index.vectors_t.ncols()).max(1);
         let vectors_t_sub = index.vectors_t.slice(s![.., ..search_rows]);
         // Batched score computation:
         // phone [frames, dims] x index_t_sub [dims, search_rows] -> [frames, search_rows].
@@ -925,11 +932,18 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             vec![0.0_f32; dims]
         };
         let mut has_prev = self.index_prev_vector.len() == dims;
+        let conf_threshold = rmvpe_threshold.clamp(0.0, 1.0);
+        let conf_denom = (1.0 - conf_threshold).max(1.0e-6);
 
         for t in 0..frames {
             let conf = confidence.get(t).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let frame_rate = if conf >= rmvpe_threshold {
-                rate * conf
+            // Confidence-gated rate:
+            // - below threshold: no index blend
+            // - threshold..1.0: remap to 0..1, then scale by index_rate
+            // This keeps full `index_rate` available at conf=1.0.
+            let frame_rate = if conf > conf_threshold {
+                let conf_norm = ((conf - conf_threshold) / conf_denom).clamp(0.0, 1.0);
+                rate * conf_norm
             } else {
                 0.0
             };
@@ -990,6 +1004,10 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             has_prev = true;
         }
         self.index_prev_vector = prev_vec;
+        IndexBlendStats {
+            rows: search_rows,
+            top_k,
+        }
     }
 
     fn run_rvc(
@@ -1191,6 +1209,14 @@ impl InferenceEngine for RvcOrtEngine {
     fn infer_frame(&mut self, frame: &[f32], config: &RuntimeConfig) -> Result<Vec<f32>> {
         let mut infer = || -> Result<Vec<f32>> {
             let mut infer_hop = |hop_input: &[f32]| -> Result<Vec<f32>> {
+                let current_sr = config.sample_rate.max(1);
+                if self.post_filter_sample_rate != current_sr {
+                    // Post-filter is stateful; reset when sample-rate changes so
+                    // previous-block state is never reused across different SR domains.
+                    self.post_filter_prev_sample = 0.0;
+                    self.post_filter_prev_valid = false;
+                    self.post_filter_sample_rate = current_sr;
+                }
                 self.infer_block_count = self.infer_block_count.saturating_add(1);
                 let infer_block_count = self.infer_block_count;
                 let emit_timing = infer_block_count % TIMING_LOG_EVERY_BLOCKS == 1;
@@ -1221,9 +1247,8 @@ impl InferenceEngine for RvcOrtEngine {
                         target_hop_samples_16k,
                     )?;
                 let t_resample_in_us = t_start.elapsed().as_micros();
-                let frames_per_hop = ((target_hop_samples_16k as f64) / 160.0)
-                    .round()
-                    .max(1.0) as usize;
+                let frames_per_hop =
+                    ((target_hop_samples_16k as f64) / 160.0).round().max(1.0) as usize;
                 let single_window_mode = hubert_source_16k.len() <= STRICT_ONNX_INPUT_SAMPLES_16K;
                 let effective_hops = if single_window_mode { 1 } else { n_hops.max(1) };
                 let total_phone_frames = if single_window_mode {
@@ -1284,16 +1309,25 @@ impl InferenceEngine for RvcOrtEngine {
                 } else {
                     DEFAULT_RMVPE_THRESHOLD
                 };
+                let requested_index_rows = config.index_search_rows.max(1);
+                let requested_index_top_k = config.index_top_k.max(1).min(requested_index_rows);
                 let post_filter_alpha = if config.post_filter_alpha.is_finite() {
                     config.post_filter_alpha.clamp(0.0, 0.999)
                 } else {
                     0.96
                 };
-                let finalize_output = |out: &[f32]| -> Result<Vec<f32>> {
+                let mut post_filter_prev_sample = self.post_filter_prev_sample;
+                let mut post_filter_prev_valid = self.post_filter_prev_valid;
+                let mut finalize_output = |out: &[f32]| -> Result<Vec<f32>> {
                     let mut filtered_storage = Vec::<f32>::new();
                     let out_ref: &[f32] = if post_filter_alpha > 0.0 {
                         filtered_storage.extend_from_slice(out);
-                        apply_post_filter_output(&mut filtered_storage, post_filter_alpha);
+                        apply_post_filter_output(
+                            &mut filtered_storage,
+                            post_filter_alpha,
+                            &mut post_filter_prev_sample,
+                            &mut post_filter_prev_valid,
+                        );
                         &filtered_storage
                     } else {
                         out
@@ -1336,6 +1370,8 @@ impl InferenceEngine for RvcOrtEngine {
                         Ok(out) => {
                             let t_finalize0 = Instant::now();
                             let finalized = finalize_output(&out)?;
+                            self.post_filter_prev_sample = post_filter_prev_sample;
+                            self.post_filter_prev_valid = post_filter_prev_valid;
                             let finalize_us = t_finalize0.elapsed().as_micros();
                             if emit_timing {
                                 let total_us = t_start.elapsed().as_micros();
@@ -1345,10 +1381,12 @@ impl InferenceEngine for RvcOrtEngine {
                                 let finalize_ms = finalize_us as f64 / 1000.0;
                                 let total_ms = total_us as f64 / 1000.0;
                                 eprintln!(
-                                    "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert=0.00ms index=0.00ms rmvpe=0.00ms feature_post=0.00ms generator=0.00ms finalize={:.2}ms total={:.2}ms zero_copy=true",
+                                    "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert=0.00ms index=0.00ms rows={} top_k={} rmvpe=0.00ms feature_post=0.00ms generator=0.00ms finalize={:.2}ms total={:.2}ms zero_copy=true",
                                     infer_block_count,
                                     resample_in_ms,
                                     preproc_ms,
+                                    requested_index_rows,
+                                    requested_index_top_k,
                                     finalize_ms,
                                     total_ms
                                 );
@@ -1376,7 +1414,7 @@ impl InferenceEngine for RvcOrtEngine {
                 if config.protect < 0.5 {
                     phone_raw = Some(phone.clone());
                 }
-                self.blend_phone_with_index(
+                let index_blend_stats = self.blend_phone_with_index(
                     &mut phone,
                     config,
                     &pitch_estimate.confidence,
@@ -1405,7 +1443,7 @@ impl InferenceEngine for RvcOrtEngine {
                 let t_feature_post0 = Instant::now();
                 let mut pitchf = pitch_estimate.f0_hz;
                 stabilize_sparse_pitch_track(&mut pitchf);
-                smooth_pitch_track_gaussian_inplace(&mut pitchf, 2);
+                audio_pipeline::smooth_pitch_track_gaussian_inplace(&mut pitchf, 2);
                 apply_pitch_shift_inplace(&mut pitchf, config.pitch_shift_semitones);
                 let f0_median_radius = config.f0_median_filter_radius;
                 if f0_median_radius > 0 {
@@ -1466,6 +1504,8 @@ impl InferenceEngine for RvcOrtEngine {
                 };
                 let t_finalize0 = Instant::now();
                 let finalized = finalize_output(&out)?;
+                self.post_filter_prev_sample = post_filter_prev_sample;
+                self.post_filter_prev_valid = post_filter_prev_valid;
                 let finalize_us = t_finalize0.elapsed().as_micros();
                 if emit_timing {
                     let total_us = t_start.elapsed().as_micros();
@@ -1488,12 +1528,14 @@ impl InferenceEngine for RvcOrtEngine {
                         + finalize_us;
                     let other_ms = total_us.saturating_sub(accounted_us) as f64 / 1000.0;
                     eprintln!(
-                        "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert={:.2}ms index={:.2}ms rmvpe={:.2}ms feature_post={:.2}ms generator={:.2}ms finalize={:.2}ms other={:.2}ms total={:.2}ms",
+                        "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert={:.2}ms index={:.2}ms rows={} top_k={} rmvpe={:.2}ms feature_post={:.2}ms generator={:.2}ms finalize={:.2}ms other={:.2}ms total={:.2}ms",
                         infer_block_count,
                         resample_in_ms,
                         preproc_ms,
                         hubert_ms,
                         index_ms,
+                        index_blend_stats.rows,
+                        index_blend_stats.top_k,
                         rmvpe_ms,
                         feature_post_ms,
                         generator_ms,
@@ -1514,6 +1556,8 @@ impl InferenceEngine for RvcOrtEngine {
     }
 
     fn prepare_for_shutdown(&mut self) -> Result<()> {
+        self.post_filter_prev_sample = 0.0;
+        self.post_filter_prev_valid = false;
         self.drop_zero_copy_engine_explicit();
         Ok(())
     }
@@ -2493,22 +2537,31 @@ fn apply_pitch_shift_inplace(f0: &mut [f32], semitones: f32) {
     }
 }
 
-fn apply_post_filter_output(output: &mut [f32], alpha: f32) {
+fn apply_post_filter_output(
+    output: &mut [f32],
+    alpha: f32,
+    prev_sample: &mut f32,
+    prev_valid: &mut bool,
+) {
     let alpha = if alpha.is_finite() {
         alpha.clamp(0.0, 0.999)
     } else {
         0.0
     };
-    if alpha <= 0.0 || output.len() < 2 {
+    if alpha <= 0.0 || output.is_empty() {
         return;
     }
-    let mut prev = output[0];
-    for sample in output.iter_mut().skip(1) {
-        // Gentle single-pole smoothing to tame buzzy high-frequency residue.
+    // `alpha` is the current-sample weight:
+    // y[n] = alpha * x[n] + (1-alpha) * y[n-1]
+    // alpha≈1.0 => near pass-through, alpha→0 => stronger smoothing.
+    let mut prev = if *prev_valid { *prev_sample } else { output[0] };
+    for sample in output.iter_mut() {
         let filtered = alpha * *sample + (1.0 - alpha) * prev;
         *sample = filtered;
         prev = filtered;
     }
+    *prev_sample = prev;
+    *prev_valid = true;
 }
 
 fn stabilize_sparse_pitch_track(pitchf: &mut [f32]) {
@@ -2574,36 +2627,6 @@ fn stabilize_sparse_pitch_track(pitchf: &mut [f32]) {
         for k in 0..gap_len {
             let t = (k + 1) as f32 / denom;
             pitchf[gap_start + k] = left * (1.0 - t) + right * t;
-        }
-    }
-}
-
-fn smooth_pitch_track_gaussian_inplace(pitchf: &mut [f32], radius: usize) {
-    if radius == 0 || pitchf.len() < 3 {
-        return;
-    }
-    let src = pitchf.to_vec();
-    for i in 0..pitchf.len() {
-        if src[i] <= 0.0 {
-            continue;
-        }
-        let mut num = 0.0_f32;
-        let mut den = 0.0_f32;
-        let lo = i.saturating_sub(radius);
-        let hi = (i + radius + 1).min(src.len());
-        for j in lo..hi {
-            let v = src[j];
-            if v <= 0.0 {
-                continue;
-            }
-            let d = i.abs_diff(j) as f32;
-            let sigma = radius.max(1) as f32 * 0.75;
-            let w = (-0.5 * (d / sigma).powi(2)).exp();
-            num += v * w;
-            den += w;
-        }
-        if den > 1.0e-8 {
-            pitchf[i] = num / den;
         }
     }
 }
@@ -2988,9 +3011,8 @@ fn resolve_model_path(base_path: &Path, block_size: usize) -> PathBuf {
 mod tests {
     use super::{
         estimate_hop_samples_16k, fit_waveform_to_len, has_block_suffix, normalize_model_stem,
-        resolve_runtime_hop_samples_16k,
-        slide_context_window,
-        upsample_phone_frames_repeat, STRICT_ONNX_INPUT_SAMPLES_16K,
+        resolve_runtime_hop_samples_16k, slide_context_window, upsample_phone_frames_repeat,
+        STRICT_ONNX_INPUT_SAMPLES_16K,
     };
     use ndarray::Array3;
     use std::collections::VecDeque;

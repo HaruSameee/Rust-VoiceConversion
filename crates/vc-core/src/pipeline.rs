@@ -22,6 +22,13 @@ impl<E: InferenceEngine> VoiceChanger<E> {
         self.config = config;
     }
 
+    pub fn update_index_search_params(&mut self, top_k: usize, rows: usize) {
+        let clamped_rows = rows.max(1);
+        let clamped_top_k = top_k.max(1).min(clamped_rows);
+        self.config.index_search_rows = clamped_rows;
+        self.config.index_top_k = clamped_top_k;
+    }
+
     pub fn set_effective_block_size(&mut self, block_size: usize) {
         self.config.block_size = block_size.max(1);
     }

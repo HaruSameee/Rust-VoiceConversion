@@ -202,6 +202,41 @@ pub struct F0Smoother {
     prev_block_last_f0: f32,
 }
 
+/// Applies lightweight Gaussian smoothing on voiced F0 frames only.
+///
+/// Unvoiced samples (`<= 0`) are kept untouched to avoid creating fake voiced
+/// regions during interpolation.
+#[inline]
+pub fn smooth_pitch_track_gaussian_inplace(pitchf: &mut [f32], radius: usize) {
+    if radius == 0 || pitchf.len() < 3 {
+        return;
+    }
+    let src = pitchf.to_vec();
+    for i in 0..pitchf.len() {
+        if src[i] <= 0.0 {
+            continue;
+        }
+        let mut num = 0.0_f32;
+        let mut den = 0.0_f32;
+        let lo = i.saturating_sub(radius);
+        let hi = (i + radius + 1).min(src.len());
+        for j in lo..hi {
+            let v = src[j];
+            if v <= 0.0 {
+                continue;
+            }
+            let d = i.abs_diff(j) as f32;
+            let sigma = radius.max(1) as f32 * 0.75;
+            let w = (-0.5 * (d / sigma).powi(2)).exp();
+            num += v * w;
+            den += w;
+        }
+        if den > 1.0e-8 {
+            pitchf[i] = num / den;
+        }
+    }
+}
+
 impl F0Smoother {
     /// Creates a smoother using hop-size dependent EMA alpha (30ms time constant).
     #[inline]
