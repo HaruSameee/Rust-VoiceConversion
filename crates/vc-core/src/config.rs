@@ -20,6 +20,11 @@ pub struct RuntimeConfig {
     pub index_smooth_alpha: f32,
     pub index_top_k: usize,
     pub index_search_rows: usize,
+    /// Index blend execution target (`cpu` or `gpu`).
+    ///
+    /// Current stable implementation is CPU.
+    /// `gpu` is accepted for compatibility and future extensions.
+    pub index_provider: String,
     pub protect: f32,
     pub rmvpe_threshold: f32,
     pub pitch_smooth_alpha: f32,
@@ -130,6 +135,7 @@ impl Default for RuntimeConfig {
             index_smooth_alpha: 0.85,
             index_top_k: 8,
             index_search_rows: 2_048,
+            index_provider: "cpu".to_string(),
             protect: 0.33,
             rmvpe_threshold: 0.01,
             pitch_smooth_alpha: 0.12,

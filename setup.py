@@ -154,7 +154,7 @@ def _patch_torch_load() -> None:
 
 
 def ensure_torch_available() -> None:
-    print_step(0, "torch 確認・インストール")
+    print_step(1, "torch 確認・インストール")
     try:
         import torch  # noqa: F401
 

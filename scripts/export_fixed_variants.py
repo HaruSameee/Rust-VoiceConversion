@@ -1,3 +1,9 @@
+"""
+NOTE: このスクリプトで生成した固定長ONNXは品質面の問題により現在は非推奨です。
+      本番環境では hubert_pad80.onnx / rmvpe_strict.onnx (dynamic axes) を使用してください。
+      将来の最適化実験用に保持しています。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -73,9 +79,9 @@ class RmvpeMelToF0(torch.nn.Module):
 
 
 VARIANTS = [
-    {"block_size": 12000, "window_16k": 8000, "hop_16k": 4000, "n_frames": 50},
-    {"block_size": 24000, "window_16k": 16000, "hop_16k": 8000, "n_frames": 100},
-    {"block_size": 48000, "window_16k": 32000, "hop_16k": 16000, "n_frames": 200},
+    {"block_size": 12000, "window_16k": 8000, "hop_16k": 4000, "n_frames": 64},
+    {"block_size": 24000, "window_16k": 16000, "hop_16k": 8000, "n_frames": 128},
+    {"block_size": 48000, "window_16k": 32000, "hop_16k": 16000, "n_frames": 256},
 ]
 
 

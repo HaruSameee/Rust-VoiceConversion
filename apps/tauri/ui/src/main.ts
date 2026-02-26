@@ -20,6 +20,7 @@ interface RuntimeConfig {
   index_smooth_alpha: number;
   index_top_k: number;
   index_search_rows: number;
+  index_provider: string;
   protect: number;
   rmvpe_threshold: number;
   pitch_smooth_alpha: number;
@@ -111,6 +112,7 @@ const ui = {
   indexSmoothAlpha: $("indexSmoothAlpha") as HTMLInputElement,
   indexTopK: $("indexTopK") as HTMLInputElement,
   indexSearchRows: $("indexSearchRows") as HTMLInputElement,
+  indexProvider: $("indexProvider") as HTMLSelectElement,
   protect: $("protect") as HTMLInputElement,
   rmvpeThreshold: $("rmvpeThreshold") as HTMLInputElement,
   pitchSmoothAlpha: $("pitchSmoothAlpha") as HTMLInputElement,
@@ -390,6 +392,9 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     index_smooth_alpha: atLeast(raw.index_smooth_alpha, 0.0, 0.85),
     index_top_k: Math.min(sanitizedTopK, sanitizedIndexRows),
     index_search_rows: sanitizedIndexRows,
+    index_provider: ["cpu", "gpu"].includes((raw.index_provider ?? "").toLowerCase())
+      ? raw.index_provider.toLowerCase()
+      : "cpu",
     protect: atLeast(raw.protect, 0.0, 0.33),
     rmvpe_threshold: atLeast(raw.rmvpe_threshold, 0.0, 0.01),
     pitch_smooth_alpha: atLeast(raw.pitch_smooth_alpha, 0.0, 0.12),
@@ -456,6 +461,7 @@ function runtimeFromInputs(): RuntimeConfig {
     index_smooth_alpha: Number(ui.indexSmoothAlpha.value),
     index_top_k: Number(ui.indexTopK.value),
     index_search_rows: Number(ui.indexSearchRows.value),
+    index_provider: ui.indexProvider.value,
     protect: Number(ui.protect.value),
     rmvpe_threshold: Number(ui.rmvpeThreshold.value),
     pitch_smooth_alpha: Number(ui.pitchSmoothAlpha.value),
@@ -513,6 +519,7 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.indexSmoothAlpha.value = String(config.index_smooth_alpha);
   ui.indexTopK.value = String(config.index_top_k);
   ui.indexSearchRows.value = String(config.index_search_rows);
+  ui.indexProvider.value = config.index_provider;
   ui.protect.value = String(config.protect);
   ui.rmvpeThreshold.value = String(config.rmvpe_threshold);
   ui.pitchSmoothAlpha.value = String(config.pitch_smooth_alpha);
@@ -587,6 +594,9 @@ async function saveAll(): Promise<void> {
   }
   if (runtime.ort_provider === "cpu") {
     log("WARN", "CPU provider is not recommended for realtime RVC. Prefer CUDA or DirectML when available.");
+  }
+  if (runtime.index_provider === "gpu") {
+    log("WARN", "Index GPU mode is experimental. If quality/latency worsens, switch index provider back to CPU.");
   }
   log("INFO", "saveAll begin", { model, runtime });
   await invoke("set_model_config_cmd", { model });

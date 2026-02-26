@@ -181,6 +181,17 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         ));
         config.index_top_k = clamped_top_k;
     }
+    let normalized_index_provider = match config.index_provider.trim().to_ascii_lowercase().as_str() {
+        "gpu" => "gpu",
+        _ => "cpu",
+    };
+    if config.index_provider != normalized_index_provider {
+        log_debug(&format!(
+            "set_runtime_config_cmd index_provider normalized: '{}' -> '{}'",
+            config.index_provider, normalized_index_provider
+        ));
+        config.index_provider = normalized_index_provider.to_string();
+    }
     if !config.vad_on_threshold.is_finite() {
         config.vad_on_threshold = config.response_threshold;
     }
@@ -196,7 +207,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
     // Keep legacy field aligned for older subsystems and saved presets.
     config.response_threshold = config.vad_on_threshold;
     log_debug(&format!(
-        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
         config.sample_rate,
         config.block_size,
         config.input_device_name,
@@ -218,6 +229,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.index_smooth_alpha,
         config.index_top_k,
         config.index_search_rows,
+        config.index_provider,
         config.protect,
         config.rmvpe_threshold,
         config.pitch_smooth_alpha,
@@ -251,10 +263,11 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
     let running = guard.running;
     let index_rows = config.index_search_rows;
     let index_top_k = config.index_top_k;
+    let index_provider = config.index_provider.clone();
     guard.config = config;
     if running {
         if let Some(task) = guard.engine_task.as_ref() {
-            task.update_index_search_params(index_rows, index_top_k)
+            task.update_index_search_params(index_rows, index_top_k, &index_provider)
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -299,14 +312,14 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             }
             (guard.config.clone(), guard.model.clone())
         };
-        let mut model = resolve_model_config_for_start(model_raw)?;
-        apply_mode_selection(&mut model, &mut runtime_config);
+        let model = resolve_model_config_for_start(model_raw)?;
+        apply_mode_selection(&model, &mut runtime_config);
         log_debug(&format!(
             "ORT_DYLIB_PATH={:?}",
             std::env::var("ORT_DYLIB_PATH").ok()
         ));
         log_debug(&format!(
-            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
             model.model_path,
             model.hubert_path,
             model.pitch_extractor_path,
@@ -332,6 +345,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.index_smooth_alpha,
             runtime_config.index_top_k,
             runtime_config.index_search_rows,
+            runtime_config.index_provider,
             runtime_config.protect,
             runtime_config.rmvpe_threshold,
             runtime_config.pitch_smooth_alpha,
@@ -446,17 +460,22 @@ fn sync_levels_from_engine(state: &mut RuntimeState) {
 }
 
 fn default_model_config() -> ModelConfig {
+    let model_path = std::env::var("RUST_VC_MODEL_PATH")
+        .ok()
+        .and_then(|p| resolve_existing_path(&p).or(Some(p)))
+        .or_else(|| resolve_existing_path("model/model.onnx"))
+        .or_else(find_first_onnx_in_model_dir)
+        .unwrap_or_else(|| "model/model.onnx".to_string());
+    let model_dir = Path::new(&model_path).parent().unwrap_or(Path::new("."));
+
     let pitch_extractor_path = std::env::var("RUST_VC_RMVPE_PATH")
         .ok()
         .and_then(|p| resolve_existing_path(&p).or(Some(p)))
-        .or_else(|| resolve_existing_path("model/rmvpe_strict.onnx"))
-        .or_else(|| resolve_existing_path("model/rmvpe.onnx"));
+        .or_else(|| resolve_sibling_if_exists(model_dir, "rmvpe_strict.onnx"));
     let hubert_path = std::env::var("RUST_VC_HUBERT_PATH")
         .ok()
         .and_then(|p| resolve_existing_path(&p).or(Some(p)))
-        .or_else(|| resolve_existing_path("model/hubert_pad80.onnx"))
-        .or_else(|| resolve_existing_path("model/hubert_strict.onnx"))
-        .or_else(|| resolve_existing_path("model/hubert.onnx"));
+        .or_else(|| resolve_sibling_if_exists(model_dir, "hubert_pad80.onnx"));
     let index_path = std::env::var("RUST_VC_INDEX_PATH")
         .ok()
         .and_then(|p| resolve_existing_path(&p).or(Some(p)))
@@ -464,12 +483,6 @@ fn default_model_config() -> ModelConfig {
         .or_else(find_first_bin_in_model_dir)
         .or_else(|| resolve_existing_path("model/model.index"))
         .or_else(|| resolve_existing_path("model/feature.index"));
-    let model_path = std::env::var("RUST_VC_MODEL_PATH")
-        .ok()
-        .and_then(|p| resolve_existing_path(&p).or(Some(p)))
-        .or_else(|| resolve_existing_path("model/model.onnx"))
-        .or_else(find_first_onnx_in_model_dir)
-        .unwrap_or_else(|| "model/model.onnx".to_string());
 
     let cfg = ModelConfig {
         model_path,
@@ -623,7 +636,7 @@ fn default_runtime_config() -> RuntimeConfig {
         cfg.bypass_slicing = v;
     }
     log_debug(&format!(
-        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
+        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} index_provider={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
         cfg.ort_provider,
         cfg.ort_device_id,
         cfg.ort_gpu_mem_limit_mb,
@@ -639,6 +652,7 @@ fn default_runtime_config() -> RuntimeConfig {
         cfg.cuda_tf32,
         cfg.index_bin_dim,
         cfg.index_max_vectors,
+        cfg.index_provider,
         cfg.target_buffer_ms,
         cfg.response_threshold,
         cfg.vad_on_threshold,
@@ -670,62 +684,20 @@ fn read_mode_block_size(model_dir: &Path) -> usize {
         Ok(contents) => {
             let trimmed = contents.trim();
             match trimmed.parse::<usize>() {
-                Ok(bs) if matches!(bs, 12_000 | 24_000 | 48_000) => {
-                    log_debug(&format!("mode.txt: block_size={}", bs));
-                    bs
-                }
-                _ => {
-                    log_debug(&format!(
-                        "warning: mode.txt: invalid value '{}', defaulting to 24000",
-                        trimmed
-                    ));
-                    24_000
-                }
+                Ok(bs) if matches!(bs, 12_000 | 24_000 | 48_000) => bs,
+                _ => 24_000,
             }
         }
-        Err(_) => {
-            log_debug("mode.txt not found, defaulting to block_size=24000");
-            24_000
-        }
+        Err(_) => 24_000,
     }
 }
 
-fn apply_mode_selection(model: &mut ModelConfig, runtime_config: &mut RuntimeConfig) {
+fn apply_mode_selection(model: &ModelConfig, runtime_config: &mut RuntimeConfig) {
     let model_path = Path::new(&model.model_path);
     let model_dir = model_path.parent().unwrap_or(Path::new("."));
     let mode_block_size = read_mode_block_size(model_dir);
-
-    if runtime_config.block_size != mode_block_size {
-        log_debug(&format!(
-            "mode.txt: runtime block_size overridden {} -> {}",
-            runtime_config.block_size, mode_block_size
-        ));
-    }
     runtime_config.block_size = mode_block_size;
-
-    let hubert_path = model_dir.join(format!("hubert_b{}.onnx", mode_block_size));
-    if hubert_path.is_file() {
-        model.hubert_path = Some(hubert_path.to_string_lossy().to_string());
-    } else {
-        log_debug(&format!(
-            "warning: auto-selected hubert not found: {} (keeping existing {:?})",
-            hubert_path.display(),
-            model.hubert_path
-        ));
-    }
-    log_debug(&format!("auto-selected hubert: {:?}", model.hubert_path));
-
-    let rmvpe_path = model_dir.join(format!("rmvpe_b{}.onnx", mode_block_size));
-    if rmvpe_path.is_file() {
-        model.pitch_extractor_path = Some(rmvpe_path.to_string_lossy().to_string());
-    } else {
-        log_debug(&format!(
-            "warning: auto-selected rmvpe not found: {} (keeping existing {:?})",
-            rmvpe_path.display(),
-            model.pitch_extractor_path
-        ));
-    }
-    log_debug(&format!("auto-selected rmvpe: {:?}", model.pitch_extractor_path));
+    log_debug(&format!("mode.txt: block_size={}", mode_block_size));
 }
 
 fn resolve_model_config_for_start(mut model: ModelConfig) -> Result<ModelConfig, String> {
@@ -752,43 +724,20 @@ fn resolve_model_config_for_start(mut model: ModelConfig) -> Result<ModelConfig,
         .and_then(|p| resolve_existing_path(&p).or(Some(p)));
     model.hubert_path = model
         .hubert_path
-        .and_then(|p| resolve_existing_path(&p).or(Some(p)))
-        .map(|p| prefer_padded_hubert_path(&p));
-    if model.hubert_path.is_none() {
-        model.hubert_path = resolve_existing_path("model/hubert_pad80.onnx")
-            .or_else(|| resolve_existing_path("model/hubert_strict.onnx"))
-            .or_else(|| resolve_existing_path("model/hubert.onnx"));
-    }
+        .and_then(|p| resolve_existing_path(&p).or(Some(p)));
     model.index_path = model
         .index_path
         .and_then(|p| resolve_existing_path(&p).or(Some(p)));
     Ok(model)
 }
 
-fn prefer_padded_hubert_path(path: &str) -> String {
-    let p = Path::new(path);
-    let Some(file_name) = p.file_name().and_then(|s| s.to_str()) else {
-        return path.to_string();
-    };
-    let name_lc = file_name.to_ascii_lowercase();
-    if name_lc != "hubert_strict.onnx" && name_lc != "hubert.onnx" {
-        return path.to_string();
+fn resolve_sibling_if_exists(model_dir: &Path, file_name: &str) -> Option<String> {
+    let candidate = model_dir.join(file_name);
+    if candidate.is_file() {
+        Some(candidate.to_string_lossy().to_string())
+    } else {
+        None
     }
-    let Some(parent) = p.parent() else {
-        return path.to_string();
-    };
-    let padded = parent.join("hubert_pad80.onnx");
-    if padded.exists() {
-        let swapped = padded.to_string_lossy().to_string();
-        if swapped != path {
-            log_debug(&format!(
-                "hubert_path '{}' overridden to '{}' (prefer pad80 contract)",
-                path, swapped
-            ));
-        }
-        return swapped;
-    }
-    path.to_string()
 }
 
 fn resolve_existing_path(path: &str) -> Option<String> {

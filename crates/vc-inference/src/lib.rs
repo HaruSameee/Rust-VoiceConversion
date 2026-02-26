@@ -30,6 +30,14 @@ const STRICT_ONNX_INPUT_SAMPLES_16K: usize = 16_000;
 const STRICT_HUBERT_OUTPUT_FRAMES: usize = 50;
 const DEFAULT_RMVPE_THRESHOLD: f32 = 0.01;
 const TIMING_LOG_EVERY_BLOCKS: u64 = 10;
+// scipy.signal.butter(N=5, Wn=48, btype="high", fs=16000, output="sos")
+const HP48_BUTTER5_SOS_16K: [[f32; 6]; 3] = [
+    [0.96996063, -0.96996063, 0.0, 1.0, -0.98132586, 0.0],
+    [1.0, -2.0, 1.0, 1.0, -1.9696107, 0.96996063],
+    [1.0, -2.0, 1.0, 1.0, -1.9880652, 0.98841846],
+];
+const HP48_FILTFILT_PADLEN_MIN: usize = 32;
+const HP48_FILTFILT_PADLEN_MAX: usize = 512;
 static ORT_INIT_FAILED: OnceLock<String> = OnceLock::new();
 static ORT_PROVIDER_AVAIL_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_CUDA_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
@@ -210,6 +218,12 @@ struct IndexBlendStats {
     top_k: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexProvider {
+    Cpu,
+    Gpu,
+}
+
 pub struct RvcOrtEngine {
     model: ModelConfig,
     rvc_session: Session,
@@ -238,6 +252,7 @@ pub struct RvcOrtEngine {
     post_filter_prev_sample: f32,
     post_filter_prev_valid: bool,
     post_filter_sample_rate: u32,
+    index_gpu_fallback_warned: bool,
 }
 
 impl RvcOrtEngine {
@@ -441,6 +456,13 @@ impl RvcOrtEngine {
                 "[vc-inference] confidence_gate: rmvpe_th={:.3} applied to index blend",
                 runtime_config.rmvpe_threshold.max(0.0)
             );
+            eprintln!(
+                "[vc-inference] index provider preference: {}",
+                runtime_config.index_provider
+            );
+            eprintln!(
+                "[vc-inference] preprocessing: 48Hz high-pass (Butterworth-5, filtfilt-like) enabled for HuBERT/RMVPE inputs"
+            );
             eprintln!("[vc-inference] execution path: standard copy (zero-copy disabled)");
             let zero_copy_engine: Option<Arc<Mutex<zero_copy_engine::ZeroCopyInferenceEngine>>> =
                 None;
@@ -484,6 +506,7 @@ impl RvcOrtEngine {
                 post_filter_prev_sample: 0.0,
                 post_filter_prev_valid: false,
                 post_filter_sample_rate: runtime_config.sample_rate.max(1),
+                index_gpu_fallback_warned: false,
             })
         }));
 
@@ -864,6 +887,13 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         confidence: &[f32],
         rmvpe_threshold: f32,
     ) -> IndexBlendStats {
+        let index_provider = parse_index_provider(&config.index_provider);
+        if matches!(index_provider, IndexProvider::Gpu) && !self.index_gpu_fallback_warned {
+            eprintln!(
+                "[vc-inference] warning: index_provider=gpu requested, but GPU index backend is not available yet; falling back to CPU"
+            );
+            self.index_gpu_fallback_warned = true;
+        }
         let requested_rows = config.index_search_rows.max(1);
         let requested_top_k = config.index_top_k.max(1).min(requested_rows);
         let Some(index) = &self.feature_index else {
@@ -1277,6 +1307,12 @@ impl InferenceEngine for RvcOrtEngine {
                     total_phone_frames,
                     expected_output_samples
                 );
+                apply_highpass_48hz_filtfilt_inplace(&mut hubert_source_16k);
+                if rmvpe_source_16k.len() == hubert_source_16k.len() {
+                    rmvpe_source_16k.copy_from_slice(&hubert_source_16k);
+                } else {
+                    apply_highpass_48hz_filtfilt_inplace(&mut rmvpe_source_16k);
+                }
                 let hubert_norm_stats = normalize_for_onnx_input(&mut hubert_source_16k);
                 let rmvpe_norm_stats = normalize_for_onnx_input(&mut rmvpe_source_16k);
                 if tensor_stats_enabled() {
@@ -1381,12 +1417,13 @@ impl InferenceEngine for RvcOrtEngine {
                                 let finalize_ms = finalize_us as f64 / 1000.0;
                                 let total_ms = total_us as f64 / 1000.0;
                                 eprintln!(
-                                    "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert=0.00ms index=0.00ms rows={} top_k={} rmvpe=0.00ms feature_post=0.00ms generator=0.00ms finalize={:.2}ms total={:.2}ms zero_copy=true",
+                                    "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert=0.00ms index=0.00ms rows={} top_k={} index_provider={} rmvpe=0.00ms feature_post=0.00ms generator=0.00ms finalize={:.2}ms total={:.2}ms zero_copy=true",
                                     infer_block_count,
                                     resample_in_ms,
                                     preproc_ms,
                                     requested_index_rows,
                                     requested_index_top_k,
+                                    config.index_provider,
                                     finalize_ms,
                                     total_ms
                                 );
@@ -1528,7 +1565,7 @@ impl InferenceEngine for RvcOrtEngine {
                         + finalize_us;
                     let other_ms = total_us.saturating_sub(accounted_us) as f64 / 1000.0;
                     eprintln!(
-                        "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert={:.2}ms index={:.2}ms rows={} top_k={} rmvpe={:.2}ms feature_post={:.2}ms generator={:.2}ms finalize={:.2}ms other={:.2}ms total={:.2}ms",
+                        "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert={:.2}ms index={:.2}ms rows={} top_k={} index_provider={} rmvpe={:.2}ms feature_post={:.2}ms generator={:.2}ms finalize={:.2}ms other={:.2}ms total={:.2}ms",
                         infer_block_count,
                         resample_in_ms,
                         preproc_ms,
@@ -1536,6 +1573,7 @@ impl InferenceEngine for RvcOrtEngine {
                         index_ms,
                         index_blend_stats.rows,
                         index_blend_stats.top_k,
+                        config.index_provider,
                         rmvpe_ms,
                         feature_post_ms,
                         generator_ms,
@@ -2537,6 +2575,62 @@ fn apply_pitch_shift_inplace(f0: &mut [f32], semitones: f32) {
     }
 }
 
+fn apply_highpass_48hz_filtfilt_inplace(samples: &mut [f32]) {
+    if samples.len() < 3 {
+        return;
+    }
+    let pad = samples
+        .len()
+        .saturating_sub(1)
+        .min(HP48_FILTFILT_PADLEN_MAX)
+        .max(HP48_FILTFILT_PADLEN_MIN);
+    if pad == 0 || pad >= samples.len() {
+        return;
+    }
+
+    let mut work = Vec::<f32>::with_capacity(samples.len() + pad * 2);
+    // Reflect-pad both edges to suppress IIR boundary transients.
+    for i in (1..=pad).rev() {
+        work.push(samples[i]);
+    }
+    work.extend_from_slice(samples);
+    let last = samples.len() - 1;
+    for i in 1..=pad {
+        work.push(samples[last - i]);
+    }
+
+    apply_sos_filter_inplace(&mut work, &HP48_BUTTER5_SOS_16K);
+    work.reverse();
+    apply_sos_filter_inplace(&mut work, &HP48_BUTTER5_SOS_16K);
+    work.reverse();
+
+    let start = pad;
+    let end = start + samples.len();
+    samples.copy_from_slice(&work[start..end]);
+}
+
+fn apply_sos_filter_inplace(samples: &mut [f32], sos: &[[f32; 6]]) {
+    for sec in sos {
+        let b0 = sec[0];
+        let b1 = sec[1];
+        let b2 = sec[2];
+        let a0 = sec[3];
+        let a1 = sec[4];
+        let a2 = sec[5];
+        let inv_a0 = if a0 != 0.0 { 1.0 / a0 } else { 1.0 };
+
+        let mut z1 = 0.0_f32;
+        let mut z2 = 0.0_f32;
+        for x in samples.iter_mut() {
+            let xn = *x;
+            let y = (b0 * xn + z1) * inv_a0;
+            z1 = b1 * xn + z2 - a1 * y;
+            z2 = b2 * xn - a2 * y;
+            *x = y;
+        }
+    }
+}
+
 fn apply_post_filter_output(
     output: &mut [f32],
     alpha: f32,
@@ -2661,6 +2755,13 @@ fn parse_ort_provider(raw: &str) -> OrtProvider {
         "directml" | "dml" => OrtProvider::DirectMl,
         "auto" | "" => OrtProvider::Auto,
         _ => OrtProvider::Auto,
+    }
+}
+
+fn parse_index_provider(raw: &str) -> IndexProvider {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "gpu" => IndexProvider::Gpu,
+        _ => IndexProvider::Cpu,
     }
 }
 

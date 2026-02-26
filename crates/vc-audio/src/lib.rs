@@ -27,6 +27,8 @@ const PROCESS_WINDOW_BLOCK_MULTIPLIER: usize = 2;
 const DEBUG_DUMP_MAX_SECONDS: usize = 20;
 const VAD_OFF_FALLBACK_RATIO: f32 = 0.177_827_94; // ~= -15dB
 const SOLA_START_CONTINUITY_WEIGHT: f32 = 0.8; // 80% previous, 20% configured center
+const VAD_ANALYSIS_FRAME_LENGTH: usize = 2_048;
+const VAD_ANALYSIS_HOP_LENGTH: usize = 1_024;
 
 /// Legacy helper for minimum `extra_inference_ms` style budgeting.
 ///
@@ -166,10 +168,14 @@ pub struct AudioStreamOptions {
     pub record_dump: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum WorkerControl {
     PrepareShutdown,
-    UpdateIndexSearch { rows: usize, top_k: usize },
+    UpdateIndexSearch {
+        rows: usize,
+        top_k: usize,
+        provider: String,
+    },
 }
 
 impl RealtimeAudioEngine {
@@ -188,11 +194,15 @@ impl RealtimeAudioEngine {
         self.running.store(false, Ordering::Relaxed);
     }
 
-    pub fn update_index_search_params(&self, rows: usize, top_k: usize) -> Result<()> {
+    pub fn update_index_search_params(&self, rows: usize, top_k: usize, provider: &str) -> Result<()> {
         let Some(tx) = self.worker_control_tx.as_ref() else {
             return Err(anyhow!("worker control channel is unavailable"));
         };
-        tx.send(WorkerControl::UpdateIndexSearch { rows, top_k })
+        tx.send(WorkerControl::UpdateIndexSearch {
+            rows,
+            top_k,
+            provider: provider.to_string(),
+        })
             .map_err(|e| anyhow!("failed to send index search update to worker: {e}"))
     }
 
@@ -920,13 +930,21 @@ fn worker_loop<E>(
                     shutdown_prepared = true;
                     let _ = worker_shutdown_ack_tx.try_send(());
                 }
-                Ok(WorkerControl::UpdateIndexSearch { rows, top_k }) => {
+                Ok(WorkerControl::UpdateIndexSearch {
+                    rows,
+                    top_k,
+                    provider,
+                }) => {
                     let clamped_rows = rows.max(1);
                     let clamped_top_k = top_k.max(1).min(clamped_rows);
-                    voice_changer.update_index_search_params(clamped_top_k, clamped_rows);
+                    voice_changer.update_index_search_params(
+                        clamped_top_k,
+                        clamped_rows,
+                        Some(&provider),
+                    );
                     eprintln!(
-                        "[vc-audio] runtime update: index_search_rows={} index_top_k={}",
-                        clamped_rows, clamped_top_k
+                        "[vc-audio] runtime update: index_search_rows={} index_top_k={} index_provider={}",
+                        clamped_rows, clamped_top_k, provider
                     );
                 }
                 Err(TryRecvError::Empty) => {}
@@ -975,30 +993,21 @@ fn worker_loop<E>(
             let step_input = &model_block[step_start..step_end];
             let current_input = step_input.to_vec();
 
-            let mut sum_sq = 0.0_f32;
-            for s in step_input {
-                sum_sq += s * s;
-            }
-            let block_rms = (sum_sq / step_input.len().max(1) as f32).sqrt();
             let vad_active = if !vad_gate_enabled {
                 true
-            } else if block_rms >= vad_on_threshold {
-                true
-            } else if block_rms < vad_off_threshold {
-                false
             } else {
-                was_active
+                detect_vad_activity_framewise(
+                    step_input,
+                    vad_on_threshold,
+                    vad_off_threshold,
+                    was_active,
+                )
             };
             if vad_gate_enabled && !vad_active {
                 silence_streak = silence_streak.saturating_add(1);
             } else {
                 silence_streak = 0;
             }
-            if was_active && !vad_active {
-                // Gate closed: clear SOLA anchor so the next activation re-centers.
-                last_final_start = None;
-            }
-
             let start = Instant::now();
             // Keep callback pacing deterministic: always produce one output block per inference step.
             let expected_len = output_step_samples.max(1);
@@ -1006,8 +1015,7 @@ fn worker_loop<E>(
             // 1-block hangover: keep inference running for one extra block below threshold.
             let bypass_inference = vad_gate_enabled && !vad_active && silence_streak > 1;
             let mut smoothed_output = if bypass_inference {
-                previous_input.fill(0.0);
-                last_final_start = None;
+                // Skip inference in sustained silence, but keep SOLA/context state intact.
                 vec![0.0_f32; expected_len]
             } else {
                 let mut padded_input =
@@ -1255,10 +1263,10 @@ fn worker_loop<E>(
                         .extend_from_slice(&smoothed_output[smoothed_output.len() - keep..]);
                 }
             }
-            if !bypass_inference {
-                previous_input.clear();
-                previous_input.extend_from_slice(&current_input);
-            }
+            // Always advance previous_input, even when inference is bypassed.
+            // This preserves overlap-save continuity through silent blocks.
+            previous_input.clear();
+            previous_input.extend_from_slice(&current_input);
             was_active = !bypass_inference;
             if let Some(samples) = recorded_out.as_mut() {
                 append_samples_limited(samples, &smoothed_output, max_recorded_out_samples);
@@ -1507,6 +1515,46 @@ fn threshold_to_db(threshold: f32) -> f32 {
     } else {
         20.0 * threshold.log10()
     }
+}
+
+fn detect_vad_activity_framewise(
+    samples: &[f32],
+    threshold_on: f32,
+    threshold_off: f32,
+    prev_active: bool,
+) -> bool {
+    if samples.is_empty() {
+        return prev_active;
+    }
+    let frame_len = VAD_ANALYSIS_FRAME_LENGTH.min(samples.len()).max(1);
+    let hop_len = VAD_ANALYSIS_HOP_LENGTH.min(frame_len).max(1);
+    let mut active = prev_active;
+    let mut any_active = false;
+    let mut frame_start = 0usize;
+
+    while frame_start < samples.len() {
+        let frame_end = (frame_start + frame_len).min(samples.len());
+        let frame = &samples[frame_start..frame_end];
+        let mut sum_sq = 0.0_f32;
+        let mut peak = 0.0_f32;
+        for &sample in frame {
+            let amp = sample.abs();
+            if amp > peak {
+                peak = amp;
+            }
+            sum_sq += sample * sample;
+        }
+        let rms = (sum_sq / frame.len() as f32).sqrt();
+        if rms >= threshold_on || peak >= threshold_on * 4.0 {
+            active = true;
+        } else if rms < threshold_off && peak < threshold_off * 4.0 {
+            active = false;
+        }
+        any_active |= active;
+        frame_start = frame_start.saturating_add(hop_len);
+    }
+
+    any_active
 }
 
 fn align_down(value: usize, align: usize) -> usize {
@@ -2038,6 +2086,22 @@ mod tests {
         let (on, off) = resolve_vad_thresholds(0.0, 0.0, 0.0);
         assert_eq!(on, 0.0);
         assert_eq!(off, 0.0);
+    }
+
+    #[test]
+    fn detect_vad_activity_framewise_detects_strong_signal() {
+        let samples = vec![0.02_f32; 24_000];
+        assert!(detect_vad_activity_framewise(
+            &samples, 0.01, 0.002, false
+        ));
+    }
+
+    #[test]
+    fn detect_vad_activity_framewise_rejects_low_noise() {
+        let samples = vec![0.0005_f32; 24_000];
+        assert!(!detect_vad_activity_framewise(
+            &samples, 0.01, 0.002, false
+        ));
     }
 
     #[test]

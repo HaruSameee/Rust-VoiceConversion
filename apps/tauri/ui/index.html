@@ -79,6 +79,13 @@
               <input id="indexSearchRows" type="number" step="100" min="100" max="20000" />
             </div>
             <div class="field">
+              <label for="indexProvider">Index Provider</label>
+              <select id="indexProvider">
+                <option value="cpu">CPU (推奨: GTX世代)</option>
+                <option value="gpu">GPU (experimental)</option>
+              </select>
+            </div>
+            <div class="field">
               <label for="rmvpeThreshold">RMVPE Threshold</label>
               <input id="rmvpeThreshold" type="number" step="0.005" min="0" />
             </div>
