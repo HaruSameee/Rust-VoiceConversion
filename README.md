@@ -20,9 +20,30 @@ npm --prefix apps/tauri/ui install
 cargo tauri dev
 ```
 
+## Model Setup / Conversion
+- First-time setup (GPU detect + mode + CUDA + conversion): `setup.py`
+- Convert only when swapping voice model (no full setup rerun): `scripts/convert_model_only.py`
+- Export fixed HuBERT/RMVPE variants (`b12000/b24000/b48000`): `scripts/export_fixed_variants.py`
+
+Examples:
+```powershell
+# Convert .pth only (writes model/model_dynamic.onnx)
+python scripts/convert_model_only.py --pth model\your_model.pth --skip-index
+
+# Convert .pth + added.index
+python scripts/convert_model_only.py --pth model\your_model.pth --index model\your_added.index
+
+# Export fixed HuBERT/RMVPE variants
+python scripts/export_fixed_variants.py --project-root . --hubert scripts/hubert_base.pt --rmvpe scripts/rmvpe.pt --out-dir model --device cpu
+```
+
 ## Runtime Notes
 - `process_window` is computed in `vc-audio` from block geometry.
 - Playback queue size is controlled by `target_buffer_ms` (independent from process window).
+- Tauri startup reads `model/mode.txt` (`12000|24000|48000`) and auto-selects:
+  - `hubert_b{block_size}.onnx`
+  - `rmvpe_b{block_size}.onnx`
+  - runtime `block_size`
 - Decoder slice tuning is controlled by:
   - `output_slice_offset_samples`
   - `sola_search_ms`

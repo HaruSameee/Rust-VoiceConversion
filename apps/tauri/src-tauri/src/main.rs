@@ -286,7 +286,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
     run_panic_safe("start_engine_cmd", || {
         log_debug("start_engine_cmd");
         let _ = ensure_ort_dylib_path();
-        let (runtime_config, model_raw) = {
+        let (mut runtime_config, model_raw) = {
             let mut guard = state.lock_runtime();
             if guard.running {
                 log_debug("engine already running");
@@ -299,7 +299,8 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             }
             (guard.config.clone(), guard.model.clone())
         };
-        let model = resolve_model_config_for_start(model_raw)?;
+        let mut model = resolve_model_config_for_start(model_raw)?;
+        apply_mode_selection(&mut model, &mut runtime_config);
         log_debug(&format!(
             "ORT_DYLIB_PATH={:?}",
             std::env::var("ORT_DYLIB_PATH").ok()
@@ -661,6 +662,70 @@ fn derive_vad_off_threshold(vad_on_threshold: f32) -> f32 {
     } else {
         (vad_on_threshold * 0.177_827_94).max(0.0)
     }
+}
+
+fn read_mode_block_size(model_dir: &Path) -> usize {
+    let mode_path = model_dir.join("mode.txt");
+    match fs::read_to_string(&mode_path) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            match trimmed.parse::<usize>() {
+                Ok(bs) if matches!(bs, 12_000 | 24_000 | 48_000) => {
+                    log_debug(&format!("mode.txt: block_size={}", bs));
+                    bs
+                }
+                _ => {
+                    log_debug(&format!(
+                        "warning: mode.txt: invalid value '{}', defaulting to 24000",
+                        trimmed
+                    ));
+                    24_000
+                }
+            }
+        }
+        Err(_) => {
+            log_debug("mode.txt not found, defaulting to block_size=24000");
+            24_000
+        }
+    }
+}
+
+fn apply_mode_selection(model: &mut ModelConfig, runtime_config: &mut RuntimeConfig) {
+    let model_path = Path::new(&model.model_path);
+    let model_dir = model_path.parent().unwrap_or(Path::new("."));
+    let mode_block_size = read_mode_block_size(model_dir);
+
+    if runtime_config.block_size != mode_block_size {
+        log_debug(&format!(
+            "mode.txt: runtime block_size overridden {} -> {}",
+            runtime_config.block_size, mode_block_size
+        ));
+    }
+    runtime_config.block_size = mode_block_size;
+
+    let hubert_path = model_dir.join(format!("hubert_b{}.onnx", mode_block_size));
+    if hubert_path.is_file() {
+        model.hubert_path = Some(hubert_path.to_string_lossy().to_string());
+    } else {
+        log_debug(&format!(
+            "warning: auto-selected hubert not found: {} (keeping existing {:?})",
+            hubert_path.display(),
+            model.hubert_path
+        ));
+    }
+    log_debug(&format!("auto-selected hubert: {:?}", model.hubert_path));
+
+    let rmvpe_path = model_dir.join(format!("rmvpe_b{}.onnx", mode_block_size));
+    if rmvpe_path.is_file() {
+        model.pitch_extractor_path = Some(rmvpe_path.to_string_lossy().to_string());
+    } else {
+        log_debug(&format!(
+            "warning: auto-selected rmvpe not found: {} (keeping existing {:?})",
+            rmvpe_path.display(),
+            model.pitch_extractor_path
+        ));
+    }
+    log_debug(&format!("auto-selected rmvpe: {:?}", model.pitch_extractor_path));
 }
 
 fn resolve_model_config_for_start(mut model: ModelConfig) -> Result<ModelConfig, String> {

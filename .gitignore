@@ -30,10 +30,21 @@ apps/tauri/src-tauri/gen/
 *.pyd
 .venv/
 venv/
+logs/
+
+# ------------------------------------------------------------
+# PyInstaller / setup artifacts
+# ------------------------------------------------------------
+build/
+dist/
+setup.spec
+setup.exe
+.tmp_setup_bin/
 
 # ------------------------------------------------------------
 # Local model assets (large files)
 # ------------------------------------------------------------
+model/mode.txt
 model/*.onnx
 model/**/*.onnx
 model/**/*.onnx.data
