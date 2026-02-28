@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 
 type NullableString = string | null;
@@ -20,6 +21,7 @@ interface RuntimeConfig {
   index_smooth_alpha: number;
   index_top_k: number;
   index_search_rows: number;
+  index_nprobe: number;
   index_provider: string;
   protect: number;
   rmvpe_threshold: number;
@@ -32,9 +34,15 @@ interface RuntimeConfig {
   response_threshold: number;
   vad_on_threshold: number;
   vad_off_threshold: number;
+  vad_hysteresis: number;
+  noise_suppress: boolean;
+  noise_suppress_db: number;
+  noise_suppress_learn_sec: number;
+  frame_gate_db: number;
   fade_in_ms: number;
   fade_out_ms: number;
   sola_search_ms: number;
+  sola_reset_threshold_samples: number;
   output_tail_offset_ms: number;
   output_slice_offset_samples: number;
   bypass_slicing: boolean;
@@ -84,6 +92,28 @@ interface EngineStatus {
 }
 
 type LogLevel = "INFO" | "WARN" | "ERROR";
+type LogFilter = "all" | "warn" | "timing";
+
+interface LogEntry {
+  level: string;
+  message: string;
+  ts: number;
+}
+
+interface TimingStats {
+  totalMs: number;
+  hubertMs: number;
+  indexMs: number;
+  rmvpeMs: number;
+  generatorMs: number;
+}
+
+interface QueueStats {
+  queueSamples: number;
+  queueMs: number;
+  rms: number;
+  peak: number;
+}
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
@@ -112,6 +142,8 @@ const ui = {
   indexSmoothAlpha: $("indexSmoothAlpha") as HTMLInputElement,
   indexTopK: $("indexTopK") as HTMLInputElement,
   indexSearchRows: $("indexSearchRows") as HTMLInputElement,
+  indexNprobe: $("indexNprobe") as HTMLInputElement,
+  indexNprobeValue: $("indexNprobeValue") as HTMLSpanElement,
   indexProvider: $("indexProvider") as HTMLSelectElement,
   protect: $("protect") as HTMLInputElement,
   rmvpeThreshold: $("rmvpeThreshold") as HTMLInputElement,
@@ -122,9 +154,16 @@ const ui = {
   targetBufferMs: $("targetBufferMs") as HTMLInputElement,
   vadOnThreshold: $("vadOnThreshold") as HTMLInputElement,
   vadOffThreshold: $("vadOffThreshold") as HTMLInputElement,
+  vadHysteresis: $("vadHysteresis") as HTMLInputElement,
+  noiseSuppress: $("noiseSuppress") as HTMLInputElement,
+  noiseSuppressDb: $("noiseSuppressDb") as HTMLInputElement,
+  noiseSuppressDbValue: $("noiseSuppressDbValue") as HTMLSpanElement,
+  frameGateDb: $("frameGateDb") as HTMLInputElement,
+  frameGateDbValue: $("frameGateDbValue") as HTMLSpanElement,
   fadeInMs: $("fadeInMs") as HTMLInputElement,
   fadeOutMs: $("fadeOutMs") as HTMLInputElement,
   solaSearchMs: $("solaSearchMs") as HTMLInputElement,
+  solaResetThreshold: $("solaResetThreshold") as HTMLInputElement,
   outputTailOffsetMs: $("outputTailOffsetMs") as HTMLInputElement,
   sliceOffsetSamples: $("sliceOffsetSamples") as HTMLInputElement,
   bypassSlicing: $("bypassSlicing") as HTMLInputElement,
@@ -144,11 +183,16 @@ const ui = {
   saveBtn: $("saveBtn") as HTMLButtonElement,
   startBtn: $("startBtn") as HTMLButtonElement,
   stopBtn: $("stopBtn") as HTMLButtonElement,
-  clearLogBtn: $("clearLogBtn") as HTMLButtonElement,
+  logClearBtn: $("logClearBtn") as HTMLButtonElement,
+  logAutoScroll: $("logAutoScroll") as HTMLInputElement,
+  logFilter: $("logFilter") as HTMLSelectElement,
+  logCount: $("logCount") as HTMLSpanElement,
+  logPanel: $("logPanel") as HTMLDivElement,
+  logEntries: $("logEntries") as HTMLDivElement,
   statusLine: $("statusLine") as HTMLParagraphElement,
   levelLine: $("levelLine") as HTMLParagraphElement,
+  backendStatsLine: $("backendStatsLine") as HTMLParagraphElement,
   messageLine: $("messageLine") as HTMLParagraphElement,
-  logBox: $("logBox") as HTMLPreElement,
   tabButtons: Array.from(document.querySelectorAll<HTMLButtonElement>(".tab-btn")),
   tabPanels: Array.from(document.querySelectorAll<HTMLElement>(".tab-panel"))
 };
@@ -162,21 +206,142 @@ let presetStore: PresetStore = {};
 const MAX_ORT_THREADS = Math.max(1, Math.round(Number(navigator.hardwareConcurrency) || 4));
 const DEFAULT_SLICE_OFFSET_SAMPLES = 6054;
 const MAX_SLICE_OFFSET_SAMPLES = 48_000;
+const MAX_LOG_ENTRIES = 500;
+let logEntries: LogEntry[] = [];
+let latestTimingStats: TimingStats | null = null;
+let latestQueueStats: QueueStats | null = null;
 
 function now(): string {
   return new Date().toISOString();
 }
 
-function log(level: LogLevel, message: string, detail?: unknown): void {
-  const line = `[${now()}] [${level}] ${message}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ""}`;
-  if (level === "ERROR") {
-    console.error(line);
-  } else if (level === "WARN") {
-    console.warn(line);
-  } else {
-    console.log(line);
+function formatLogTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString("ja-JP", { hour12: false });
+}
+
+function normalizeLogLevel(level: string): string {
+  const lower = level.toLowerCase();
+  if (lower.includes("error")) {
+    return "error";
   }
-  ui.logBox.textContent = `${line}\n${ui.logBox.textContent}`.slice(0, 12000);
+  if (lower.includes("warn")) {
+    return "warn";
+  }
+  if (lower.includes("timing")) {
+    return "timing";
+  }
+  return "info";
+}
+
+function currentLogFilter(): LogFilter {
+  const value = ui.logFilter.value as LogFilter;
+  return value === "warn" || value === "timing" ? value : "all";
+}
+
+function parseBackendStats(entry: LogEntry): void {
+  const msg = entry.message;
+  if (msg.includes("[vc-inference] timing detail")) {
+    const total = msg.match(/total=([0-9.]+)ms/);
+    const hubert = msg.match(/hubert=([0-9.]+)ms/);
+    const index = msg.match(/index=([0-9.]+)ms/);
+    const rmvpe = msg.match(/rmvpe=([0-9.]+)ms/);
+    const generator = msg.match(/generator=([0-9.]+)ms/);
+    if (total && hubert && index && rmvpe && generator) {
+      latestTimingStats = {
+        totalMs: Number(total[1]),
+        hubertMs: Number(hubert[1]),
+        indexMs: Number(index[1]),
+        rmvpeMs: Number(rmvpe[1]),
+        generatorMs: Number(generator[1])
+      };
+    }
+  }
+  if (msg.includes("[vc-audio] heartbeat")) {
+    const queue = msg.match(/queue=([0-9]+)/);
+    const queueMs = msg.match(/queue_ms=([0-9.]+)/);
+    const rms = msg.match(/rms=([0-9.]+)/);
+    const peak = msg.match(/peak=([0-9.]+)/);
+    if (queue && queueMs && rms && peak) {
+      latestQueueStats = {
+        queueSamples: Number(queue[1]),
+        queueMs: Number(queueMs[1]),
+        rms: Number(rms[1]),
+        peak: Number(peak[1])
+      };
+    }
+  }
+}
+
+function updateBackendStatsLine(): void {
+  const timingText = latestTimingStats
+    ? `推論: ${latestTimingStats.totalMs.toFixed(0)}ms | hubert: ${latestTimingStats.hubertMs.toFixed(0)}ms | index: ${latestTimingStats.indexMs.toFixed(0)}ms | rmvpe: ${latestTimingStats.rmvpeMs.toFixed(0)}ms | gen: ${latestTimingStats.generatorMs.toFixed(0)}ms`
+    : "推論: --";
+  const queueText = latestQueueStats
+    ? `queue: ${latestQueueStats.queueSamples} (${latestQueueStats.queueMs.toFixed(0)}ms) | RMS: ${latestQueueStats.rms.toFixed(3)} | Peak: ${latestQueueStats.peak.toFixed(3)}`
+    : "queue: --";
+  ui.backendStatsLine.textContent = `${timingText} | ${queueText}`;
+}
+
+function syncRangeReadouts(): void {
+  ui.indexNprobeValue.textContent = ui.indexNprobe.value;
+  ui.noiseSuppressDbValue.textContent = `${ui.noiseSuppressDb.value} dB`;
+  ui.frameGateDbValue.textContent = `${ui.frameGateDb.value} dB`;
+}
+
+function renderLog(): void {
+  const filter = currentLogFilter();
+  const filtered = logEntries.filter((entry) => {
+    if (filter === "warn") {
+      return entry.level === "warn" || entry.level === "error";
+    }
+    if (filter === "timing") {
+      return entry.level === "timing" || entry.message.includes("timing detail");
+    }
+    return true;
+  });
+
+  ui.logEntries.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  for (const entry of filtered) {
+    const line = document.createElement("div");
+    line.className = `log-entry log-${entry.level}`;
+    line.textContent = `[${formatLogTime(entry.ts)}] [${entry.level.toUpperCase()}] ${entry.message}`;
+    frag.appendChild(line);
+  }
+  ui.logEntries.appendChild(frag);
+  ui.logCount.textContent = `${filtered.length}件`;
+
+  if (ui.logAutoScroll.checked) {
+    ui.logPanel.scrollTop = ui.logPanel.scrollHeight;
+  }
+}
+
+function addLogEntry(entry: LogEntry): void {
+  const normalized: LogEntry = {
+    level: normalizeLogLevel(entry.level),
+    message: entry.message,
+    ts: entry.ts
+  };
+  logEntries.push(normalized);
+  if (logEntries.length > MAX_LOG_ENTRIES) {
+    logEntries = logEntries.slice(logEntries.length - MAX_LOG_ENTRIES);
+  }
+  parseBackendStats(normalized);
+  updateBackendStatsLine();
+  renderLog();
+}
+
+function log(level: LogLevel, message: string, detail?: unknown): void {
+  const line = `${message}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ""}`;
+  addLogEntry({ level: level.toLowerCase(), message: line, ts: Date.now() });
+  const consoleLine = `[${now()}] [${level}] ${line}`;
+  if (level === "ERROR") {
+    console.error(consoleLine);
+  } else if (level === "WARN") {
+    console.warn(consoleLine);
+  } else {
+    console.log(consoleLine);
+  }
 }
 
 function setMessage(msg: string): void {
@@ -370,6 +535,7 @@ function initPresetUi(): void {
 function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
   const sanitizedIndexRows = Math.round(clamp(raw.index_search_rows, 100, 20000, 2048));
   const sanitizedTopK = Math.round(clamp(raw.index_top_k, 1, 32, 8));
+  const sanitizedNprobe = Math.round(clamp(raw.index_nprobe, 1, 128, 32));
   const normalizedVadOn = finiteOr(
     (raw as Partial<RuntimeConfig>).vad_on_threshold,
     finiteOr(raw.response_threshold, -40.0)
@@ -382,6 +548,30 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
       ? Math.max(-120.0, normalizedVadOn - 15.0)
       : Math.max(0.0, normalizedVadOn * 0.17782794)
   );
+  const normalizedVadHysteresis = clamp(
+    finiteOr((raw as Partial<RuntimeConfig>).vad_hysteresis, 0.5),
+    0.1,
+    1.0,
+    0.5
+  );
+  const normalizedNoiseSuppressDb = clamp(
+    finiteOr((raw as Partial<RuntimeConfig>).noise_suppress_db, -12.0),
+    -30.0,
+    0.0,
+    -12.0
+  );
+  const normalizedNoiseLearnSec = clamp(
+    finiteOr((raw as Partial<RuntimeConfig>).noise_suppress_learn_sec, 1.5),
+    0.1,
+    5.0,
+    1.5
+  );
+  const normalizedFrameGateDb = clamp(
+    finiteOr((raw as Partial<RuntimeConfig>).frame_gate_db, -60.0),
+    -80.0,
+    -30.0,
+    -60.0
+  );
   return {
     input_gain: atLeast(raw.input_gain, 0.0, 1.0),
     output_gain: atLeast(raw.output_gain, 0.0, 1.0),
@@ -392,6 +582,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     index_smooth_alpha: atLeast(raw.index_smooth_alpha, 0.0, 0.85),
     index_top_k: Math.min(sanitizedTopK, sanitizedIndexRows),
     index_search_rows: sanitizedIndexRows,
+    index_nprobe: sanitizedNprobe,
     index_provider: ["cpu", "gpu"].includes((raw.index_provider ?? "").toLowerCase())
       ? raw.index_provider.toLowerCase()
       : "cpu",
@@ -407,9 +598,15 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     response_threshold: normalizedVadOn,
     vad_on_threshold: normalizedVadOn,
     vad_off_threshold: normalizedVadOff,
+    vad_hysteresis: normalizedVadHysteresis,
+    noise_suppress: Boolean((raw as Partial<RuntimeConfig>).noise_suppress ?? true),
+    noise_suppress_db: normalizedNoiseSuppressDb,
+    noise_suppress_learn_sec: normalizedNoiseLearnSec,
+    frame_gate_db: normalizedFrameGateDb,
     fade_in_ms: intAtLeast(raw.fade_in_ms, 0, 12),
     fade_out_ms: intAtLeast(raw.fade_out_ms, 0, 120),
     sola_search_ms: intAtLeast(raw.sola_search_ms, 1, 40),
+    sola_reset_threshold_samples: intAtLeast(raw.sola_reset_threshold_samples, 1, 400),
     output_tail_offset_ms: intAtLeast(raw.output_tail_offset_ms, 0, 0),
     output_slice_offset_samples: normalizeSliceOffsetSamples(raw.output_slice_offset_samples),
     bypass_slicing: Boolean(raw.bypass_slicing),
@@ -461,6 +658,7 @@ function runtimeFromInputs(): RuntimeConfig {
     index_smooth_alpha: Number(ui.indexSmoothAlpha.value),
     index_top_k: Number(ui.indexTopK.value),
     index_search_rows: Number(ui.indexSearchRows.value),
+    index_nprobe: Number(ui.indexNprobe.value),
     index_provider: ui.indexProvider.value,
     protect: Number(ui.protect.value),
     rmvpe_threshold: Number(ui.rmvpeThreshold.value),
@@ -473,9 +671,15 @@ function runtimeFromInputs(): RuntimeConfig {
     response_threshold: Number(ui.vadOnThreshold.value),
     vad_on_threshold: Number(ui.vadOnThreshold.value),
     vad_off_threshold: Number(ui.vadOffThreshold.value),
+    vad_hysteresis: Number(ui.vadHysteresis.value),
+    noise_suppress: ui.noiseSuppress.checked,
+    noise_suppress_db: Number(ui.noiseSuppressDb.value),
+    noise_suppress_learn_sec: base?.noise_suppress_learn_sec ?? 1.5,
+    frame_gate_db: Number(ui.frameGateDb.value),
     fade_in_ms: Number(ui.fadeInMs.value),
     fade_out_ms: Number(ui.fadeOutMs.value),
     sola_search_ms: Number(ui.solaSearchMs.value),
+    sola_reset_threshold_samples: Number(ui.solaResetThreshold.value),
     output_tail_offset_ms: Number(ui.outputTailOffsetMs.value),
     output_slice_offset_samples: Number(ui.sliceOffsetSamples.value),
     bypass_slicing: ui.bypassSlicing.checked,
@@ -519,6 +723,7 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.indexSmoothAlpha.value = String(config.index_smooth_alpha);
   ui.indexTopK.value = String(config.index_top_k);
   ui.indexSearchRows.value = String(config.index_search_rows);
+  ui.indexNprobe.value = String(config.index_nprobe);
   ui.indexProvider.value = config.index_provider;
   ui.protect.value = String(config.protect);
   ui.rmvpeThreshold.value = String(config.rmvpe_threshold);
@@ -529,9 +734,14 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.targetBufferMs.value = String(config.target_buffer_ms);
   ui.vadOnThreshold.value = String(config.vad_on_threshold);
   ui.vadOffThreshold.value = String(config.vad_off_threshold);
+  ui.vadHysteresis.value = String(config.vad_hysteresis);
+  ui.noiseSuppress.checked = Boolean(config.noise_suppress);
+  ui.noiseSuppressDb.value = String(config.noise_suppress_db);
+  ui.frameGateDb.value = String(config.frame_gate_db);
   ui.fadeInMs.value = String(config.fade_in_ms);
   ui.fadeOutMs.value = String(config.fade_out_ms);
   ui.solaSearchMs.value = String(config.sola_search_ms);
+  ui.solaResetThreshold.value = String(config.sola_reset_threshold_samples);
   ui.outputTailOffsetMs.value = String(config.output_tail_offset_ms);
   ui.sliceOffsetSamples.value = String(normalizeSliceOffsetSamples(config.output_slice_offset_samples));
   ui.bypassSlicing.checked = Boolean(config.bypass_slicing);
@@ -546,6 +756,7 @@ function applyRuntime(config: RuntimeConfig): void {
   ui.cudaWs.checked = config.cuda_ws;
   ui.cudaTf32.checked = config.cuda_tf32;
   syncCudaWsUiState();
+  syncRangeReadouts();
   ui.ortIntraThreads.value = String(config.ort_intra_threads);
   ui.ortInterThreads.value = String(config.ort_inter_threads);
 }
@@ -553,6 +764,13 @@ function applyRuntime(config: RuntimeConfig): void {
 function applyStatus(status: EngineStatus): void {
   ui.statusLine.textContent = `status: ${status.running ? "running" : "stopped"}`;
   ui.levelLine.textContent = `input level: rms ${status.input_level_rms.toFixed(4)} / peak ${status.input_level_peak.toFixed(4)}`;
+  updateBackendStatsLine();
+}
+
+async function setupLogListener(): Promise<void> {
+  await listen<LogEntry>("vc-log", (event) => {
+    addLogEntry(event.payload);
+  });
 }
 
 async function loadAll(): Promise<void> {
@@ -697,8 +915,18 @@ ui.startBtn.addEventListener("click", () => {
 ui.stopBtn.addEventListener("click", () => {
   void runAction("stop", stopEngine);
 });
-ui.clearLogBtn.addEventListener("click", () => {
-  ui.logBox.textContent = "";
+ui.logClearBtn.addEventListener("click", () => {
+  logEntries = [];
+  latestTimingStats = null;
+  latestQueueStats = null;
+  updateBackendStatsLine();
+  renderLog();
+});
+ui.logFilter.addEventListener("change", () => {
+  renderLog();
+});
+ui.logAutoScroll.addEventListener("change", () => {
+  renderLog();
 });
 ui.cudaWs.addEventListener("change", () => {
   syncCudaWsUiState();
@@ -708,6 +936,27 @@ ui.sliceOffsetSamples.addEventListener("input", () => {
 });
 ui.bypassSlicing.addEventListener("change", () => {
   void runAction("save_runtime_live_bypass", saveRuntimeOnly);
+});
+ui.vadHysteresis.addEventListener("input", () => {
+  void runAction("save_runtime_live_vad_hysteresis", saveRuntimeOnly);
+});
+ui.noiseSuppress.addEventListener("change", () => {
+  void runAction("save_runtime_live_noise_suppress", saveRuntimeOnly);
+});
+ui.noiseSuppressDb.addEventListener("input", () => {
+  syncRangeReadouts();
+  void runAction("save_runtime_live_noise_suppress_db", saveRuntimeOnly);
+});
+ui.frameGateDb.addEventListener("input", () => {
+  syncRangeReadouts();
+  void runAction("save_runtime_live_frame_gate", saveRuntimeOnly);
+});
+ui.indexNprobe.addEventListener("input", () => {
+  syncRangeReadouts();
+  void runAction("save_runtime_live_index_nprobe", saveRuntimeOnly);
+});
+ui.solaResetThreshold.addEventListener("input", () => {
+  void runAction("save_runtime_live_sola_reset_threshold", saveRuntimeOnly);
 });
 ui.indexSearchRows.addEventListener("input", () => {
   void runAction("save_runtime_live_index_rows", saveRuntimeOnly);
@@ -723,8 +972,12 @@ for (const btn of ui.tabButtons) {
 switchTab(ui.tabButtons[0]?.dataset.tab ?? "model");
 syncCudaWsUiState();
 initPresetUi();
+updateBackendStatsLine();
+syncRangeReadouts();
+renderLog();
 
 void runAction("init", loadAll);
+void runAction("log_listener", setupLogListener);
 statusTimer = window.setInterval(() => {
   void runAction("status_poll", pollStatus);
 }, 250);

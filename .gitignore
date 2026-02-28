@@ -46,6 +46,7 @@ setup.exe
 # ------------------------------------------------------------
 model/mode.txt
 model/*.onnx
+model/*.onnx.data
 model/**/*.onnx
 model/**/*.onnx.data
 model/*.pth
@@ -56,6 +57,8 @@ model/*.index
 model/**/*.index
 model/*.bin
 model/**/*.bin
+model/*.faiss
+model/**/*.faiss
 model/*.cache
 model/**/*.cache
 model/*.rustvc.cache
@@ -63,6 +66,7 @@ model/**/*.rustvc.cache
 model/*.dll
 model/**/*.dll
 models/*.onnx
+models/*.onnx.data
 models/**/*.onnx
 models/**/*.onnx.data
 models/*.pth
@@ -73,6 +77,8 @@ models/*.index
 models/**/*.index
 models/*.bin
 models/**/*.bin
+models/*.faiss
+models/**/*.faiss
 models/*.cache
 models/**/*.cache
 models/*.rustvc.cache
@@ -99,6 +105,8 @@ mel_parity_*.npy
 timing_*.log
 profile_*.log
 *.npy
+*.rar
+RustVoiceConversion/
 
 # ------------------------------------------------------------
 # Logs / env

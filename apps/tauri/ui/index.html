@@ -79,6 +79,10 @@
               <input id="indexSearchRows" type="number" step="100" min="100" max="20000" />
             </div>
             <div class="field">
+              <label for="indexNprobe">Index nprobe <span id="indexNprobeValue">32</span></label>
+              <input id="indexNprobe" type="range" min="1" max="128" step="1" value="32" />
+            </div>
+            <div class="field">
               <label for="indexProvider">Index Provider</label>
               <select id="indexProvider">
                 <option value="cpu">CPU (推奨: GTX世代)</option>
@@ -134,6 +138,24 @@
               <input id="vadOffThreshold" type="number" step="0.001" min="-120" />
             </div>
             <div class="field">
+              <label for="vadHysteresis">VAD Hysteresis</label>
+              <input id="vadHysteresis" type="number" step="0.05" min="0.1" max="1.0" />
+            </div>
+            <div class="field">
+              <label for="noiseSuppress">
+                <input id="noiseSuppress" type="checkbox" checked />
+                Noise Suppress
+              </label>
+            </div>
+            <div class="field">
+              <label for="noiseSuppressDb">Noise Suppress (dB) <span id="noiseSuppressDbValue">-12 dB</span></label>
+              <input id="noiseSuppressDb" type="range" min="-30" max="0" step="1" value="-12" />
+            </div>
+            <div class="field">
+              <label for="frameGateDb">Frame Gate (dBFS) <span id="frameGateDbValue">-60 dB</span></label>
+              <input id="frameGateDb" type="range" min="-80" max="-30" step="1" value="-60" />
+            </div>
+            <div class="field">
               <label for="fadeInMs">Fade In (ms)</label>
               <input id="fadeInMs" type="number" step="1" min="0" />
             </div>
@@ -144,6 +166,10 @@
             <div class="field">
               <label for="solaSearchMs">SOLA Search (ms)</label>
               <input id="solaSearchMs" type="number" step="1" min="1" />
+            </div>
+            <div class="field">
+              <label for="solaResetThreshold">SOLA Reset Threshold (samples)</label>
+              <input id="solaResetThreshold" type="number" step="10" min="1" max="48000" value="400" />
             </div>
             <div class="field">
               <label for="outputTailOffsetMs">Output Tail Offset (ms)</label>
@@ -258,15 +284,30 @@
         </div>
         <p id="statusLine">status: idle</p>
         <p id="levelLine">input level: rms 0.0000 / peak 0.0000</p>
+        <p id="backendStatsLine">推論: -- | queue: --</p>
         <p id="messageLine" class="message"></p>
       </section>
 
       <section class="card log-card">
         <div class="log-head">
           <h2>ログ</h2>
-          <button id="clearLogBtn">Clear</button>
+          <button id="logClearBtn">クリア</button>
         </div>
-        <pre id="logBox"></pre>
+        <div class="log-toolbar">
+          <label class="log-toggle">
+            <input id="logAutoScroll" type="checkbox" checked />
+            自動スクロール
+          </label>
+          <select id="logFilter">
+            <option value="all">全て</option>
+            <option value="warn">警告以上</option>
+            <option value="timing">timingのみ</option>
+          </select>
+          <span id="logCount">0件</span>
+        </div>
+        <div id="logPanel">
+          <div id="logEntries"></div>
+        </div>
       </section>
     </main>
     <script type="module" src="/src/main.ts"></script>

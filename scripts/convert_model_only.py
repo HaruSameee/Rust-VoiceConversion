@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import traceback
 import types
@@ -170,6 +171,93 @@ def convert_index_to_bin(index_path: str, out_path: str) -> Tuple[int, int]:
     return rows, dims
 
 
+def _discover_python_command() -> list[str]:
+    candidates: list[list[str]] = []
+    env_python = os.environ.get("PYTHON", "").strip()
+    if env_python:
+        candidates.append([env_python])
+    candidates.extend([["python"], ["py", "-3.10"], ["py", "-3"], ["py"]])
+
+    for argv in candidates:
+        try:
+            probe = subprocess.run(
+                argv + ["-c", "import sys; print(sys.executable)"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if probe.returncode == 0 and probe.stdout.strip():
+                return argv
+        except Exception:
+            continue
+    return []
+
+
+def _resolve_helper_script(name: str) -> Path:
+    candidates = [
+        BASE_DIR / name,
+        BASE_DIR / "scripts" / name,
+        Path.cwd() / name,
+        Path.cwd() / "scripts" / name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise RuntimeError(f"必要な補助スクリプトが見つかりません: {name}")
+
+
+def convert_ivf_index(base_dir: Path, out_dir: Path) -> None:
+    vectors_bin = out_dir / "model_vectors.bin"
+    ivf_bin = out_dir / "model_vectors_ivf.bin"
+
+    if not vectors_bin.exists():
+        print("\n=== Step 5.5: IVF インデックス生成 ===")
+        print("  model_vectors.bin が見つかりません。スキップします。")
+        return
+
+    if ivf_bin.exists() and ivf_bin.stat().st_mtime >= vectors_bin.stat().st_mtime:
+        size_mb = ivf_bin.stat().st_size / 1024 / 1024
+        print("\n=== Step 5.5: IVF インデックス生成 ===")
+        print(f"  既存の IVF インデックスを使用します: {ivf_bin} ({size_mb:.1f} MB)")
+        return
+
+    script = _resolve_helper_script("convert_to_ivf.py")
+    python_cmd = _discover_python_command()
+    if not python_cmd:
+        print("\n=== Step 5.5: IVF インデックス生成 ===")
+        print("  警告: Python が見つかりません。IVF変換をスキップします。")
+        return
+
+    print("\n=== Step 5.5: IVF インデックス生成 ===")
+    print(f"  入力: {vectors_bin}")
+    print(f"  出力: {ivf_bin}")
+
+    result = subprocess.run(
+        python_cmd
+        + [
+            str(script),
+            "--input",
+            str(vectors_bin),
+            "--output",
+            str(ivf_bin),
+            "--nlist",
+            "512",
+            "--nprobe",
+            "32",
+            "--no-interactive",
+        ],
+        capture_output=False,
+        check=False,
+    )
+
+    if result.returncode == 0 and ivf_bin.exists():
+        size_mb = ivf_bin.stat().st_size / 1024 / 1024
+        print(f"  ✅ IVF インデックス生成完了: {size_mb:.1f} MB")
+    else:
+        print(f"  ⚠️  IVF変換に失敗しました（returncode={result.returncode}）")
+        print("     model_vectors.bin は引き続き使用できます。")
+
+
 def resolve_input_path(cli_value: str | None, prompt: str, required_ext: str | None = None) -> str:
     if cli_value:
         path = cli_value.strip()
@@ -215,6 +303,7 @@ def main() -> None:
     onnx_out = str(out_dir / "model_dynamic.onnx")
     export_generator(pth_path, onnx_out)
     print(f"変換完了: {onnx_out}")
+    convert_ivf_index(BASE_DIR, out_dir)
 
     if args.skip_index:
         print("index変換はスキップしました。")
@@ -234,6 +323,7 @@ def main() -> None:
     bin_out = str(out_dir / "model_vectors.bin")
     rows, dims = convert_index_to_bin(index_path, bin_out)
     print(f"変換完了: {bin_out} ({rows}行, {dims}次元)")
+    convert_ivf_index(BASE_DIR, out_dir)
     print("完了しました。")
 
 

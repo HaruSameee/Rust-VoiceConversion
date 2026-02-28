@@ -6,17 +6,17 @@ use std::{
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{Emitter, State};
 use vc_audio::{
     list_input_devices, list_output_devices, spawn_voice_changer_stream, AudioStreamOptions,
     RealtimeAudioEngine,
 };
-use vc_core::{ModelConfig, RuntimeConfig, VoiceChanger};
+use vc_core::{set_log_sink, ModelConfig, RuntimeConfig, VoiceChanger};
 use vc_inference::RvcOrtEngine;
 
 fn log_debug(message: &str) {
@@ -25,6 +25,29 @@ fn log_debug(message: &str) {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     eprintln!("[tauri:{ts}] {message}");
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UiLogEvent {
+    level: String,
+    message: String,
+    ts: u64,
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn emit_log(app: &tauri::AppHandle, level: &str, message: &str) {
+    let payload = UiLogEvent {
+        level: level.to_string(),
+        message: message.to_string(),
+        ts: now_millis(),
+    };
+    let _ = app.emit("vc-log", payload);
 }
 
 fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
@@ -181,7 +204,16 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         ));
         config.index_top_k = clamped_top_k;
     }
-    let normalized_index_provider = match config.index_provider.trim().to_ascii_lowercase().as_str() {
+    let clamped_nprobe = config.index_nprobe.max(1).min(128);
+    if clamped_nprobe != config.index_nprobe {
+        log_debug(&format!(
+            "set_runtime_config_cmd index_nprobe clamped: {} -> {}",
+            config.index_nprobe, clamped_nprobe
+        ));
+        config.index_nprobe = clamped_nprobe;
+    }
+    let normalized_index_provider = match config.index_provider.trim().to_ascii_lowercase().as_str()
+    {
         "gpu" => "gpu",
         _ => "cpu",
     };
@@ -204,10 +236,57 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
     if config.vad_off_threshold == 0.0 && config.vad_on_threshold != 0.0 {
         config.vad_off_threshold = derive_vad_off_threshold(config.vad_on_threshold);
     }
+    if !config.vad_hysteresis.is_finite() {
+        config.vad_hysteresis = 0.5;
+    }
+    let clamped_vad_hysteresis = config.vad_hysteresis.clamp(0.1, 1.0);
+    if (clamped_vad_hysteresis - config.vad_hysteresis).abs() > f32::EPSILON {
+        log_debug(&format!(
+            "set_runtime_config_cmd vad_hysteresis clamped: {} -> {}",
+            config.vad_hysteresis, clamped_vad_hysteresis
+        ));
+        config.vad_hysteresis = clamped_vad_hysteresis;
+    }
+    if !config.noise_suppress_db.is_finite() {
+        config.noise_suppress_db = -12.0;
+    }
+    let clamped_noise_suppress_db = config.noise_suppress_db.clamp(-30.0, 0.0);
+    if (clamped_noise_suppress_db - config.noise_suppress_db).abs() > f32::EPSILON {
+        log_debug(&format!(
+            "set_runtime_config_cmd noise_suppress_db clamped: {} -> {}",
+            config.noise_suppress_db, clamped_noise_suppress_db
+        ));
+        config.noise_suppress_db = clamped_noise_suppress_db;
+    }
+    if !config.noise_suppress_learn_sec.is_finite() {
+        config.noise_suppress_learn_sec = 1.5;
+    }
+    let clamped_noise_learn = config.noise_suppress_learn_sec.clamp(0.1, 5.0);
+    if (clamped_noise_learn - config.noise_suppress_learn_sec).abs() > f32::EPSILON {
+        log_debug(&format!(
+            "set_runtime_config_cmd noise_suppress_learn_sec clamped: {} -> {}",
+            config.noise_suppress_learn_sec, clamped_noise_learn
+        ));
+        config.noise_suppress_learn_sec = clamped_noise_learn;
+    }
+    if !config.frame_gate_db.is_finite() {
+        config.frame_gate_db = -60.0;
+    }
+    let clamped_frame_gate_db = config.frame_gate_db.clamp(-80.0, -30.0);
+    if (clamped_frame_gate_db - config.frame_gate_db).abs() > f32::EPSILON {
+        log_debug(&format!(
+            "set_runtime_config_cmd frame_gate_db clamped: {} -> {}",
+            config.frame_gate_db, clamped_frame_gate_db
+        ));
+        config.frame_gate_db = clamped_frame_gate_db;
+    }
+    config.sola_reset_threshold_samples = config
+        .sola_reset_threshold_samples
+        .clamp(1, config.block_size.max(1));
     // Keep legacy field aligned for older subsystems and saved presets.
     config.response_threshold = config.vad_on_threshold;
     log_debug(&format!(
-        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} fade_in_ms={} fade_out_ms={} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} nprobe={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
         config.sample_rate,
         config.block_size,
         config.input_device_name,
@@ -217,9 +296,15 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.response_threshold,
         config.vad_on_threshold,
         config.vad_off_threshold,
+        config.vad_hysteresis,
+        config.noise_suppress,
+        config.noise_suppress_db,
+        config.noise_suppress_learn_sec,
+        config.frame_gate_db,
         config.fade_in_ms,
         config.fade_out_ms,
         config.sola_search_ms,
+        config.sola_reset_threshold_samples,
         config.output_tail_offset_ms,
         config.output_slice_offset_samples,
         config.bypass_slicing,
@@ -229,6 +314,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.index_smooth_alpha,
         config.index_top_k,
         config.index_search_rows,
+        config.index_nprobe,
         config.index_provider,
         config.protect,
         config.rmvpe_threshold,
@@ -263,11 +349,12 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
     let running = guard.running;
     let index_rows = config.index_search_rows;
     let index_top_k = config.index_top_k;
+    let index_nprobe = config.index_nprobe;
     let index_provider = config.index_provider.clone();
     guard.config = config;
     if running {
         if let Some(task) = guard.engine_task.as_ref() {
-            task.update_index_search_params(index_rows, index_top_k, &index_provider)
+            task.update_index_search_params(index_rows, index_top_k, index_nprobe, &index_provider)
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -295,9 +382,10 @@ fn set_model_config_cmd(model: ModelConfig, state: State<'_, AppState>) -> Resul
 }
 
 #[tauri::command]
-fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> {
+fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<EngineStatus, String> {
     run_panic_safe("start_engine_cmd", || {
         log_debug("start_engine_cmd");
+        emit_log(&app, "info", "start_engine_cmd");
         let _ = ensure_ort_dylib_path();
         let (mut runtime_config, model_raw) = {
             let mut guard = state.lock_runtime();
@@ -319,7 +407,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             std::env::var("ORT_DYLIB_PATH").ok()
         ));
         log_debug(&format!(
-            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} fade_in_ms={} fade_out_ms={} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} nprobe={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
             model.model_path,
             model.hubert_path,
             model.pitch_extractor_path,
@@ -333,9 +421,15 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.response_threshold,
             runtime_config.vad_on_threshold,
             runtime_config.vad_off_threshold,
+            runtime_config.vad_hysteresis,
+            runtime_config.noise_suppress,
+            runtime_config.noise_suppress_db,
+            runtime_config.noise_suppress_learn_sec,
+            runtime_config.frame_gate_db,
             runtime_config.fade_in_ms,
             runtime_config.fade_out_ms,
             runtime_config.sola_search_ms,
+            runtime_config.sola_reset_threshold_samples,
             runtime_config.output_tail_offset_ms,
             runtime_config.output_slice_offset_samples,
             runtime_config.bypass_slicing,
@@ -345,6 +439,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
             runtime_config.index_smooth_alpha,
             runtime_config.index_top_k,
             runtime_config.index_search_rows,
+            runtime_config.index_nprobe,
             runtime_config.index_provider,
             runtime_config.protect,
             runtime_config.rmvpe_threshold,
@@ -385,9 +480,15 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
                 response_threshold: runtime_config.response_threshold,
                 vad_on_threshold: runtime_config.vad_on_threshold,
                 vad_off_threshold: runtime_config.vad_off_threshold,
+                vad_hysteresis: runtime_config.vad_hysteresis,
+                noise_suppress: runtime_config.noise_suppress,
+                noise_suppress_db: runtime_config.noise_suppress_db,
+                noise_suppress_learn_sec: runtime_config.noise_suppress_learn_sec,
+                frame_gate_db: runtime_config.frame_gate_db,
                 fade_in_ms: runtime_config.fade_in_ms,
                 fade_out_ms: runtime_config.fade_out_ms,
                 sola_search_ms: runtime_config.sola_search_ms,
+                sola_reset_threshold_samples: runtime_config.sola_reset_threshold_samples,
                 output_tail_offset_ms: runtime_config.output_tail_offset_ms,
                 output_slice_offset_samples: runtime_config.output_slice_offset_samples,
                 bypass_slicing: runtime_config.bypass_slicing,
@@ -412,6 +513,7 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
         guard.config = runtime_config;
         guard.engine_task = Some(audio_engine);
         sync_levels_from_engine(&mut guard);
+        emit_log(&app, "info", "start_engine_cmd done");
         Ok(EngineStatus {
             running: guard.running,
             input_level_rms: guard.input_level_rms,
@@ -421,14 +523,16 @@ fn start_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> 
 }
 
 #[tauri::command]
-fn stop_engine_cmd(state: State<'_, AppState>) -> Result<EngineStatus, String> {
+fn stop_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<EngineStatus, String> {
     run_panic_safe("stop_engine_cmd", || {
         log_debug("stop_engine_cmd");
+        emit_log(&app, "info", "stop_engine_cmd");
         let mut guard = state.lock_runtime();
         if let Some(task) = guard.engine_task.take() {
             task.stop_and_abort();
         }
         guard.running = false;
+        emit_log(&app, "info", "stop_engine_cmd done");
         Ok(EngineStatus {
             running: guard.running,
             input_level_rms: guard.input_level_rms,
@@ -601,6 +705,9 @@ fn default_runtime_config() -> RuntimeConfig {
     if let Some(v) = env_usize("RUST_VC_INDEX_MAX_VECTORS") {
         cfg.index_max_vectors = v;
     }
+    if let Some(v) = env_u32("RUST_VC_INDEX_NPROBE") {
+        cfg.index_nprobe = v.max(1).min(128);
+    }
     if let Some(v) = env_f32("RUST_VC_PITCH_SMOOTH_ALPHA") {
         cfg.pitch_smooth_alpha = v.max(0.0);
     }
@@ -623,6 +730,24 @@ fn default_runtime_config() -> RuntimeConfig {
     } else {
         cfg.vad_off_threshold = 0.0;
     }
+    if let Some(v) = env_f32("RUST_VC_VAD_HYSTERESIS") {
+        cfg.vad_hysteresis = v.clamp(0.1, 1.0);
+    }
+    if let Some(v) = env_bool("RUST_VC_NOISE_SUPPRESS") {
+        cfg.noise_suppress = v;
+    }
+    if let Some(v) = env_f32("RUST_VC_NOISE_SUPPRESS_DB") {
+        cfg.noise_suppress_db = v.clamp(-30.0, 0.0);
+    }
+    if let Some(v) = env_f32("RUST_VC_NOISE_SUPPRESS_LEARN_SEC") {
+        cfg.noise_suppress_learn_sec = v.clamp(0.1, 5.0);
+    }
+    if let Some(v) = env_f32("RUST_VC_FRAME_GATE_DB") {
+        cfg.frame_gate_db = v.clamp(-80.0, -30.0);
+    }
+    if let Some(v) = env_usize("RUST_VC_SOLA_RESET_THRESHOLD") {
+        cfg.sola_reset_threshold_samples = v.max(1);
+    }
     if let Some(v) = env_u32("RUST_VC_SOLA_SEARCH_MS") {
         cfg.sola_search_ms = v.max(1);
     }
@@ -636,7 +761,7 @@ fn default_runtime_config() -> RuntimeConfig {
         cfg.bypass_slicing = v;
     }
     log_debug(&format!(
-        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} index_provider={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} sola_search_ms={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
+        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} index_nprobe={} index_provider={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
         cfg.ort_provider,
         cfg.ort_device_id,
         cfg.ort_gpu_mem_limit_mb,
@@ -652,12 +777,19 @@ fn default_runtime_config() -> RuntimeConfig {
         cfg.cuda_tf32,
         cfg.index_bin_dim,
         cfg.index_max_vectors,
+        cfg.index_nprobe,
         cfg.index_provider,
         cfg.target_buffer_ms,
         cfg.response_threshold,
         cfg.vad_on_threshold,
         cfg.vad_off_threshold,
+        cfg.vad_hysteresis,
+        cfg.noise_suppress,
+        cfg.noise_suppress_db,
+        cfg.noise_suppress_learn_sec,
+        cfg.frame_gate_db,
         cfg.sola_search_ms,
+        cfg.sola_reset_threshold_samples,
         cfg.output_tail_offset_ms,
         cfg.output_slice_offset_samples,
         cfg.bypass_slicing,
@@ -955,6 +1087,13 @@ print(",".join(ort.get_available_providers()))"#;
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            set_log_sink(Some(Arc::new(move |level, message| {
+                emit_log(&handle, level, message);
+            })));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_audio_devices_cmd,
             get_runtime_config_cmd,

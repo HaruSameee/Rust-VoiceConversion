@@ -16,7 +16,7 @@ use ort::{
     tensor::TensorElementType,
     value::Tensor,
 };
-use vc_core::{InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
+use vc_core::{emit_log as emit_backend_log, InferenceEngine, ModelConfig, Result, RuntimeConfig, VcError};
 use vc_signal::{
     apply_rms_mix, coarse_pitch_from_f0, median_filter_pitch_track_inplace,
     normalize_for_onnx_input, postprocess_generated_audio, resample_hq_into,
@@ -24,7 +24,9 @@ use vc_signal::{
 };
 
 pub mod audio_pipeline;
+pub mod ivf_index;
 pub mod zero_copy_engine;
+use ivf_index::{IvfIndex, IVF_MAGIC};
 
 const STRICT_ONNX_INPUT_SAMPLES_16K: usize = 16_000;
 const STRICT_HUBERT_OUTPUT_FRAMES: usize = 50;
@@ -45,6 +47,18 @@ static ORT_DML_MISSING_WARN_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_AUTO_CPU_WARN_LOGGED: OnceLock<()> = OnceLock::new();
 static ORT_CUDA_TUNE_LOGGED: OnceLock<()> = OnceLock::new();
 static TENSOR_STATS_DEBUG: OnceLock<bool> = OnceLock::new();
+
+fn emit_info(message: &str) {
+    emit_backend_log("info", message);
+}
+
+fn emit_warn(message: &str) {
+    emit_backend_log("warn", message);
+}
+
+fn emit_timing(message: &str) {
+    emit_backend_log("timing", message);
+}
 
 #[derive(Debug, Clone, Copy)]
 struct TensorStats {
@@ -206,6 +220,12 @@ struct FeatureIndex {
     vectors_t: Array2<f32>,
 }
 
+#[derive(Debug)]
+enum IndexBackend {
+    Binary(FeatureIndex),
+    Ivf(IvfIndex),
+}
+
 #[derive(Debug, Clone)]
 struct PitchEstimate {
     f0_hz: Vec<f32>,
@@ -216,6 +236,8 @@ struct PitchEstimate {
 struct IndexBlendStats {
     rows: usize,
     top_k: usize,
+    provider: &'static str,
+    nprobe: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,7 +251,7 @@ pub struct RvcOrtEngine {
     rvc_session: Session,
     rmvpe_session: Option<Session>,
     hubert_session: Option<Session>,
-    feature_index: Option<FeatureIndex>,
+    feature_index: Option<IndexBackend>,
     phone_feature_dim: usize,
     input_to_16k_resampler: HqResampler,
     ort_intra_threads: usize,
@@ -414,18 +436,23 @@ impl RvcOrtEngine {
             let feature_index = match model.index_path.as_deref() {
                 Some(path) => {
                     if !Path::new(path).exists() {
-                        eprintln!("[vc-inference] index file not found, disable index: {path}");
+                        let msg = format!("[vc-inference] index file not found, disable index: {path}");
+                        eprintln!("{msg}");
+                        emit_warn(&msg);
                         None
                     } else {
-                        match load_feature_index(
+                        match load_index_backend(
                             path,
                             phone_feature_dim,
                             runtime_config.index_bin_dim.max(1),
                             runtime_config.index_max_vectors,
+                            runtime_config.index_nprobe.max(1),
                         ) {
                             Ok(index) => Some(index),
                             Err(e) => {
-                                eprintln!("index disabled: {e}");
+                                let msg = format!("index disabled: {e}");
+                                eprintln!("{msg}");
+                                emit_warn(&msg);
                                 None
                             }
                         }
@@ -896,29 +923,21 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         }
         let requested_rows = config.index_search_rows.max(1);
         let requested_top_k = config.index_top_k.max(1).min(requested_rows);
-        let Some(index) = &self.feature_index else {
+        let requested_nprobe = config.index_nprobe.max(1);
+        let Some(index_backend) = self.feature_index.as_mut() else {
             self.index_prev_vector.clear();
             return IndexBlendStats {
                 rows: requested_rows,
                 top_k: requested_top_k,
+                provider: "none",
+                nprobe: requested_nprobe,
             };
         };
-        if index.vectors.nrows() == 0 || index.vectors.ncols() == 0 {
-            self.index_prev_vector.clear();
-            return IndexBlendStats { rows: 0, top_k: 0 };
-        }
         let rate = if config.index_rate.is_finite() {
             config.index_rate.max(0.0)
         } else {
             0.0
         };
-        if rate <= f32::EPSILON {
-            self.index_prev_vector.clear();
-            return IndexBlendStats {
-                rows: requested_rows.min(index.vectors.nrows()),
-                top_k: requested_top_k.min(index.vectors.nrows().max(1)),
-            };
-        }
         let index_smooth = if config.index_smooth_alpha.is_finite() {
             config.index_smooth_alpha.max(0.0)
         } else {
@@ -926,36 +945,7 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         };
         let frames = phone.shape()[1];
         let dims = phone.shape()[2];
-        let total_rows = index.vectors.nrows();
-        let search_rows = requested_rows.min(total_rows);
-        let top_k = requested_top_k.min(search_rows.max(1));
-        let frame_search_stride = if search_rows >= 4_096 {
-            3
-        } else if search_rows >= 2_048 {
-            2
-        } else {
-            1
-        };
         let phone_matrix = phone.slice(s![0, .., ..]).to_owned();
-        if phone_matrix.ncols() != index.vectors_t.nrows() {
-            eprintln!(
-                "[vc-inference] index dim mismatch at runtime: phone={} index={}",
-                phone_matrix.ncols(),
-                index.vectors_t.nrows()
-            );
-            self.index_prev_vector.clear();
-            return IndexBlendStats {
-                rows: search_rows,
-                top_k,
-            };
-        }
-        let search_rows = search_rows.min(index.vectors_t.ncols()).max(1);
-        let vectors_t_sub = index.vectors_t.slice(s![.., ..search_rows]);
-        // Batched score computation:
-        // phone [frames, dims] x index_t_sub [dims, search_rows] -> [frames, search_rows].
-        let scores = phone_matrix.dot(&vectors_t_sub);
-        let mut retrieved = vec![0.0_f32; dims];
-        let mut best = Vec::<(f32, usize)>::with_capacity(top_k);
         let mut prev_vec = if self.index_prev_vector.len() == dims {
             self.index_prev_vector.clone()
         } else {
@@ -965,78 +955,254 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
         let conf_threshold = rmvpe_threshold.clamp(0.0, 1.0);
         let conf_denom = (1.0 - conf_threshold).max(1.0e-6);
 
-        for t in 0..frames {
-            let conf = confidence.get(t).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            // Confidence-gated rate:
-            // - below threshold: no index blend
-            // - threshold..1.0: remap to 0..1, then scale by index_rate
-            // This keeps full `index_rate` available at conf=1.0.
-            let frame_rate = if conf > conf_threshold {
-                let conf_norm = ((conf - conf_threshold) / conf_denom).clamp(0.0, 1.0);
-                rate * conf_norm
-            } else {
-                0.0
-            };
-            if frame_rate <= f32::EPSILON {
-                continue;
-            }
-            if frame_search_stride > 1 && has_prev && t % frame_search_stride != 0 {
-                // Reuse prior index vector on skipped frames to cut top-k work
-                // without abrupt frame-to-frame timbre jumps.
-                for c in 0..dims {
-                    let from_index = prev_vec[c];
-                    let base = phone[(0, t, c)];
-                    phone[(0, t, c)] = base * (1.0 - frame_rate) + from_index * frame_rate;
+        let (search_rows, top_k, provider, used_nprobe) = match index_backend {
+            IndexBackend::Binary(index) => {
+                if index.vectors.nrows() == 0 || index.vectors.ncols() == 0 {
+                    self.index_prev_vector.clear();
+                    return IndexBlendStats {
+                        rows: 0,
+                        top_k: 0,
+                        provider: "binary_cpu",
+                        nprobe: requested_nprobe,
+                    };
                 }
-                continue;
-            }
-            best.clear();
-            let mut scanned = 0usize;
-            let mut row = 0usize;
-            while row < search_rows && scanned < search_rows {
-                let score = scores[(t, row)];
-                push_top_k(&mut best, (score, row), top_k);
-                row += 1;
-                scanned += 1;
-            }
-            if best.is_empty() {
-                continue;
-            }
+                if phone_matrix.ncols() != index.vectors_t.nrows() {
+                    eprintln!(
+                        "[vc-inference] index dim mismatch at runtime: phone={} index={}",
+                        phone_matrix.ncols(),
+                        index.vectors_t.nrows()
+                    );
+                    self.index_prev_vector.clear();
+                    return IndexBlendStats {
+                        rows: 0,
+                        top_k: 0,
+                        provider: "binary_cpu",
+                        nprobe: requested_nprobe,
+                    };
+                }
 
-            retrieved.fill(0.0);
-            let mut weight_sum = 0.0_f32;
-            let min_score = best
-                .iter()
-                .map(|(score, _)| *score)
-                .fold(f32::INFINITY, f32::min);
-            for &(score, row) in &best {
-                // Convert similarity scores into positive weights.
-                // Subtracting min_score keeps numerical range stable.
-                let w = (score - min_score + 1e-6).max(1e-6);
-                weight_sum += w;
-                for c in 0..dims {
-                    retrieved[c] += index.vectors[(row, c)] * w;
+                if rate <= f32::EPSILON {
+                    self.index_prev_vector.clear();
+                    let rows = requested_rows.min(index.vectors.nrows());
+                    let top_k = requested_top_k.min(index.vectors.nrows().max(1));
+                    return IndexBlendStats {
+                        rows,
+                        top_k,
+                        provider: "binary_cpu",
+                        nprobe: requested_nprobe,
+                    };
                 }
-            }
-            if weight_sum <= f32::EPSILON {
-                continue;
-            }
 
-            for c in 0..dims {
-                let mut from_index = retrieved[c] / weight_sum;
-                if has_prev {
-                    from_index = prev_vec[c] * index_smooth + from_index * (1.0 - index_smooth);
+                let search_rows = requested_rows.min(index.vectors.nrows()).max(1);
+                let top_k = requested_top_k.min(search_rows.max(1));
+                let frame_search_stride = if search_rows >= 4_096 {
+                    3
+                } else if search_rows >= 2_048 {
+                    2
+                } else {
+                    1
+                };
+                let vectors_t_sub = index.vectors_t.slice(s![.., ..search_rows]);
+                // Batched score computation:
+                // phone [frames, dims] x index_t_sub [dims, search_rows] -> [frames, search_rows].
+                let scores = phone_matrix.dot(&vectors_t_sub);
+                let mut retrieved = vec![0.0_f32; dims];
+                let mut best = Vec::<(f32, usize)>::with_capacity(top_k);
+
+                for t in 0..frames {
+                    let conf = confidence.get(t).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    // Confidence-gated rate:
+                    // - below threshold: no index blend
+                    // - threshold..1.0: remap to 0..1, then scale by index_rate
+                    // This keeps full `index_rate` available at conf=1.0.
+                    let frame_rate = if conf > conf_threshold {
+                        let conf_norm = ((conf - conf_threshold) / conf_denom).clamp(0.0, 1.0);
+                        rate * conf_norm
+                    } else {
+                        0.0
+                    };
+                    if frame_rate <= f32::EPSILON {
+                        continue;
+                    }
+                    if frame_search_stride > 1 && has_prev && t % frame_search_stride != 0 {
+                        for c in 0..dims {
+                            let from_index = prev_vec[c];
+                            let base = phone[(0, t, c)];
+                            phone[(0, t, c)] = base * (1.0 - frame_rate) + from_index * frame_rate;
+                        }
+                        continue;
+                    }
+
+                    best.clear();
+                    for row in 0..search_rows {
+                        let score = scores[(t, row)];
+                        push_top_k(&mut best, (score, row), top_k);
+                    }
+                    if best.is_empty() {
+                        continue;
+                    }
+
+                    retrieved.fill(0.0);
+                    let mut weight_sum = 0.0_f32;
+                    let min_score = best
+                        .iter()
+                        .map(|(score, _)| *score)
+                        .fold(f32::INFINITY, f32::min);
+                    for &(score, row) in &best {
+                        let w = (score - min_score + 1e-6).max(1e-6);
+                        weight_sum += w;
+                        for c in 0..dims {
+                            retrieved[c] += index.vectors[(row, c)] * w;
+                        }
+                    }
+                    if weight_sum <= f32::EPSILON {
+                        continue;
+                    }
+
+                    for c in 0..dims {
+                        let mut from_index = retrieved[c] / weight_sum;
+                        if has_prev {
+                            from_index =
+                                prev_vec[c] * index_smooth + from_index * (1.0 - index_smooth);
+                        }
+                        prev_vec[c] = from_index;
+                        let current = phone[(0, t, c)];
+                        phone[(0, t, c)] = current * (1.0 - frame_rate) + from_index * frame_rate;
+                    }
+                    has_prev = true;
                 }
-                prev_vec[c] = from_index;
-                let current = phone[(0, t, c)];
-                phone[(0, t, c)] = current * (1.0 - frame_rate) + from_index * frame_rate;
+                (search_rows, top_k, "binary_cpu", requested_nprobe)
             }
-            has_prev = true;
-        }
+            IndexBackend::Ivf(index) => {
+                if index.dims() == 0 || index.ntotal() == 0 {
+                    self.index_prev_vector.clear();
+                    return IndexBlendStats {
+                        rows: 0,
+                        top_k: 0,
+                        provider: "ivf_native",
+                        nprobe: requested_nprobe,
+                    };
+                }
+                if phone_matrix.ncols() != index.dims() {
+                    eprintln!(
+                        "[vc-inference] ivf index dim mismatch at runtime: phone={} index={}",
+                        phone_matrix.ncols(),
+                        index.dims()
+                    );
+                    self.index_prev_vector.clear();
+                    return IndexBlendStats {
+                        rows: 0,
+                        top_k: 0,
+                        provider: "ivf_native",
+                        nprobe: requested_nprobe,
+                    };
+                }
+
+                let clamped_nprobe = requested_nprobe
+                    .max(1)
+                    .min(index.nlist().max(1) as u32);
+                let max_rows = requested_rows.max(1);
+                let top_k = requested_top_k.min(max_rows.max(1));
+                if rate <= f32::EPSILON {
+                    self.index_prev_vector.clear();
+                    return IndexBlendStats {
+                        rows: 0,
+                        top_k,
+                        provider: "ivf_native",
+                        nprobe: clamped_nprobe,
+                    };
+                }
+
+                let frame_search_stride = 1usize;
+
+                let mut retrieved = vec![0.0_f32; dims];
+                let mut scanned_rows_total = 0usize;
+                let mut searched_frames = 0usize;
+
+                for t in 0..frames {
+                    let conf = confidence.get(t).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let frame_rate = if conf > conf_threshold {
+                        let conf_norm = ((conf - conf_threshold) / conf_denom).clamp(0.0, 1.0);
+                        rate * conf_norm
+                    } else {
+                        0.0
+                    };
+                    if frame_rate <= f32::EPSILON {
+                        continue;
+                    }
+                    if frame_search_stride > 1 && has_prev && t % frame_search_stride != 0 {
+                        for c in 0..dims {
+                            let from_index = prev_vec[c];
+                            let base = phone[(0, t, c)];
+                            phone[(0, t, c)] = base * (1.0 - frame_rate) + from_index * frame_rate;
+                        }
+                        continue;
+                    }
+
+                    let row_view = phone_matrix.row(t);
+                    let query_buf;
+                    let query_vec = if let Some(slice) = row_view.as_slice() {
+                        slice
+                    } else {
+                        query_buf = row_view.iter().copied().collect::<Vec<f32>>();
+                        &query_buf
+                    };
+                    let (candidates, scanned_rows) = index.search_with_stats(
+                        query_vec,
+                        top_k,
+                        clamped_nprobe as usize,
+                        max_rows,
+                    );
+                    scanned_rows_total = scanned_rows_total.saturating_add(scanned_rows);
+                    searched_frames = searched_frames.saturating_add(1);
+                    if candidates.is_empty() {
+                        continue;
+                    }
+
+                    retrieved.fill(0.0);
+                    let mut weight_sum = 0.0_f32;
+                    for &(distance, id) in &candidates {
+                        let Some(neighbor) = index.vector(id) else {
+                            continue;
+                        };
+                        let w = 1.0 / (distance + 1.0e-6).powi(2);
+                        weight_sum += w;
+                        for c in 0..dims {
+                            retrieved[c] += neighbor[c] * w;
+                        }
+                    }
+                    if weight_sum <= f32::EPSILON {
+                        continue;
+                    }
+
+                    for c in 0..dims {
+                        let mut from_index = retrieved[c] / weight_sum;
+                        if has_prev {
+                            from_index =
+                                prev_vec[c] * index_smooth + from_index * (1.0 - index_smooth);
+                        }
+                        prev_vec[c] = from_index;
+                        let current = phone[(0, t, c)];
+                        phone[(0, t, c)] = current * (1.0 - frame_rate) + from_index * frame_rate;
+                    }
+                    has_prev = true;
+                }
+
+                let effective_rows = if searched_frames > 0 {
+                    scanned_rows_total / searched_frames
+                } else {
+                    0
+                };
+                (effective_rows, top_k, "ivf_native", clamped_nprobe)
+            }
+        };
+
         self.index_prev_vector = prev_vec;
         IndexBlendStats {
             rows: search_rows,
             top_k,
+            provider,
+            nprobe: used_nprobe,
         }
     }
 
@@ -1249,7 +1415,7 @@ impl InferenceEngine for RvcOrtEngine {
                 }
                 self.infer_block_count = self.infer_block_count.saturating_add(1);
                 let infer_block_count = self.infer_block_count;
-                let emit_timing = infer_block_count % TIMING_LOG_EVERY_BLOCKS == 1;
+                let should_emit_timing = infer_block_count % TIMING_LOG_EVERY_BLOCKS == 1;
                 let t_start = Instant::now();
                 let waveform = hop_input.to_vec();
                 // Keep explicit configured hop when it is smaller than window (e.g. 8000/16000).
@@ -1347,6 +1513,12 @@ impl InferenceEngine for RvcOrtEngine {
                 };
                 let requested_index_rows = config.index_search_rows.max(1);
                 let requested_index_top_k = config.index_top_k.max(1).min(requested_index_rows);
+                let requested_index_nprobe = config.index_nprobe.max(1);
+                let timing_index_provider = match self.feature_index.as_ref() {
+                    Some(IndexBackend::Ivf(_)) => "ivf_native",
+                    Some(IndexBackend::Binary(_)) => "binary_cpu",
+                    None => "none",
+                };
                 let post_filter_alpha = if config.post_filter_alpha.is_finite() {
                     config.post_filter_alpha.clamp(0.0, 0.999)
                 } else {
@@ -1409,24 +1581,27 @@ impl InferenceEngine for RvcOrtEngine {
                             self.post_filter_prev_sample = post_filter_prev_sample;
                             self.post_filter_prev_valid = post_filter_prev_valid;
                             let finalize_us = t_finalize0.elapsed().as_micros();
-                            if emit_timing {
+                            if should_emit_timing {
                                 let total_us = t_start.elapsed().as_micros();
                                 let resample_in_ms = t_resample_in_us as f64 / 1000.0;
                                 let preproc_ms =
                                     t_preproc_us.saturating_sub(t_resample_in_us) as f64 / 1000.0;
                                 let finalize_ms = finalize_us as f64 / 1000.0;
                                 let total_ms = total_us as f64 / 1000.0;
-                                eprintln!(
-                                    "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert=0.00ms index=0.00ms rows={} top_k={} index_provider={} rmvpe=0.00ms feature_post=0.00ms generator=0.00ms finalize={:.2}ms total={:.2}ms zero_copy=true",
+                                let msg = format!(
+                                    "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert=0.00ms index=0.00ms rows={} top_k={} nprobe={} index_provider={} rmvpe=0.00ms feature_post=0.00ms generator=0.00ms finalize={:.2}ms total={:.2}ms zero_copy=true",
                                     infer_block_count,
                                     resample_in_ms,
                                     preproc_ms,
                                     requested_index_rows,
                                     requested_index_top_k,
-                                    config.index_provider,
+                                    requested_index_nprobe,
+                                    timing_index_provider,
                                     finalize_ms,
                                     total_ms
                                 );
+                                eprintln!("{msg}");
+                                emit_timing(&msg);
                             }
                             return Ok(finalized);
                         }
@@ -1544,7 +1719,7 @@ impl InferenceEngine for RvcOrtEngine {
                 self.post_filter_prev_sample = post_filter_prev_sample;
                 self.post_filter_prev_valid = post_filter_prev_valid;
                 let finalize_us = t_finalize0.elapsed().as_micros();
-                if emit_timing {
+                if should_emit_timing {
                     let total_us = t_start.elapsed().as_micros();
                     let resample_in_ms = t_resample_in_us as f64 / 1000.0;
                     let preproc_ms = t_preproc_us.saturating_sub(t_resample_in_us) as f64 / 1000.0;
@@ -1564,8 +1739,8 @@ impl InferenceEngine for RvcOrtEngine {
                         + generator_us
                         + finalize_us;
                     let other_ms = total_us.saturating_sub(accounted_us) as f64 / 1000.0;
-                    eprintln!(
-                        "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert={:.2}ms index={:.2}ms rows={} top_k={} index_provider={} rmvpe={:.2}ms feature_post={:.2}ms generator={:.2}ms finalize={:.2}ms other={:.2}ms total={:.2}ms",
+                    let msg = format!(
+                        "[vc-inference] timing detail block={}: resample_in={:.2}ms preproc={:.2}ms hubert={:.2}ms index={:.2}ms rows={} top_k={} nprobe={} index_provider={} rmvpe={:.2}ms feature_post={:.2}ms generator={:.2}ms finalize={:.2}ms other={:.2}ms total={:.2}ms",
                         infer_block_count,
                         resample_in_ms,
                         preproc_ms,
@@ -1573,7 +1748,8 @@ impl InferenceEngine for RvcOrtEngine {
                         index_ms,
                         index_blend_stats.rows,
                         index_blend_stats.top_k,
-                        config.index_provider,
+                        index_blend_stats.nprobe,
+                        index_blend_stats.provider,
                         rmvpe_ms,
                         feature_post_ms,
                         generator_ms,
@@ -1581,6 +1757,8 @@ impl InferenceEngine for RvcOrtEngine {
                         other_ms,
                         total_ms
                     );
+                    eprintln!("{msg}");
+                    emit_timing(&msg);
                 }
                 Ok(finalized)
             };
@@ -2160,6 +2338,89 @@ fn decode_rmvpe_salience_row(row: &[f32], threshold: f32) -> (f32, f32) {
     (f0, confidence)
 }
 
+fn has_ivf_magic(path: &Path) -> bool {
+    let Ok(raw) = fs::read(path) else {
+        return false;
+    };
+    raw.get(..IVF_MAGIC.len()) == Some(IVF_MAGIC)
+}
+
+fn resolve_ivf_index_path(index_path: &str) -> Option<PathBuf> {
+    let configured = Path::new(index_path);
+    if configured.exists() && has_ivf_magic(configured) {
+        return Some(configured.to_path_buf());
+    }
+
+    let parent = configured.parent().unwrap_or_else(|| Path::new("."));
+    let stem = configured
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model_vectors");
+    let candidate_stem = parent.join(format!("{stem}_ivf.bin"));
+    if candidate_stem.exists() && has_ivf_magic(&candidate_stem) {
+        return Some(candidate_stem);
+    }
+
+    let canonical = parent.join("model_vectors_ivf.bin");
+    if canonical.exists() && has_ivf_magic(&canonical) {
+        return Some(canonical);
+    }
+    None
+}
+
+fn load_index_backend(
+    path: &str,
+    target_dim: usize,
+    bin_index_dim: usize,
+    index_max_vectors: usize,
+    requested_nprobe: u32,
+) -> Result<IndexBackend> {
+    if let Some(ivf_path) = resolve_ivf_index_path(path) {
+        match IvfIndex::load(&ivf_path) {
+            Ok(index) => {
+                if target_dim > 0 && index.dims() != target_dim {
+                    return Err(VcError::Config(format!(
+                        "ivf dim mismatch: index={} rvc_phone={} ({})",
+                        index.dims(),
+                        target_dim,
+                        ivf_path.display()
+                    )));
+                }
+                let nprobe = requested_nprobe
+                    .max(1)
+                    .min(index.nlist().max(1) as u32);
+                let msg = format!(
+                    "[vc-inference] index backend: ivf_native nlist={} nprobe={} total={}",
+                    index.nlist(),
+                    nprobe,
+                    index.ntotal()
+                );
+                eprintln!("{msg}");
+                emit_info(&msg);
+                return Ok(IndexBackend::Ivf(index));
+            }
+            Err(e) => {
+                let msg = format!(
+                    "[vc-inference] warning: failed to load native IVF index ({}), falling back to binary/text backend: {}",
+                    ivf_path.display(),
+                    e
+                );
+                eprintln!("{msg}");
+                emit_warn(&msg);
+            }
+        }
+    }
+    let binary = load_feature_index(path, target_dim, bin_index_dim, index_max_vectors)?;
+    let msg = format!(
+        "[vc-inference] index backend: binary rows={} dims={}",
+        binary.vectors.nrows(),
+        binary.vectors.ncols()
+    );
+    eprintln!("{msg}");
+    emit_info(&msg);
+    Ok(IndexBackend::Binary(binary))
+}
+
 fn load_feature_index(
     path: &str,
     target_dim: usize,
@@ -2217,6 +2478,11 @@ fn load_feature_index_from_bin(
 ) -> Result<FeatureIndex> {
     let raw = fs::read(path)
         .map_err(|e| VcError::Config(format!("failed to read binary index file ({path}): {e}")))?;
+    if raw.get(..IVF_MAGIC.len()) == Some(IVF_MAGIC) {
+        return Err(VcError::Config(format!(
+            "native IVF index must be loaded via the IVF backend path: {path}"
+        )));
+    }
     let flat = decode_f32_le(&raw).map_err(|e| {
         VcError::Config(format!(
             "failed to decode binary index f32 payload ({path}): {e}"

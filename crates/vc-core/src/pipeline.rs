@@ -26,12 +26,14 @@ impl<E: InferenceEngine> VoiceChanger<E> {
         &mut self,
         top_k: usize,
         rows: usize,
+        nprobe: u32,
         provider: Option<&str>,
     ) {
         let clamped_rows = rows.max(1);
         let clamped_top_k = top_k.max(1).min(clamped_rows);
         self.config.index_search_rows = clamped_rows;
         self.config.index_top_k = clamped_top_k;
+        self.config.index_nprobe = nprobe.max(1);
         if let Some(raw) = provider {
             let lc = raw.trim().to_ascii_lowercase();
             self.config.index_provider = if lc == "gpu" {

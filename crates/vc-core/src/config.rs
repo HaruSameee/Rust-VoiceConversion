@@ -20,6 +20,7 @@ pub struct RuntimeConfig {
     pub index_smooth_alpha: f32,
     pub index_top_k: usize,
     pub index_search_rows: usize,
+    pub index_nprobe: u32,
     /// Index blend execution target (`cpu` or `gpu`).
     ///
     /// Current stable implementation is CPU.
@@ -66,6 +67,22 @@ pub struct RuntimeConfig {
     /// Negative values are interpreted as dBFS (e.g. `-55.0`), and
     /// positive values are interpreted as linear amplitude.
     pub vad_off_threshold: f32,
+    /// Frame-level VAD hysteresis ratio for pre-inference gating.
+    ///
+    /// Applied as `off = on * vad_hysteresis` on overlapping analysis frames
+    /// before the block is passed into inference.
+    pub vad_hysteresis: f32,
+    /// Frame-level spectral subtraction enable flag.
+    pub noise_suppress: bool,
+    /// Spectral subtraction strength in dB.
+    pub noise_suppress_db: f32,
+    /// Initial noise-profile learning duration in seconds.
+    pub noise_suppress_learn_sec: f32,
+    /// Frame-level pre-inference gate threshold in dBFS.
+    ///
+    /// This is independent from block-level VAD (`vad_on_threshold`/`vad_off_threshold`).
+    /// Lower values gate only near-silent subframes inside otherwise-voiced blocks.
+    pub frame_gate_db: f32,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
     /// SOLA search range in milliseconds (output sample-rate domain).
@@ -75,6 +92,8 @@ pub struct RuntimeConfig {
     /// - 20ms = 960 samples
     /// - 40ms = 1920 samples
     pub sola_search_ms: u32,
+    /// SOLA EMA reset threshold in samples.
+    pub sola_reset_threshold_samples: usize,
     /// Extra right-edge safety offset (ms) when slicing decoder output tails.
     ///
     /// 0 means "disable right-edge trimming".
@@ -135,6 +154,7 @@ impl Default for RuntimeConfig {
             index_smooth_alpha: 0.85,
             index_top_k: 8,
             index_search_rows: 2_048,
+            index_nprobe: 32,
             index_provider: "cpu".to_string(),
             protect: 0.33,
             rmvpe_threshold: 0.01,
@@ -147,9 +167,15 @@ impl Default for RuntimeConfig {
             response_threshold: -40.0,
             vad_on_threshold: -40.0,
             vad_off_threshold: -55.0,
+            vad_hysteresis: 0.5,
+            noise_suppress: true,
+            noise_suppress_db: -12.0,
+            noise_suppress_learn_sec: 1.5,
+            frame_gate_db: -60.0,
             fade_in_ms: 12,
             fade_out_ms: 120,
             sola_search_ms: 40,
+            sola_reset_threshold_samples: 400,
             output_tail_offset_ms: 0,
             output_slice_offset_samples: 24_000,
             bypass_slicing: false,

@@ -12,6 +12,9 @@ pyinstaller ^
   --name setup ^
   --add-data "%INFER_PACK_PATH%;infer_pack" ^
   --add-data "%RMVPE_PATH%;rmvpe" ^
+  --add-data "scripts\export_generator_standalone.py;scripts" ^
+  --add-data "scripts\convert_index_standalone.py;scripts" ^
+  --add-data "scripts\convert_to_ivf.py;scripts" ^
   --hidden-import faiss ^
   --hidden-import tqdm ^
   --hidden-import requests ^

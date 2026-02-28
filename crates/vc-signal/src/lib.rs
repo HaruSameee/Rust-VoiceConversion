@@ -9,6 +9,9 @@ use std::{
 use ndarray::{Array2, Array3};
 use rustfft::{num_complex::Complex32, FftPlanner};
 
+pub mod noise_suppress;
+pub use noise_suppress::NoiseSuppress;
+
 pub const RVC_N_FFT: usize = 1024;
 pub const RVC_HOP_LENGTH: usize = 160;
 pub const RVC_WIN_LENGTH: usize = RVC_N_FFT;

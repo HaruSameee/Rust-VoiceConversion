@@ -1,4 +1,4 @@
-# pyinstaller --onefile --name setup setup.py
+﻿# pyinstaller --onefile --name setup setup.py
 #
 # 必要パッケージ:
 #   requests, tqdm, numpy, faiss-cpu
@@ -89,6 +89,22 @@ def _discover_python_command() -> str:
         except Exception:
             continue
     return ""
+
+
+def _resolve_helper_script(script_name: str) -> Path:
+    candidates = [
+        Path(BASE_DIR) / script_name,
+        Path(BASE_DIR) / "scripts" / script_name,
+        Path.cwd() / script_name,
+        Path.cwd() / "scripts" / script_name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    searched = "\n".join(str(p) for p in candidates)
+    raise RuntimeError(
+        f"{script_name} が見つかりません。\n探索先:\n{searched}\nBASE_DIR={BASE_DIR}"
+    )
 
 
 def _attach_site_packages_from_python(python_cmd: str) -> None:
@@ -266,9 +282,9 @@ def detect_gpu_name() -> str:
 def select_mode_interactive(suggested_mode: str) -> Tuple[str, int]:
     suggested_block = MODE_TABLE[suggested_mode]
     options = [
-        ("1", "ultra_low", "超低遅延 (RTX推奨, block_size=12000)"),
-        ("2", "low", "低遅延   (GTX1080Ti推奨, block_size=24000)"),
-        ("3", "mid", "中遅延   (GTX1080Ti以下推奨, block_size=48000)"),
+        ("1", "ultra_low", "超低遅延 (RTX3060以上推奨, block_size=12000)"),
+        ("2", "low", "低遅延   (GTX1080以上推奨, block_size=24000)"),
+        ("3", "mid", "中遅延   (GTX1080以下推奨, block_size=48000)"),
     ]
     for key, mode, label in options:
         mark = " ← 推奨" if mode == suggested_mode else ""
@@ -356,6 +372,28 @@ def ensure_cuda(required_cuda: str) -> None:
 
 
 def export_generator(pth_path: str, out_path: str) -> None:
+    if getattr(sys, "frozen", False):
+        python_cmd = _discover_python_command()
+        if not python_cmd:
+            raise RuntimeError("Python が見つかりません")
+
+        script_path = _resolve_helper_script("export_generator_standalone.py")
+        print(f"[generator] system python で変換実行: {python_cmd}")
+        print(f"[generator] script: {script_path}")
+        print(f"[generator] pth: {pth_path}")
+        print(f"[generator] out: {out_path}")
+
+        result = subprocess.run(
+            python_cmd.split() + [str(script_path), pth_path, out_path],
+            capture_output=False,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"generator の変換に失敗しました (returncode={result.returncode})"
+            )
+        return
+
     import torch
 
     _patch_torch_load()
@@ -482,6 +520,54 @@ def ensure_exists(path: str, message: str) -> None:
         raise RuntimeError(message)
 
 
+def convert_ivf_index(base_dir: str) -> None:
+    base_path = Path(base_dir)
+    vectors_bin = base_path / "model" / "model_vectors.bin"
+    ivf_bin = base_path / "model" / "model_vectors_ivf.bin"
+
+    if not vectors_bin.exists():
+        return
+
+    print("\n--- IVF インデックス生成 ---")
+    print(f"  入力: {vectors_bin}")
+    print(f"  出力: {ivf_bin}")
+
+    script_path = base_path / "scripts" / "convert_to_ivf.py"
+    if not script_path.exists():
+        print(f"  警告: convert_to_ivf.py が見つかりません: {script_path}")
+        return
+
+    python_cmd = _discover_python_command()
+    if not python_cmd:
+        print("  警告: Python が見つかりません。IVF変換をスキップします。")
+        return
+
+    result = subprocess.run(
+        python_cmd.split()
+        + [
+            str(script_path),
+            "--input",
+            str(vectors_bin),
+            "--output",
+            str(ivf_bin),
+            "--nlist",
+            "512",
+            "--nprobe",
+            "32",
+            "--no-interactive",
+        ],
+        capture_output=False,
+        check=False,
+    )
+
+    if result.returncode == 0 and ivf_bin.exists():
+        size_mb = ivf_bin.stat().st_size / 1024 / 1024
+        print(f"  ✅ IVF インデックス生成完了: {size_mb:.1f} MB")
+    else:
+        print(f"  ⚠️  IVF変換に失敗しました（returncode={result.returncode}）")
+        print("     model_vectors.bin は引き続き使用できます。")
+
+
 def run_setup() -> None:
     ensure_torch_available()
 
@@ -525,6 +611,7 @@ def run_setup() -> None:
     out_bin = "./model/model_vectors.bin"
     rows, dims = convert_index_to_bin(index_path, out_bin)
     print(f"変換完了: model/model_vectors.bin ({rows}行, {dims}次元)")
+    convert_ivf_index(BASE_DIR)
 
     print("\nセットアップ完了！RustVC.exeを起動してください。")
 
