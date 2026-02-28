@@ -24,14 +24,16 @@ use vc_signal::{
 };
 
 pub mod audio_pipeline;
+pub mod faiss_index;
 pub mod ivf_index;
 pub mod zero_copy_engine;
+use faiss_index::FaissIndex;
 use ivf_index::{IvfIndex, IVF_MAGIC};
 
 const STRICT_ONNX_INPUT_SAMPLES_16K: usize = 16_000;
 const STRICT_HUBERT_OUTPUT_FRAMES: usize = 50;
-const HUBERT_MULTI_WINDOW_HOP_16K: usize = 4_000;
 const HUBERT_MULTI_WINDOW_USED_FRAMES: usize = STRICT_HUBERT_OUTPUT_FRAMES / 2;
+const JUNCTION_BLEND_FRAMES: usize = 4;
 const DEFAULT_RMVPE_THRESHOLD: f32 = 0.01;
 const TIMING_LOG_EVERY_BLOCKS: u64 = 10;
 // scipy.signal.butter(N=5, Wn=48, btype="high", fs=16000, output="sos")
@@ -225,6 +227,10 @@ struct FeatureIndex {
 #[derive(Debug)]
 enum IndexBackend {
     Binary(FeatureIndex),
+    Faiss {
+        search: FaissIndex,
+        vectors: FeatureIndex,
+    },
     Ivf(IvfIndex),
 }
 
@@ -467,7 +473,9 @@ impl RvcOrtEngine {
                 runtime_config.block_size.max(1),
                 runtime_config.sample_rate.max(1),
             );
-            let hop_samples_16k = block_samples_16k.min(HUBERT_MULTI_WINDOW_HOP_16K).max(1);
+            let hop_samples_16k = block_samples_16k
+                .min(STRICT_ONNX_INPUT_SAMPLES_16K)
+                .max(1);
             let requested_context_samples = (runtime_config.hubert_context_sec.clamp(0.25, 2.0)
                 * RMVPE_SAMPLE_RATE as f32)
                 .round() as usize;
@@ -476,7 +484,7 @@ impl RvcOrtEngine {
             let frames_per_hop = HUBERT_MULTI_WINDOW_USED_FRAMES;
             let total_frames = hops_per_block.saturating_mul(frames_per_hop);
             eprintln!(
-                "[vc-inference] sliding_window: multi-window window={}smp hop={}smp context={}smp ({:.1}sec) @ 16kHz requested_context={}smp ({:.1}sec) hops_per_block={} frames_per_hop={} total_frames={}",
+                "[vc-inference] sliding_window: single-window window={}smp hop={}smp context={}smp ({:.1}sec) @ 16kHz requested_context={}smp ({:.1}sec) hops_per_block={} frames_per_hop={} total_frames={}",
                 STRICT_ONNX_INPUT_SAMPLES_16K,
                 hop_samples_16k,
                 context_samples,
@@ -616,7 +624,12 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
                 VcError::Inference(format!("failed to create RMVPE mel tensor: {e}"))
             })?
         } else {
-            tensor_from_audio_rank_owned(rank.max(2), source_16k.to_vec())?
+            let audio_samples = fixed_audio_input_len(input_shape.as_ref().map(|shape| shape.as_ref()))
+                .filter(|&target_len| target_len != source_16k.len())
+                .map_or_else(|| source_16k.to_vec(), |target_len| {
+                    fit_waveform_to_len(source_16k, target_len)
+                });
+            tensor_from_audio_rank_owned(rank.max(2), audio_samples)?
         };
 
         let outputs = session
@@ -789,6 +802,25 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             context_16k
         );
         self.hubert_context_tail_16k = context_tail;
+
+        for i in 0..segments.len().saturating_sub(1) {
+            let blend = JUNCTION_BLEND_FRAMES
+                .min(segments[i].shape()[1])
+                .min(segments[i + 1].shape()[1]);
+            for f in 0..blend {
+                let alpha = (f + 1) as f32 / (blend + 1) as f32;
+                let frame0 = segments[i].shape()[1] - blend + f;
+                let frame1 = f;
+                let left = segments[i].slice(s![.., frame0..frame0 + 1, ..]).to_owned();
+                let right = segments[i + 1]
+                    .slice(s![.., frame1..frame1 + 1, ..])
+                    .to_owned();
+                let blended = left * (1.0 - alpha) + right * alpha;
+                segments[i]
+                    .slice_mut(s![.., frame0..frame0 + 1, ..])
+                    .assign(&blended);
+            }
+        }
 
         let total_frames = segments
             .iter()
@@ -1059,6 +1091,144 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
                     has_prev = true;
                 }
                 (search_rows, top_k, "binary_cpu", requested_nprobe)
+            }
+            IndexBackend::Faiss { search, vectors } => {
+                if search.dims() == 0 || search.ntotal() == 0 {
+                    self.index_prev_vector.clear();
+                    return IndexBlendStats {
+                        rows: 0,
+                        top_k: 0,
+                        provider: "faiss_native",
+                        nprobe: requested_nprobe,
+                    };
+                }
+                if vectors.vectors.nrows() == 0 || vectors.vectors.ncols() == 0 {
+                    self.index_prev_vector.clear();
+                    return IndexBlendStats {
+                        rows: 0,
+                        top_k: 0,
+                        provider: "faiss_native",
+                        nprobe: requested_nprobe,
+                    };
+                }
+                if phone_matrix.ncols() != search.dims() || phone_matrix.ncols() != vectors.vectors.ncols()
+                {
+                    eprintln!(
+                        "[vc-inference] faiss index dim mismatch at runtime: phone={} faiss={} vectors={}",
+                        phone_matrix.ncols(),
+                        search.dims(),
+                        vectors.vectors.ncols()
+                    );
+                    self.index_prev_vector.clear();
+                    return IndexBlendStats {
+                        rows: 0,
+                        top_k: 0,
+                        provider: "faiss_native",
+                        nprobe: requested_nprobe,
+                    };
+                }
+
+                let search_rows = requested_rows.min(search.ntotal().max(1)).max(1);
+                let top_k = requested_top_k.min(search_rows.max(1));
+                let clamped_nprobe = match search.set_nprobe(requested_nprobe as usize) {
+                    Ok(nprobe) => nprobe,
+                    Err(e) => {
+                        eprintln!("[vc-inference] failed to set faiss nprobe: {e}");
+                        self.index_prev_vector.clear();
+                        return IndexBlendStats {
+                            rows: 0,
+                            top_k: 0,
+                            provider: "faiss_native",
+                            nprobe: requested_nprobe,
+                        };
+                    }
+                };
+
+                if rate <= f32::EPSILON {
+                    self.index_prev_vector.clear();
+                    return IndexBlendStats {
+                        rows: 0,
+                        top_k,
+                        provider: "faiss_native",
+                        nprobe: clamped_nprobe,
+                    };
+                }
+
+                let mut retrieved = vec![0.0_f32; dims];
+                for t in 0..frames {
+                    let conf = confidence.get(t).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let frame_rate = if conf > conf_threshold {
+                        let conf_norm = ((conf - conf_threshold) / conf_denom).clamp(0.0, 1.0);
+                        rate * conf_norm
+                    } else {
+                        0.0
+                    };
+                    if frame_rate <= f32::EPSILON {
+                        continue;
+                    }
+
+                    let row_view = phone_matrix.row(t);
+                    let query_buf;
+                    let query_vec = if let Some(slice) = row_view.as_slice() {
+                        slice
+                    } else {
+                        query_buf = row_view.iter().copied().collect::<Vec<f32>>();
+                        &query_buf
+                    };
+                    let neighbors = match search.search(query_vec, search_rows) {
+                        Ok(ids) => ids,
+                        Err(e) => {
+                            eprintln!("[vc-inference] faiss search failed at runtime: {e}");
+                            self.index_prev_vector.clear();
+                            return IndexBlendStats {
+                                rows: 0,
+                                top_k: 0,
+                                provider: "faiss_native",
+                                nprobe: clamped_nprobe,
+                            };
+                        }
+                    };
+                    if neighbors.is_empty() {
+                        continue;
+                    }
+
+                    retrieved.fill(0.0);
+                    let mut weight_sum = 0.0_f32;
+                    for &id in neighbors.iter().take(top_k) {
+                        let row = id as usize;
+                        if row >= vectors.vectors.nrows() {
+                            continue;
+                        }
+                        let neighbor = vectors.vectors.row(row);
+                        let mut distance = 0.0_f32;
+                        for c in 0..dims {
+                            let d = query_vec[c] - neighbor[c];
+                            distance += d * d;
+                        }
+                        let w = 1.0 / (distance + 1.0e-6).powi(2);
+                        weight_sum += w;
+                        for c in 0..dims {
+                            retrieved[c] += neighbor[c] * w;
+                        }
+                    }
+                    if weight_sum <= f32::EPSILON {
+                        continue;
+                    }
+
+                    for c in 0..dims {
+                        let mut from_index = retrieved[c] / weight_sum;
+                        if has_prev {
+                            from_index =
+                                prev_vec[c] * index_smooth + from_index * (1.0 - index_smooth);
+                        }
+                        prev_vec[c] = from_index;
+                        let current = phone[(0, t, c)];
+                        phone[(0, t, c)] = current * (1.0 - frame_rate) + from_index * frame_rate;
+                    }
+                    has_prev = true;
+                }
+
+                (search_rows, top_k, "faiss_native", clamped_nprobe)
             }
             IndexBackend::Ivf(index) => {
                 if index.dims() == 0 || index.ntotal() == 0 {
@@ -1496,6 +1666,7 @@ impl InferenceEngine for RvcOrtEngine {
                 let requested_index_nprobe = config.index_nprobe.max(1);
                 let timing_index_provider = match self.feature_index.as_ref() {
                     Some(IndexBackend::Ivf(_)) => "ivf_native",
+                    Some(IndexBackend::Faiss { .. }) => "faiss_native",
                     Some(IndexBackend::Binary(_)) => "binary_cpu",
                     None => "none",
                 };
@@ -1766,7 +1937,6 @@ impl Drop for RvcOrtEngine {
     }
 }
 
-#[cfg(test)]
 fn fit_waveform_to_len(samples: &[f32], target_len: usize) -> Vec<f32> {
     if target_len == 0 {
         return Vec::new();
@@ -1791,7 +1961,6 @@ fn fit_waveform_to_len(samples: &[f32], target_len: usize) -> Vec<f32> {
     out
 }
 
-#[cfg(test)]
 fn reflect_left_pad_index(dist: usize, len: usize) -> usize {
     let period = 2 * (len - 1);
     let mut m = dist % period;
@@ -1812,6 +1981,16 @@ fn estimate_hop_samples_16k(input_samples: usize, input_sample_rate: u32) -> usi
     let hop = ((input_samples as f64) * (RMVPE_SAMPLE_RATE as f64) / (input_sample_rate as f64))
         .round() as usize;
     hop.max(1).min(STRICT_ONNX_INPUT_SAMPLES_16K)
+}
+
+fn fixed_audio_input_len(input_shape: Option<&[i64]>) -> Option<usize> {
+    let shape = input_shape?;
+    shape
+        .iter()
+        .rev()
+        .copied()
+        .find(|&dim| dim > 0)
+        .map(|dim| dim as usize)
 }
 
 fn resolve_runtime_hop_samples_16k(
@@ -2356,6 +2535,34 @@ fn load_index_backend(
     index_max_vectors: usize,
     requested_nprobe: u32,
 ) -> Result<IndexBackend> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "index" {
+        let search = FaissIndex::load(path, requested_nprobe as usize)?;
+        if target_dim > 0 && search.dims() != target_dim {
+            return Err(VcError::Config(format!(
+                "faiss dim mismatch: index={} rvc_phone={} ({})",
+                search.dims(),
+                target_dim,
+                path
+            )));
+        }
+        let vectors = load_feature_index(path, target_dim, bin_index_dim, index_max_vectors)?;
+        let nprobe = requested_nprobe
+            .max(1)
+            .min(search.nlist().max(1) as u32);
+        let msg = format!(
+            "[vc-inference] index backend: faiss_native nprobe={} total={}",
+            nprobe,
+            search.ntotal()
+        );
+        eprintln!("{msg}");
+        emit_info(&msg);
+        return Ok(IndexBackend::Faiss { search, vectors });
+    }
     if let Some(ivf_path) = resolve_ivf_index_path(path) {
         match IvfIndex::load(&ivf_path) {
             Ok(index) => {

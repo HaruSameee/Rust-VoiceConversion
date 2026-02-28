@@ -1,7 +1,7 @@
 ﻿# pyinstaller --onefile --name setup setup.py
 #
 # 必要パッケージ:
-#   requests, tqdm, numpy, faiss-cpu
+#   requests, tqdm, numpy, faiss-cpu, onnx, onnxscript
 
 import json
 import importlib.util
@@ -438,7 +438,11 @@ def convert_index_to_bin(index_path: str, out_path: str) -> Tuple[int, int]:
     try:
         import faiss
     except ImportError:
-        print("faissが見つかりません。pip install faiss-cpu を実行してください")
+        if getattr(sys, "frozen", False):
+            raise RuntimeError(
+                "faiss の import に失敗しました。setup.exe の同梱内容が不足している可能性があります。"
+            )
+        print("faissが見つかりません。python -m pip install faiss-cpu を実行してください")
         sys.exit(1)
 
     print("[index] faissインデックスを読み込み中...")
@@ -514,7 +518,7 @@ def convert_ivf_index(base_dir: str) -> None:
         t0 = datetime.now()
         vectors = helper.load_vectors(vectors_bin, dims)
         centroids, offsets, sorted_vectors = helper.build_ivf(
-            vectors, dims, 512, 32
+            vectors, dims, 3812, 32
         )
         helper.write_ivf_bin(ivf_bin, centroids, offsets, sorted_vectors, 32)
         try:

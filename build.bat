@@ -2,7 +2,7 @@
 setlocal
 
 echo Building RustVC setup.exe...
-python -m pip install pyinstaller faiss-cpu tqdm requests --quiet
+python -m pip install pyinstaller faiss-cpu tqdm requests onnx onnxscript --quiet
 if errorlevel 1 (
   echo Failed to install build dependencies.
   exit /b 1

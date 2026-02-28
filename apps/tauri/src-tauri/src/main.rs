@@ -1002,11 +1002,83 @@ fn prepend_path_dir(dir: &Path) {
     log_debug(&format!("prepended DLL search path: {}", dir_str));
 }
 
-fn set_ort_dylib_path(path: &str, source_label: &str) {
-    std::env::set_var("ORT_DYLIB_PATH", path);
-    if let Some(parent) = Path::new(path).parent() {
+fn prepend_if_dir(path: PathBuf) {
+    if path.is_dir() {
+        prepend_path_dir(&path);
+    }
+}
+
+fn prepend_cuda_runtime_search_dirs() {
+    if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+        prepend_if_dir(PathBuf::from(cuda_path).join("bin"));
+    }
+    if let Ok(cudnn_path) = std::env::var("CUDNN_PATH") {
+        let cudnn_root = PathBuf::from(cudnn_path);
+        prepend_if_dir(cudnn_root.clone());
+        prepend_if_dir(cudnn_root.join("bin"));
+    }
+    for (key, value) in std::env::vars() {
+        if key.starts_with("CUDA_PATH_V") {
+            prepend_if_dir(PathBuf::from(value).join("bin"));
+        }
+    }
+}
+
+fn prepend_python_nvidia_bin_dirs(onnxruntime_dll_path: &str) {
+    let mut current = Path::new(onnxruntime_dll_path).parent();
+    while let Some(dir) = current {
+        let is_site_packages = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().eq_ignore_ascii_case("site-packages"))
+            .unwrap_or(false);
+        if is_site_packages {
+            let nvidia_root = dir.join("nvidia");
+            if let Ok(entries) = fs::read_dir(&nvidia_root) {
+                for entry in entries.flatten() {
+                    let bin_dir = entry.path().join("bin");
+                    prepend_if_dir(bin_dir);
+                }
+            }
+            break;
+        }
+        current = dir.parent();
+    }
+}
+
+fn prepare_ort_dependency_search_paths(onnxruntime_dll_path: &str) {
+    if let Some(parent) = Path::new(onnxruntime_dll_path).parent() {
         prepend_path_dir(parent);
     }
+    prepend_cuda_runtime_search_dirs();
+    prepend_python_nvidia_bin_dirs(onnxruntime_dll_path);
+}
+
+fn parse_version_tuple(raw: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = raw.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch_raw = parts.next().unwrap_or("0");
+    let patch_digits: String = patch_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let patch = if patch_digits.is_empty() {
+        0
+    } else {
+        patch_digits.parse().ok()?
+    };
+    Some((major, minor, patch))
+}
+
+fn is_supported_ort_version(raw: &str) -> bool {
+    parse_version_tuple(raw)
+        .map(|(major, minor, _)| major > 1 || (major == 1 && minor >= 23))
+        .unwrap_or(false)
+}
+
+fn set_ort_dylib_path(path: &str, source_label: &str) {
+    std::env::set_var("ORT_DYLIB_PATH", path);
+    prepare_ort_dependency_search_paths(path);
     log_debug(&format!(
         "ORT_DYLIB_PATH auto-set from {}: {}",
         source_label, path
@@ -1028,6 +1100,7 @@ fn ensure_ort_dylib_path() -> Option<String> {
         let p = PathBuf::from(&current);
         if p.exists() {
             if ort_bundle_has_provider_shared(&current) {
+                prepare_ort_dependency_search_paths(&current);
                 return Some(current);
             }
             log_debug(&format!(
@@ -1075,6 +1148,7 @@ fn ensure_ort_dylib_path() -> Option<String> {
 fn find_onnxruntime_dll_via_python() -> Option<String> {
     let py = r#"import os
 import onnxruntime as ort
+print(ort.__version__)
 print(os.path.join(os.path.dirname(ort.__file__), "capi", "onnxruntime.dll"))
 print(",".join(ort.get_available_providers()))"#;
 
@@ -1084,8 +1158,16 @@ print(",".join(ort.get_available_providers()))"#;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut lines = stdout.lines();
+    let version = lines.next().unwrap_or("").trim().to_string();
     let candidate = lines.next().unwrap_or("").trim().to_string();
     let providers_line = lines.next().unwrap_or("").trim().to_string();
+    if !is_supported_ort_version(&version) {
+        log_debug(&format!(
+            "python onnxruntime candidate rejected: version={} path={} (need >= 1.23.x)",
+            version, candidate
+        ));
+        return None;
+    }
     if candidate.is_empty() {
         return None;
     }
@@ -1100,8 +1182,8 @@ print(",".join(ort.get_available_providers()))"#;
                 || p.eq_ignore_ascii_case("DmlExecutionProvider")
         });
         log_debug(&format!(
-            "python onnxruntime providers={:?} gpu_available={}",
-            providers, has_gpu
+            "python onnxruntime version={} providers={:?} gpu_available={}",
+            version, providers, has_gpu
         ));
     }
     if Path::new(&candidate).exists() {

@@ -126,14 +126,13 @@ impl IvfIndex {
         query: &[f32],
         top_k: usize,
         nprobe: usize,
-        max_rows: usize,
+        _max_rows: usize,
     ) -> (Vec<(f32, usize)>, usize) {
         if self.dims == 0 || self.ntotal() == 0 || query.len() != self.dims || top_k == 0 {
             return (Vec::new(), 0);
         }
 
         let probe_count = nprobe.max(1).min(self.nlist);
-        let per_cluster = (max_rows.max(1) / probe_count).max(1);
         let mut centroid_best = Vec::<(f32, usize)>::with_capacity(probe_count);
         for cluster in 0..self.nlist {
             let centroid_start = cluster * self.dims;
@@ -148,9 +147,8 @@ impl IvfIndex {
         for &(_, cluster) in &centroid_best {
             let start = self.offsets[cluster] as usize;
             let end = self.offsets[cluster + 1] as usize;
-            let scan_end = start.saturating_add(per_cluster).min(end);
-            scanned_rows = scanned_rows.saturating_add(scan_end.saturating_sub(start));
-            for idx in start..scan_end {
+            scanned_rows = scanned_rows.saturating_add(end.saturating_sub(start));
+            for idx in start..end {
                 let vec_start = idx * self.dims;
                 let vec_end = vec_start + self.dims;
                 let dist = l2_distance(query, &self.vectors[vec_start..vec_end]);

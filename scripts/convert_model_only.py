@@ -241,7 +241,7 @@ def convert_ivf_index(base_dir: Path, out_dir: Path) -> None:
             "--output",
             str(ivf_bin),
             "--nlist",
-            "512",
+            "3812",
             "--nprobe",
             "32",
             "--no-interactive",

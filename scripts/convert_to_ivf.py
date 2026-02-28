@@ -15,7 +15,7 @@ MAGIC = b"RVCIVF01"
 DEFAULT_INPUT = Path("model/model_vectors.bin")
 DEFAULT_OUTPUT = Path("model/model_vectors_ivf.bin")
 DEFAULT_DIMS = 768
-DEFAULT_NLIST = 512
+DEFAULT_NLIST = 3812
 DEFAULT_NPROBE = 32
 
 
@@ -80,7 +80,7 @@ def build_ivf(
     except ImportError as exc:
         raise RuntimeError("faiss not found. Run: pip install faiss-cpu") from exc
 
-    kmeans = faiss.Kmeans(dims, nlist, niter=25, verbose=True, gpu=False)
+    kmeans = faiss.Kmeans(dims, nlist, niter=100, verbose=True, gpu=False)
     kmeans.train(vectors)
     centroids = np.ascontiguousarray(kmeans.centroids.reshape(nlist, dims), dtype=np.float32)
 
