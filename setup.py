@@ -4,6 +4,7 @@
 #   requests, tqdm, numpy, faiss-cpu
 
 import json
+import importlib.util
 import os
 import re
 import subprocess
@@ -107,6 +108,16 @@ def _resolve_helper_script(script_name: str) -> Path:
     )
 
 
+def _load_script_module(script_name: str, module_name: str):
+    script_path = _resolve_helper_script(script_name)
+    spec = importlib.util.spec_from_file_location(module_name, script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"{script_name} のロードに失敗しました: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _attach_site_packages_from_python(python_cmd: str) -> None:
     probe = (
         "import json,site;"
@@ -170,43 +181,25 @@ def _patch_torch_load() -> None:
 
 
 def ensure_torch_available() -> None:
-    print_step(1, "torch 確認・インストール")
+    print_step(1, "torch 確認")
     try:
-        import torch  # noqa: F401
+        import torch
 
-        print(f"torch {torch.__version__} 検出済み、スキップします")
-    except ImportError:
-        python_cmd = _discover_python_command()
-        if not python_cmd:
-            print("エラー: Python実行環境が見つかりません。")
-            print("手動で Python をインストール後、pip install torch を実行してください。")
-            sys.exit(1)
-
-        print("torchが見つかりません。インストールしています（数分かかる場合があります）...")
-        result = subprocess.run(
-            python_cmd.split() + ["-m", "pip", "install", "torch", "--quiet"],
-            check=False,
-        )
-        if result.returncode != 0:
-            print("エラー: torchのインストールに失敗しました")
-            print("手動で以下を実行してください:")
-            print(f"  {python_cmd} -m pip install torch")
-            sys.exit(1)
-
-        print("torchのインストールが完了しました")
-        _attach_site_packages_from_python(python_cmd)
-
-        try:
-            import importlib
-
-            importlib.invalidate_caches()
-            import torch  # noqa: F401
-        except ImportError:
-            print("エラー: torchのインストール後もimportに失敗しました")
-            print(f"使用したPythonコマンド: {python_cmd}")
-            print("手動で以下を実行してください:")
-            print(f"  {python_cmd} -m pip install torch")
-            sys.exit(1)
+        if getattr(sys, "frozen", False):
+            torch_lib = Path(torch.__file__).resolve().parent / "lib"
+            if torch_lib.exists():
+                torch_lib_str = str(torch_lib)
+                os.environ["PATH"] = f"{torch_lib_str};{os.environ.get('PATH', '')}"
+                if hasattr(os, "add_dll_directory"):
+                    try:
+                        os.add_dll_directory(torch_lib_str)
+                    except OSError:
+                        pass
+        print(f"torch {torch.__version__} 検出済み")
+    except ImportError as exc:
+        raise RuntimeError(
+            "torch の import に失敗しました。setup.exe は torch 同梱版を前提としています。"
+        ) from exc
 
     _patch_torch_load()
 
@@ -372,28 +365,6 @@ def ensure_cuda(required_cuda: str) -> None:
 
 
 def export_generator(pth_path: str, out_path: str) -> None:
-    if getattr(sys, "frozen", False):
-        python_cmd = _discover_python_command()
-        if not python_cmd:
-            raise RuntimeError("Python が見つかりません")
-
-        script_path = _resolve_helper_script("export_generator_standalone.py")
-        print(f"[generator] system python で変換実行: {python_cmd}")
-        print(f"[generator] script: {script_path}")
-        print(f"[generator] pth: {pth_path}")
-        print(f"[generator] out: {out_path}")
-
-        result = subprocess.run(
-            python_cmd.split() + [str(script_path), pth_path, out_path],
-            capture_output=False,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"generator の変換に失敗しました (returncode={result.returncode})"
-            )
-        return
-
     import torch
 
     _patch_torch_load()
@@ -537,34 +508,24 @@ def convert_ivf_index(base_dir: str) -> None:
         print(f"  警告: convert_to_ivf.py が見つかりません: {script_path}")
         return
 
-    python_cmd = _discover_python_command()
-    if not python_cmd:
-        print("  警告: Python が見つかりません。IVF変換をスキップします。")
-        return
-
-    result = subprocess.run(
-        python_cmd.split()
-        + [
-            str(script_path),
-            "--input",
-            str(vectors_bin),
-            "--output",
-            str(ivf_bin),
-            "--nlist",
-            "512",
-            "--nprobe",
-            "32",
-            "--no-interactive",
-        ],
-        capture_output=False,
-        check=False,
-    )
-
-    if result.returncode == 0 and ivf_bin.exists():
+    try:
+        helper = _load_script_module("convert_to_ivf.py", "_rustvc_convert_to_ivf")
+        dims = helper.resolve_dims(vectors_bin, None, False)
+        t0 = datetime.now()
+        vectors = helper.load_vectors(vectors_bin, dims)
+        centroids, offsets, sorted_vectors = helper.build_ivf(
+            vectors, dims, 512, 32
+        )
+        helper.write_ivf_bin(ivf_bin, centroids, offsets, sorted_vectors, 32)
+        try:
+            helper.quality_check(ivf_bin, vectors, sorted_vectors, 32)
+        except Exception as quality_exc:
+            print(f"  警告: IVF quality check をスキップしました: {quality_exc}")
+        elapsed = (datetime.now() - t0).total_seconds()
         size_mb = ivf_bin.stat().st_size / 1024 / 1024
-        print(f"  ✅ IVF インデックス生成完了: {size_mb:.1f} MB")
-    else:
-        print(f"  ⚠️  IVF変換に失敗しました（returncode={result.returncode}）")
+        print(f"  ✅ IVF インデックス生成完了: {size_mb:.1f} MB ({elapsed:.2f}s)")
+    except Exception as exc:
+        print(f"  ⚠️  IVF変換に失敗しました: {exc}")
         print("     model_vectors.bin は引き続き使用できます。")
 
 

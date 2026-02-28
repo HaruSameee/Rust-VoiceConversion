@@ -56,6 +56,7 @@ interface RuntimeConfig {
   ort_intra_threads: number;
   ort_inter_threads: number;
   ort_parallel_execution: boolean;
+  hubert_context_sec: number;
   hubert_context_samples_16k: number;
   hubert_output_layer: number;
   hubert_upsample_factor: number;
@@ -179,6 +180,8 @@ const ui = {
   cudaTf32: $("cudaTf32") as HTMLInputElement,
   ortIntraThreads: $("ortIntraThreads") as HTMLInputElement,
   ortInterThreads: $("ortInterThreads") as HTMLInputElement,
+  hubertContextSec: $("hubertContextSec") as HTMLInputElement,
+  hubertContextSecValue: $("hubertContextSecValue") as HTMLSpanElement,
   reloadBtn: $("reloadBtn") as HTMLButtonElement,
   saveBtn: $("saveBtn") as HTMLButtonElement,
   startBtn: $("startBtn") as HTMLButtonElement,
@@ -204,7 +207,7 @@ let runtimeCache: RuntimeConfig | null = null;
 const PRESET_STORAGE_KEY = "rust_vc_presets_v1";
 let presetStore: PresetStore = {};
 const MAX_ORT_THREADS = Math.max(1, Math.round(Number(navigator.hardwareConcurrency) || 4));
-const DEFAULT_SLICE_OFFSET_SAMPLES = 6054;
+const DEFAULT_SLICE_OFFSET_SAMPLES = 10_800;
 const MAX_SLICE_OFFSET_SAMPLES = 48_000;
 const MAX_LOG_ENTRIES = 500;
 let logEntries: LogEntry[] = [];
@@ -286,6 +289,7 @@ function syncRangeReadouts(): void {
   ui.indexNprobeValue.textContent = ui.indexNprobe.value;
   ui.noiseSuppressDbValue.textContent = `${ui.noiseSuppressDb.value} dB`;
   ui.frameGateDbValue.textContent = `${ui.frameGateDb.value} dB`;
+  ui.hubertContextSecValue.textContent = `${Number(ui.hubertContextSec.value).toFixed(2)} sec`;
 }
 
 function renderLog(): void {
@@ -609,7 +613,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     sola_reset_threshold_samples: intAtLeast(raw.sola_reset_threshold_samples, 1, 400),
     output_tail_offset_ms: intAtLeast(raw.output_tail_offset_ms, 0, 0),
     output_slice_offset_samples: normalizeSliceOffsetSamples(raw.output_slice_offset_samples),
-    bypass_slicing: Boolean(raw.bypass_slicing),
+    bypass_slicing: Boolean(raw.bypass_slicing ?? true),
     record_dump: Boolean(raw.record_dump),
     speaker_id: Math.round(finiteOr(raw.speaker_id, 0)),
     sample_rate: intAtLeast(raw.sample_rate, 1, 48000),
@@ -622,6 +626,7 @@ function sanitizeRuntime(raw: RuntimeConfig): RuntimeConfig {
     ort_intra_threads: Math.round(clamp(raw.ort_intra_threads, 0, MAX_ORT_THREADS, 0)),
     ort_inter_threads: Math.round(clamp(raw.ort_inter_threads, 1, MAX_ORT_THREADS, 1)),
     ort_parallel_execution: Boolean(raw.ort_parallel_execution),
+    hubert_context_sec: clamp((raw as Partial<RuntimeConfig>).hubert_context_sec ?? 0.5, 0.25, 2.0, 0.5),
     hubert_context_samples_16k: intAtLeast(raw.hubert_context_samples_16k, 1600, 16000),
     hubert_output_layer: Math.round(finiteOr(raw.hubert_output_layer, 12)),
     hubert_upsample_factor: intAtLeast(raw.hubert_upsample_factor, 1, 2),
@@ -696,7 +701,8 @@ function runtimeFromInputs(): RuntimeConfig {
     ort_intra_threads: Number(ui.ortIntraThreads.value),
     ort_inter_threads: Number(ui.ortInterThreads.value),
     ort_parallel_execution: base?.ort_parallel_execution ?? false,
-    hubert_context_samples_16k: base?.hubert_context_samples_16k ?? 16000,
+    hubert_context_sec: Number(ui.hubertContextSec.value),
+    hubert_context_samples_16k: Math.round((Number(ui.hubertContextSec.value) || 0.5) * 16000),
     hubert_output_layer: base?.hubert_output_layer ?? 12,
     hubert_upsample_factor: base?.hubert_upsample_factor ?? 2,
     cuda_conv1d_pad_to_nc1d: base?.cuda_conv1d_pad_to_nc1d ?? false,
@@ -759,6 +765,7 @@ function applyRuntime(config: RuntimeConfig): void {
   syncRangeReadouts();
   ui.ortIntraThreads.value = String(config.ort_intra_threads);
   ui.ortInterThreads.value = String(config.ort_inter_threads);
+  ui.hubertContextSec.value = String(config.hubert_context_sec);
 }
 
 function applyStatus(status: EngineStatus): void {
@@ -954,6 +961,10 @@ ui.frameGateDb.addEventListener("input", () => {
 ui.indexNprobe.addEventListener("input", () => {
   syncRangeReadouts();
   void runAction("save_runtime_live_index_nprobe", saveRuntimeOnly);
+});
+ui.hubertContextSec.addEventListener("input", () => {
+  syncRangeReadouts();
+  void runAction("save_runtime_live_hubert_context_sec", saveRuntimeOnly);
 });
 ui.solaResetThreshold.addEventListener("input", () => {
   void runAction("save_runtime_live_sola_reset_threshold", saveRuntimeOnly);

@@ -100,8 +100,8 @@ pub struct RuntimeConfig {
     pub output_tail_offset_ms: u32,
     /// Decoder output slice start offset in samples (output domain).
     ///
-    /// For 3-block center-window slicing, default is one block (24_000 @ 48kHz block=24_000),
-    /// i.e. start of the center block.
+    /// Default is the empirically stable fixed cut near 45% of a 24k block
+    /// (`10_800` samples at 48kHz).
     /// 0 means "use engine default".
     #[serde(alias = "slice_offset_samples")]
     pub output_slice_offset_samples: usize,
@@ -127,6 +127,11 @@ pub struct RuntimeConfig {
     #[serde(rename = "ort_inter_threads", alias = "inter_threads")]
     pub inter_threads: u32,
     pub ort_parallel_execution: bool,
+    /// Requested HuBERT cross-block context in seconds.
+    ///
+    /// Runtime converts this to 16k-sample context and caps it to the
+    /// effective HuBERT window geometry.
+    pub hubert_context_sec: f32,
     pub hubert_context_samples_16k: usize,
     pub hubert_output_layer: i64,
     pub hubert_upsample_factor: usize,
@@ -177,8 +182,8 @@ impl Default for RuntimeConfig {
             sola_search_ms: 40,
             sola_reset_threshold_samples: 400,
             output_tail_offset_ms: 0,
-            output_slice_offset_samples: 24_000,
-            bypass_slicing: false,
+            output_slice_offset_samples: 10_800,
+            bypass_slicing: true,
             record_dump: false,
             speaker_id: 0,
             sample_rate: 48_000,
@@ -189,7 +194,8 @@ impl Default for RuntimeConfig {
             intra_threads: default_intra_threads(),
             inter_threads: 1,
             ort_parallel_execution: false,
-            hubert_context_samples_16k: 16_000,
+            hubert_context_sec: 0.5,
+            hubert_context_samples_16k: 8_000,
             hubert_output_layer: 12,
             hubert_upsample_factor: 2,
             cuda_conv_algo: "default".to_string(),

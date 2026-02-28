@@ -170,6 +170,7 @@
             <div class="field">
               <label for="solaResetThreshold">SOLA Reset Threshold (samples)</label>
               <input id="solaResetThreshold" type="number" step="10" min="1" max="48000" value="400" />
+              <p class="hint">`bypass_slicing=false` の場合のみ有効です。SOLA EMA の補正も同条件でのみ使われます。</p>
             </div>
             <div class="field">
               <label for="outputTailOffsetMs">Output Tail Offset (ms)</label>
@@ -177,13 +178,14 @@
             </div>
             <div class="field">
               <label for="sliceOffsetSamples">Slice Offset (samples)</label>
-              <input id="sliceOffsetSamples" type="number" step="1" min="0" max="48000" />
+              <input id="sliceOffsetSamples" type="number" step="1" min="0" max="48000" value="10800" />
             </div>
             <div class="field">
               <label for="bypassSlicing">
-                <input id="bypassSlicing" type="checkbox" />
+                <input id="bypassSlicing" type="checkbox" checked />
                 Bypass Slicing
               </label>
+              <p class="hint">有効時は固定カットを使い、SOLA Reset Threshold / EMA は無視されます。</p>
             </div>
             <div class="field">
               <label for="recordDump">
@@ -254,6 +256,10 @@
             <div class="field">
               <label for="ortInterThreads">ORT Inter Threads</label>
               <input id="ortInterThreads" type="number" step="1" min="1" />
+            </div>
+            <div class="field">
+              <label for="hubertContextSec">HuBERT Context (sec) <span id="hubertContextSecValue">0.50 sec</span></label>
+              <input id="hubertContextSec" type="range" min="0.25" max="2.0" step="0.25" value="0.5" />
             </div>
           </div>
         </section>

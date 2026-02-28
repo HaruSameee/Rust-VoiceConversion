@@ -30,6 +30,8 @@ use ivf_index::{IvfIndex, IVF_MAGIC};
 
 const STRICT_ONNX_INPUT_SAMPLES_16K: usize = 16_000;
 const STRICT_HUBERT_OUTPUT_FRAMES: usize = 50;
+const HUBERT_MULTI_WINDOW_HOP_16K: usize = 4_000;
+const HUBERT_MULTI_WINDOW_USED_FRAMES: usize = STRICT_HUBERT_OUTPUT_FRAMES / 2;
 const DEFAULT_RMVPE_THRESHOLD: f32 = 0.01;
 const TIMING_LOG_EVERY_BLOCKS: u64 = 10;
 // scipy.signal.butter(N=5, Wn=48, btype="high", fs=16000, output="sos")
@@ -267,6 +269,7 @@ pub struct RvcOrtEngine {
     source_16k_context: VecDeque<f32>,
     rmvpe_16k_context: VecDeque<f32>,
     hubert_context_tail_16k: Vec<f32>,
+    configured_context_samples_16k: usize,
     configured_hop_samples_16k: usize,
     hop_samples_16k: usize,
     rnd_state: u64,
@@ -460,14 +463,29 @@ impl RvcOrtEngine {
                 }
                 None => None,
             };
-            let hop_samples_16k = estimate_hop_samples_16k(
+            let block_samples_16k = estimate_hop_samples_16k(
                 runtime_config.block_size.max(1),
                 runtime_config.sample_rate.max(1),
             );
+            let hop_samples_16k = block_samples_16k.min(HUBERT_MULTI_WINDOW_HOP_16K).max(1);
+            let requested_context_samples = (runtime_config.hubert_context_sec.clamp(0.25, 2.0)
+                * RMVPE_SAMPLE_RATE as f32)
+                .round() as usize;
             let context_samples = STRICT_ONNX_INPUT_SAMPLES_16K.saturating_sub(hop_samples_16k);
+            let hops_per_block = block_samples_16k.div_ceil(hop_samples_16k).max(1);
+            let frames_per_hop = HUBERT_MULTI_WINDOW_USED_FRAMES;
+            let total_frames = hops_per_block.saturating_mul(frames_per_hop);
             eprintln!(
-                "[vc-inference] sliding_window: hubert=independent rmvpe=independent window={}smp hop={}smp context={}smp @ 16kHz",
-                STRICT_ONNX_INPUT_SAMPLES_16K, hop_samples_16k, context_samples
+                "[vc-inference] sliding_window: multi-window window={}smp hop={}smp context={}smp ({:.1}sec) @ 16kHz requested_context={}smp ({:.1}sec) hops_per_block={} frames_per_hop={} total_frames={}",
+                STRICT_ONNX_INPUT_SAMPLES_16K,
+                hop_samples_16k,
+                context_samples,
+                context_samples as f32 / RMVPE_SAMPLE_RATE as f32,
+                requested_context_samples,
+                requested_context_samples as f32 / RMVPE_SAMPLE_RATE as f32,
+                hops_per_block,
+                frames_per_hop,
+                total_frames
             );
             eprintln!(
                 "[vc-inference] context_window initialized: {} zeros (context={}smp hop={}smp)",
@@ -526,6 +544,7 @@ impl RvcOrtEngine {
                     buf
                 },
                 hubert_context_tail_16k: vec![0.0; context_samples],
+                configured_context_samples_16k: context_samples,
                 configured_hop_samples_16k: hop_samples_16k,
                 hop_samples_16k,
                 rnd_state: 0x9E37_79B9_7F4A_7C15,
@@ -647,26 +666,19 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             ));
         };
         let window_16k = STRICT_ONNX_INPUT_SAMPLES_16K;
-        // HuBERT must always be called with one strict 16k window.
-        // If runtime hop-sync ever drifts to full-window hop while we have multi-hop input,
-        // fall back to half-window hop to preserve cross-block context.
-        let hop_16k = {
-            let configured = self.hop_samples_16k.max(1).min(window_16k);
-            if configured == window_16k && source_16k.len() > window_16k {
-                window_16k / 2
-            } else {
-                configured
-            }
-        };
-        let context_16k = window_16k.saturating_sub(hop_16k);
+        let hop_16k = self.hop_samples_16k.max(1).min(window_16k);
+        let context_16k = self
+            .configured_context_samples_16k
+            .min(window_16k.saturating_sub(hop_16k));
         let upsample = self.hubert_upsample_factor.max(1);
         let phone_feature_dim = self.phone_feature_dim;
         let target_phone_frames = target_decoder_frames.max(1);
         let target_hubert_frames = target_phone_frames.div_ceil(upsample).max(1);
-        let n_hops = source_16k.len().div_ceil(hop_16k).max(1);
-        let phone_frames_per_hop = ((hop_16k as f64) / 160.0).round().max(1.0) as usize;
-        let hubert_frames_per_hop = phone_frames_per_hop.div_ceil(upsample).max(1);
-        let single_window_mode = source_16k.len() <= window_16k;
+        let new_samples_16k = source_16k.len().div_ceil(2);
+        let new_start = source_16k.len().saturating_sub(new_samples_16k);
+        let new_region = &source_16k[new_start..];
+        let n_hops = new_region.len().div_ceil(hop_16k).max(1);
+        let hubert_frames_per_hop = HUBERT_MULTI_WINDOW_USED_FRAMES.max(1);
         let mut context_tail = if self.hubert_context_tail_16k.len() == context_16k {
             self.hubert_context_tail_16k.clone()
         } else {
@@ -731,47 +743,14 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             ))
         };
 
-        if single_window_mode {
-            let mut window = vec![0.0_f32; window_16k];
-            let src_len = source_16k.len().min(window_16k);
-            let src_start = window_16k.saturating_sub(src_len);
-            if src_len > 0 {
-                window[src_start..].copy_from_slice(&source_16k[source_16k.len() - src_len..]);
-            }
-            let ctx_needed = src_start;
-            if ctx_needed > 0 {
-                let take_ctx = ctx_needed.min(context_tail.len());
-                if take_ctx > 0 {
-                    let ctx_src_start = context_tail.len() - take_ctx;
-                    let ctx_dst_start = ctx_needed - take_ctx;
-                    window[ctx_dst_start..ctx_dst_start + take_ctx]
-                        .copy_from_slice(&context_tail[ctx_src_start..]);
-                }
-            }
-
-            let per_window = run_hubert_window(&window)?;
-            if context_16k == 0 {
-                context_tail.clear();
-            } else {
-                context_tail = window[window_16k - context_16k..].to_vec();
-            }
-            self.hubert_context_tail_16k = context_tail;
-            let phone_hubert = force_frame_count_3d_tail_pad(per_window, target_hubert_frames);
-            let phone = upsample_phone_frames_repeat(phone_hubert, target_phone_frames);
-            let phone_stats = tensor_stats_from_iter(phone.iter().copied());
-            maybe_log_tensor_stats("hubert_phone", phone_stats);
-            ensure_tensor_finite("hubert_phone", phone_stats)?;
-            return Ok(phone);
-        }
-
         let mut segments = Vec::<Array3<f32>>::with_capacity(n_hops);
         for hop_idx in 0..n_hops {
             let start = hop_idx.saturating_mul(hop_16k);
-            let end = (start + hop_16k).min(source_16k.len());
+            let end = (start + hop_16k).min(new_region.len());
             let copy_len = end.saturating_sub(start);
             let mut hop_audio = vec![0.0_f32; hop_16k];
             if copy_len > 0 {
-                hop_audio[..copy_len].copy_from_slice(&source_16k[start..end]);
+                hop_audio[..copy_len].copy_from_slice(&new_region[start..end]);
             }
 
             let mut window = Vec::<f32>::with_capacity(window_16k);
@@ -784,16 +763,21 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             if context_16k == 0 {
                 context_tail.clear();
             } else {
-                let mut merged = Vec::<f32>::with_capacity(context_tail.len() + hop_audio.len());
-                merged.extend_from_slice(&context_tail);
-                merged.extend_from_slice(&hop_audio);
-                let take = context_16k.min(merged.len());
-                context_tail = merged[merged.len() - take..].to_vec();
-                if context_tail.len() < context_16k {
+                if context_tail.len() != context_16k {
                     let mut padded = vec![0.0_f32; context_16k];
-                    let offset = context_16k - context_tail.len();
-                    padded[offset..].copy_from_slice(&context_tail);
+                    let keep = context_tail.len().min(context_16k);
+                    if keep > 0 {
+                        let src_start = context_tail.len() - keep;
+                        let dst_start = context_16k - keep;
+                        padded[dst_start..].copy_from_slice(&context_tail[src_start..]);
+                    }
                     context_tail = padded;
+                }
+                if hop_16k >= context_16k {
+                    context_tail.copy_from_slice(&hop_audio[hop_16k - context_16k..]);
+                } else {
+                    context_tail.rotate_left(hop_16k);
+                    context_tail[context_16k - hop_16k..].copy_from_slice(&hop_audio);
                 }
             }
         }
@@ -862,7 +846,9 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             input_sample_rate
         );
         self.hop_samples_16k = effective_hop;
-        let hubert_context_len = STRICT_ONNX_INPUT_SAMPLES_16K.saturating_sub(effective_hop);
+        let hubert_context_len = self
+            .configured_context_samples_16k
+            .min(STRICT_ONNX_INPUT_SAMPLES_16K.saturating_sub(effective_hop));
         if self.hubert_context_tail_16k.len() != hubert_context_len {
             let mut next = vec![0.0_f32; hubert_context_len];
             let keep = self.hubert_context_tail_16k.len().min(hubert_context_len);
@@ -873,7 +859,8 @@ Set ORT_DYLIB_PATH to a compatible onnxruntime.dll (>= 1.23.x). details: {detail
             }
             self.hubert_context_tail_16k = next;
         }
-        let n_hops = source_16k.len().div_ceil(effective_hop);
+        let new_samples_16k = source_16k.len().div_ceil(2);
+        let n_hops = new_samples_16k.div_ceil(effective_hop).max(1);
         slide_context_window(
             &mut self.source_16k_context,
             &hop_advance_16k,
@@ -1444,16 +1431,9 @@ impl InferenceEngine for RvcOrtEngine {
                     )?;
                 let t_resample_in_us = t_start.elapsed().as_micros();
                 let frames_per_hop =
-                    ((target_hop_samples_16k as f64) / 160.0).round().max(1.0) as usize;
-                let single_window_mode = hubert_source_16k.len() <= STRICT_ONNX_INPUT_SAMPLES_16K;
-                let effective_hops = if single_window_mode { 1 } else { n_hops.max(1) };
-                let total_phone_frames = if single_window_mode {
-                    STRICT_HUBERT_OUTPUT_FRAMES
-                        .saturating_mul(self.hubert_upsample_factor.max(1))
-                        .max(1)
-                } else {
-                    effective_hops.saturating_mul(frames_per_hop).max(1)
-                };
+                    HUBERT_MULTI_WINDOW_USED_FRAMES.saturating_mul(self.hubert_upsample_factor.max(1));
+                let effective_hops = n_hops.max(1);
+                let total_phone_frames = effective_hops.saturating_mul(frames_per_hop).max(1);
                 let expected_output_samples = total_phone_frames
                     .saturating_mul(config.sample_rate.max(1) as usize)
                     .saturating_div(100);
@@ -1772,6 +1752,7 @@ impl InferenceEngine for RvcOrtEngine {
     }
 
     fn prepare_for_shutdown(&mut self) -> Result<()> {
+        self.last_pitch_hz = 0.0;
         self.post_filter_prev_sample = 0.0;
         self.post_filter_prev_valid = false;
         self.drop_zero_copy_engine_explicit();

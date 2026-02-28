@@ -280,13 +280,26 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         ));
         config.frame_gate_db = clamped_frame_gate_db;
     }
+    if !config.hubert_context_sec.is_finite() {
+        config.hubert_context_sec = 0.5;
+    }
+    let clamped_hubert_context_sec = config.hubert_context_sec.clamp(0.25, 2.0);
+    if (clamped_hubert_context_sec - config.hubert_context_sec).abs() > f32::EPSILON {
+        log_debug(&format!(
+            "set_runtime_config_cmd hubert_context_sec clamped: {} -> {}",
+            config.hubert_context_sec, clamped_hubert_context_sec
+        ));
+        config.hubert_context_sec = clamped_hubert_context_sec;
+    }
+    config.hubert_context_samples_16k =
+        (config.hubert_context_sec * 16_000.0).round().max(1.0) as usize;
     config.sola_reset_threshold_samples = config
         .sola_reset_threshold_samples
         .clamp(1, config.block_size.max(1));
     // Keep legacy field aligned for older subsystems and saved presets.
     config.response_threshold = config.vad_on_threshold;
     log_debug(&format!(
-        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} fade_in_ms={} fade_out_ms={} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} nprobe={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+        "set_runtime_config_cmd sample_rate={} block_size={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} fade_in_ms={} fade_out_ms={} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} nprobe={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_sec={:.2} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
         config.sample_rate,
         config.block_size,
         config.input_device_name,
@@ -328,6 +341,7 @@ fn set_runtime_config_cmd(config: RuntimeConfig, state: State<'_, AppState>) -> 
         config.intra_threads,
         config.inter_threads,
         config.ort_parallel_execution,
+        config.hubert_context_sec,
         config.hubert_context_samples_16k,
         config.hubert_output_layer,
         config.hubert_upsample_factor,
@@ -407,7 +421,7 @@ fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
             std::env::var("ORT_DYLIB_PATH").ok()
         ));
         log_debug(&format!(
-            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} fade_in_ms={} fade_out_ms={} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} nprobe={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
+            "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} fade_in_ms={} fade_out_ms={} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} nprobe={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_sec={:.2} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
             model.model_path,
             model.hubert_path,
             model.pitch_extractor_path,
@@ -453,6 +467,7 @@ fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
             runtime_config.intra_threads,
             runtime_config.inter_threads,
             runtime_config.ort_parallel_execution,
+            runtime_config.hubert_context_sec,
             runtime_config.hubert_context_samples_16k,
             runtime_config.hubert_output_layer,
             runtime_config.hubert_upsample_factor,
@@ -650,6 +665,9 @@ fn clamp_inter_threads(value: u32, max_threads: u32) -> u32 {
 
 fn default_runtime_config() -> RuntimeConfig {
     let mut cfg = RuntimeConfig::default();
+    cfg.output_slice_offset_samples = 10_800;
+    cfg.bypass_slicing = true;
+    cfg.hubert_context_samples_16k = (cfg.hubert_context_sec * 16_000.0).round().max(1.0) as usize;
     let max_threads = max_runtime_threads();
 
     if let Some(v) = std::env::var("RUST_VC_ORT_PROVIDER").ok() {
@@ -675,6 +693,8 @@ fn default_runtime_config() -> RuntimeConfig {
     }
     if let Some(v) = env_usize("RUST_VC_HUBERT_CONTEXT_16K") {
         cfg.hubert_context_samples_16k = v.max(1_600);
+        cfg.hubert_context_sec =
+            (cfg.hubert_context_samples_16k as f32 / 16_000.0).clamp(0.25, 2.0);
     }
     if let Some(v) = env_i64("RUST_VC_HUBERT_OUTPUT_LAYER") {
         cfg.hubert_output_layer = v;
@@ -760,14 +780,21 @@ fn default_runtime_config() -> RuntimeConfig {
     if let Some(v) = env_bool("RUST_VC_BYPASS_SLICING") {
         cfg.bypass_slicing = v;
     }
+    if let Some(v) = env_f32("RUST_VC_HUBERT_CONTEXT_SEC") {
+        cfg.hubert_context_sec = v.clamp(0.25, 2.0);
+        cfg.hubert_context_samples_16k = (cfg.hubert_context_sec * 16_000.0)
+            .round()
+            .max(1.0) as usize;
+    }
     log_debug(&format!(
-        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} index_nprobe={} index_provider={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
+        "default_runtime_config ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_sec={:.2} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={} index_nprobe={} index_provider={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
         cfg.ort_provider,
         cfg.ort_device_id,
         cfg.ort_gpu_mem_limit_mb,
         cfg.intra_threads,
         cfg.inter_threads,
         cfg.ort_parallel_execution,
+        cfg.hubert_context_sec,
         cfg.hubert_context_samples_16k,
         cfg.hubert_output_layer,
         cfg.hubert_upsample_factor,

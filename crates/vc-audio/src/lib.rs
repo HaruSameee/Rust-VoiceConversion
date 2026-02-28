@@ -18,6 +18,7 @@ use vc_signal::{resample_hq_into, HqResampler, NoiseSuppress};
 const MIN_INFERENCE_BLOCK: usize = 8_192;
 const MIN_OUTPUT_CROSSFADE_SAMPLES: usize = 256;
 const MAX_OUTPUT_CROSSFADE_SAMPLES: usize = 1_024;
+const BYPASS_CROSSFADE_SAMPLES: usize = 480; // 10ms @ 48kHz
 const OUTPUT_SLICE_AUDIT_BLOCKS: u64 = 30;
 const FRAME_GRID_SEC: f64 = 0.02; // 20ms per frame
 const INPUT_DC_BLOCK_COEFF: f32 = 0.995;
@@ -440,6 +441,12 @@ where
         "[vc-audio] resolved output_slice_offset_samples={} (runtime-config controlled)",
         output_slice_offset_samples,
     );
+    if bypass_slicing {
+        eprintln!(
+            "[vc-audio] output: bypass mode fixed_cut={}",
+            output_slice_offset_samples
+        );
+    }
     eprintln!(
         "[vc-audio] process_window={}smp (2x block_size={})",
         process_window_samples, block_size
@@ -1449,6 +1456,21 @@ fn worker_loop<E>(
             if !bypass_slicing && overlap > 0 && (!bypass_inference || was_active) {
                 apply_equal_power_overlap(&previous_output_tail, &mut smoothed_output, overlap);
             }
+            let bypass_overlap = BYPASS_CROSSFADE_SAMPLES
+                .min(smoothed_output.len())
+                .min(previous_output_tail.len());
+            if bypass_slicing && bypass_overlap > 0 {
+                if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
+                    eprintln!(
+                        "[vc-audio] output-slice bypass-crossfade block={} overlap={} prev_tail_len={} current_len={}",
+                        processed_blocks + 1,
+                        bypass_overlap,
+                        previous_output_tail.len(),
+                        smoothed_output.len()
+                    );
+                }
+                apply_linear_overlap(&previous_output_tail, &mut smoothed_output, bypass_overlap);
+            }
             let boundary_overlap = boundary_fade_samples
                 .min(smoothed_output.len())
                 .min(previous_output_tail.len());
@@ -1481,14 +1503,16 @@ fn worker_loop<E>(
                 );
             }
             previous_output_tail.clear();
-            if !bypass_slicing {
-                let keep = ola_overlap_samples
+            let keep = if bypass_slicing {
+                BYPASS_CROSSFADE_SAMPLES.min(smoothed_output.len())
+            } else {
+                ola_overlap_samples
                     .max(boundary_fade_samples)
-                    .min(smoothed_output.len());
-                if keep > 0 {
-                    previous_output_tail
-                        .extend_from_slice(&smoothed_output[smoothed_output.len() - keep..]);
-                }
+                    .min(smoothed_output.len())
+            };
+            if keep > 0 {
+                previous_output_tail
+                    .extend_from_slice(&smoothed_output[smoothed_output.len() - keep..]);
             }
             // Always advance previous_input, even when inference is bypassed.
             // This preserves overlap-save continuity through silent blocks.
@@ -1925,6 +1949,18 @@ fn apply_equal_power_overlap(previous_tail: &[f32], current: &mut [f32], overlap
         let w_prev = phase.cos();
         let w_curr = phase.sin();
         current[i] = previous_tail[prev_start + i] * w_prev + current[i] * w_curr;
+    }
+}
+
+fn apply_linear_overlap(previous_tail: &[f32], current: &mut [f32], overlap: usize) {
+    if overlap == 0 || previous_tail.len() < overlap || current.len() < overlap {
+        return;
+    }
+    let prev_start = previous_tail.len() - overlap;
+    let inv = 1.0_f32 / overlap as f32;
+    for i in 0..overlap {
+        let alpha = i as f32 * inv;
+        current[i] = previous_tail[prev_start + i] * (1.0 - alpha) + current[i] * alpha;
     }
 }
 
