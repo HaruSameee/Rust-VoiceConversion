@@ -90,6 +90,9 @@ interface EngineStatus {
   running: boolean;
   input_level_rms: number;
   input_level_peak: number;
+  ort_ready: boolean;
+  ort_setup_status: string;
+  ort_setup_message: string;
 }
 
 type LogLevel = "INFO" | "WARN" | "ERROR";
@@ -99,6 +102,12 @@ interface LogEntry {
   level: string;
   message: string;
   ts: number;
+}
+
+interface OrtSetupProgress {
+  status: "downloading" | "extracting" | "done" | "error";
+  progress: number;
+  message: string;
 }
 
 interface TimingStats {
@@ -213,6 +222,7 @@ const MAX_LOG_ENTRIES = 500;
 let logEntries: LogEntry[] = [];
 let latestTimingStats: TimingStats | null = null;
 let latestQueueStats: QueueStats | null = null;
+let ortSetupReady = false;
 
 function now(): string {
   return new Date().toISOString();
@@ -771,12 +781,41 @@ function applyRuntime(config: RuntimeConfig): void {
 function applyStatus(status: EngineStatus): void {
   ui.statusLine.textContent = `status: ${status.running ? "running" : "stopped"}`;
   ui.levelLine.textContent = `input level: rms ${status.input_level_rms.toFixed(4)} / peak ${status.input_level_peak.toFixed(4)}`;
+  ortSetupReady = Boolean(status.ort_ready);
+  ui.startBtn.disabled = !ortSetupReady || status.running;
+  if (!ortSetupReady && status.ort_setup_message) {
+    setMessage(`ONNX Runtime setup: ${status.ort_setup_message}`);
+  }
   updateBackendStatsLine();
 }
 
 async function setupLogListener(): Promise<void> {
   await listen<LogEntry>("vc-log", (event) => {
     addLogEntry(event.payload);
+  });
+}
+
+async function setupOrtDownloadListener(): Promise<void> {
+  ui.startBtn.disabled = true;
+  await listen<OrtSetupProgress>("ort-setup-progress", (event) => {
+    const payload = event.payload;
+    const pct = Math.round((payload.progress ?? 0) * 100);
+    if (payload.status === "error") {
+      ortSetupReady = false;
+      ui.startBtn.disabled = true;
+      setMessage(`ONNX Runtime setup failed: ${payload.message}`);
+      log("ERROR", payload.message);
+      return;
+    }
+    if (payload.status === "done") {
+      ortSetupReady = true;
+      ui.startBtn.disabled = false;
+      setMessage(payload.message);
+      log("INFO", payload.message);
+      return;
+    }
+    setMessage(`ONNX Runtime setup: ${payload.message} (${pct}%)`);
+    ui.startBtn.disabled = true;
   });
 }
 
@@ -839,6 +878,9 @@ async function saveRuntimeOnly(): Promise<void> {
 }
 
 async function startEngine(): Promise<void> {
+  if (!ortSetupReady) {
+    throw new Error("ONNX Runtime setup is not ready");
+  }
   await saveAll();
   log("INFO", "start_engine_cmd");
   const status = await invoke<EngineStatus>("start_engine_cmd");
@@ -989,6 +1031,7 @@ renderLog();
 
 void runAction("init", loadAll);
 void runAction("log_listener", setupLogListener);
+void runAction("ort_setup_listener", setupOrtDownloadListener);
 statusTimer = window.setInterval(() => {
   void runAction("status_poll", pollStatus);
 }, 250);

@@ -1232,7 +1232,14 @@ fn worker_loop<E>(
                     let configured_start =
                         output_slice_offset_samples.saturating_add(context_shift);
                     let max_start = source_end.saturating_sub(expected_len);
-                    let slice_start = configured_start.min(max_start);
+                    let slice_start = if configured_start
+                        .checked_add(expected_len)
+                        .is_some_and(|end| end <= source_end)
+                    {
+                        configured_start
+                    } else {
+                        max_start
+                    };
 
                     if source_end >= expected_len {
                         let slice_end = slice_start.saturating_add(expected_len);

@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+faiss-native = ["dep:faiss"]
+
 [dependencies]
 vc-core = { path = "../vc-core" }
 vc-signal = { path = "../vc-signal" }
 ort.workspace = true
 ndarray.workspace = true
-faiss = { version = "0.12", features = [] }
+faiss = { version = "0.12", default-features = false, features = [], optional = true }

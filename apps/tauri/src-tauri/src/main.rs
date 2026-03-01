@@ -2,14 +2,18 @@
 
 use std::{
     any::Any,
+    ffi::{c_char, CStr},
     fs,
+    io::{self, Read, Write},
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
-    process::Command,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use libloading::{Library, Symbol};
+use reqwest::blocking::Client;
 use serde::Serialize;
 use tauri::{Emitter, State};
 use vc_audio::{
@@ -18,6 +22,13 @@ use vc_audio::{
 };
 use vc_core::{set_log_sink, ModelConfig, RuntimeConfig, VoiceChanger};
 use vc_inference::RvcOrtEngine;
+use windows::{
+    core::PCWSTR,
+    Win32::System::LibraryLoader::{
+        AddDllDirectory, SetDefaultDllDirectories, SetDllDirectoryW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        LOAD_LIBRARY_SEARCH_USER_DIRS,
+    },
+};
 
 fn log_debug(message: &str) {
     let ts = SystemTime::now()
@@ -34,6 +45,42 @@ struct UiLogEvent {
     ts: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct OrtSetupProgress {
+    status: String,
+    progress: f32,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+struct OrtSetupState {
+    status: String,
+    progress: f32,
+    message: String,
+    ready: bool,
+}
+
+impl Default for OrtSetupState {
+    fn default() -> Self {
+        Self {
+            status: "checking".to_string(),
+            progress: 0.0,
+            message: "ONNX Runtime setup pending".to_string(),
+            ready: false,
+        }
+    }
+}
+
+const ORT_VERSION: &str = "1.23.0";
+const ORT_DOWNLOAD_URL: &str =
+    "https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-win-x64-gpu-1.23.0.zip";
+const ORT_REQUIRED_DLLS: &[&str] = &[
+    "onnxruntime.dll",
+    "onnxruntime_providers_cuda.dll",
+    "onnxruntime_providers_shared.dll",
+];
+static ORT_SETUP_STATE: OnceLock<Mutex<OrtSetupState>> = OnceLock::new();
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -48,6 +95,51 @@ fn emit_log(app: &tauri::AppHandle, level: &str, message: &str) {
         ts: now_millis(),
     };
     let _ = app.emit("vc-log", payload);
+}
+
+fn ort_setup_state() -> &'static Mutex<OrtSetupState> {
+    ORT_SETUP_STATE.get_or_init(|| Mutex::new(OrtSetupState::default()))
+}
+
+fn snapshot_ort_setup_state() -> OrtSetupState {
+    match ort_setup_state().lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+fn update_ort_setup_state(status: &str, progress: f32, message: String, ready: bool) {
+    match ort_setup_state().lock() {
+        Ok(mut guard) => {
+            guard.status = status.to_string();
+            guard.progress = progress.clamp(0.0, 1.0);
+            guard.message = message;
+            guard.ready = ready;
+        }
+        Err(mut poisoned) => {
+            let guard = poisoned.get_mut();
+            guard.status = status.to_string();
+            guard.progress = progress.clamp(0.0, 1.0);
+            guard.message = message;
+            guard.ready = ready;
+        }
+    }
+}
+
+fn emit_ort_setup_progress(
+    app: &tauri::AppHandle,
+    status: &str,
+    progress: f32,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    update_ort_setup_state(status, progress, message.clone(), status == "done");
+    let payload = OrtSetupProgress {
+        status: status.to_string(),
+        progress: progress.clamp(0.0, 1.0),
+        message,
+    };
+    let _ = app.emit("ort-setup-progress", payload);
 }
 
 fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
@@ -123,6 +215,9 @@ struct EngineStatus {
     running: bool,
     input_level_rms: f32,
     input_level_peak: f32,
+    ort_ready: bool,
+    ort_setup_status: String,
+    ort_setup_message: String,
 }
 
 #[tauri::command]
@@ -406,14 +501,25 @@ fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
             if guard.running {
                 log_debug("engine already running");
                 sync_levels_from_engine(&mut guard);
+                let ort = snapshot_ort_setup_state();
                 return Ok(EngineStatus {
                     running: guard.running,
                     input_level_rms: guard.input_level_rms,
                     input_level_peak: guard.input_level_peak,
+                    ort_ready: ort.ready,
+                    ort_setup_status: ort.status,
+                    ort_setup_message: ort.message,
                 });
             }
             (guard.config.clone(), guard.model.clone())
         };
+        let ort = snapshot_ort_setup_state();
+        if !ort.ready {
+            return Err(format!(
+                "ONNX Runtime setup is not ready: {} ({})",
+                ort.message, ort.status
+            ));
+        }
         let model = resolve_model_config_for_start(model_raw)?;
         apply_mode_selection(&model, &mut runtime_config);
         log_debug(&format!(
@@ -517,10 +623,14 @@ fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
             log_debug("engine already running");
             sync_levels_from_engine(&mut guard);
             audio_engine.stop_and_abort();
+            let ort = snapshot_ort_setup_state();
             return Ok(EngineStatus {
                 running: guard.running,
                 input_level_rms: guard.input_level_rms,
                 input_level_peak: guard.input_level_peak,
+                ort_ready: ort.ready,
+                ort_setup_status: ort.status,
+                ort_setup_message: ort.message,
             });
         }
 
@@ -529,10 +639,14 @@ fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
         guard.engine_task = Some(audio_engine);
         sync_levels_from_engine(&mut guard);
         emit_log(&app, "info", "start_engine_cmd done");
+        let ort = snapshot_ort_setup_state();
         Ok(EngineStatus {
             running: guard.running,
             input_level_rms: guard.input_level_rms,
             input_level_peak: guard.input_level_peak,
+            ort_ready: ort.ready,
+            ort_setup_status: ort.status,
+            ort_setup_message: ort.message,
         })
     })
 }
@@ -548,10 +662,14 @@ fn stop_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<
         }
         guard.running = false;
         emit_log(&app, "info", "stop_engine_cmd done");
+        let ort = snapshot_ort_setup_state();
         Ok(EngineStatus {
             running: guard.running,
             input_level_rms: guard.input_level_rms,
             input_level_peak: guard.input_level_peak,
+            ort_ready: ort.ready,
+            ort_setup_status: ort.status,
+            ort_setup_message: ort.message,
         })
     })
 }
@@ -561,10 +679,14 @@ fn get_engine_status_cmd(state: State<'_, AppState>) -> Result<EngineStatus, Str
     run_panic_safe("get_engine_status_cmd", || {
         let mut guard = state.lock_runtime();
         sync_levels_from_engine(&mut guard);
+        let ort = snapshot_ort_setup_state();
         Ok(EngineStatus {
             running: guard.running,
             input_level_rms: guard.input_level_rms,
             input_level_peak: guard.input_level_peak,
+            ort_ready: ort.ready,
+            ort_setup_status: ort.status,
+            ort_setup_message: ort.message,
         })
     })
 }
@@ -980,77 +1102,63 @@ fn candidate_bases() -> Vec<PathBuf> {
     out
 }
 
-fn prepend_path_dir(dir: &Path) {
-    let dir_str = dir.to_string_lossy().to_string();
-    if dir_str.is_empty() {
-        return;
-    }
-    let current = std::env::var_os("PATH").unwrap_or_default();
-    let current_s = current.to_string_lossy().to_string();
-    let exists = current_s
-        .split(';')
-        .any(|p| p.eq_ignore_ascii_case(&dir_str));
-    if exists {
-        return;
-    }
-    let new_path = if current_s.is_empty() {
-        dir_str.clone()
-    } else {
-        format!("{dir_str};{current_s}")
-    };
-    std::env::set_var("PATH", &new_path);
-    log_debug(&format!("prepended DLL search path: {}", dir_str));
-}
-
-fn prepend_if_dir(path: PathBuf) {
-    if path.is_dir() {
-        prepend_path_dir(&path);
-    }
-}
-
-fn prepend_cuda_runtime_search_dirs() {
-    if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
-        prepend_if_dir(PathBuf::from(cuda_path).join("bin"));
-    }
-    if let Ok(cudnn_path) = std::env::var("CUDNN_PATH") {
-        let cudnn_root = PathBuf::from(cudnn_path);
-        prepend_if_dir(cudnn_root.clone());
-        prepend_if_dir(cudnn_root.join("bin"));
-    }
-    for (key, value) in std::env::vars() {
-        if key.starts_with("CUDA_PATH_V") {
-            prepend_if_dir(PathBuf::from(value).join("bin"));
+fn resolve_model_dir() -> PathBuf {
+    for base in candidate_bases() {
+        let model_dir = base.join("model");
+        if model_dir.is_dir() {
+            return model_dir;
         }
     }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("model")
 }
 
-fn prepend_python_nvidia_bin_dirs(onnxruntime_dll_path: &str) {
-    let mut current = Path::new(onnxruntime_dll_path).parent();
-    while let Some(dir) = current {
-        let is_site_packages = dir
-            .file_name()
-            .map(|name| name.to_string_lossy().eq_ignore_ascii_case("site-packages"))
-            .unwrap_or(false);
-        if is_site_packages {
-            let nvidia_root = dir.join("nvidia");
-            if let Ok(entries) = fs::read_dir(&nvidia_root) {
-                for entry in entries.flatten() {
-                    let bin_dir = entry.path().join("bin");
-                    prepend_if_dir(bin_dir);
-                }
-            }
-            break;
-        }
-        current = dir.parent();
-    }
+fn utf16_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn prepare_ort_dependency_search_paths(onnxruntime_dll_path: &str) {
-    if let Some(parent) = Path::new(onnxruntime_dll_path).parent() {
-        prepend_path_dir(parent);
+    let Some(model_dir) = Path::new(onnxruntime_dll_path).parent() else {
+        return;
+    };
+    let wide = utf16_null(&model_dir.to_string_lossy());
+    unsafe {
+        let _ = SetDllDirectoryW(PCWSTR::null());
+        let _ = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
+        let _ = AddDllDirectory(PCWSTR(wide.as_ptr()));
     }
-    prepend_cuda_runtime_search_dirs();
-    prepend_python_nvidia_bin_dirs(onnxruntime_dll_path);
+    log_debug(&format!(
+        "ORT DLL search restricted to model directory: {}",
+        model_dir.display()
+    ));
+}
+
+#[repr(C)]
+struct OrtApiBase {
+    _get_api: unsafe extern "system" fn(u32) -> *const std::ffi::c_void,
+    get_version_string: unsafe extern "system" fn() -> *const c_char,
+}
+
+type OrtGetApiBaseFn = unsafe extern "system" fn() -> *const OrtApiBase;
+
+fn get_onnxruntime_version_from_dll(path: &Path) -> Result<String, String> {
+    unsafe {
+        let lib = Library::new(path)
+            .map_err(|e| format!("failed to load '{}': {e}", path.display()))?;
+        let get_api_base: Symbol<'_, OrtGetApiBaseFn> = lib
+            .get(b"OrtGetApiBase\0")
+            .map_err(|e| format!("OrtGetApiBase not found in '{}': {e}", path.display()))?;
+        let api_base = get_api_base();
+        if api_base.is_null() {
+            return Err(format!("OrtGetApiBase returned null for '{}'", path.display()));
+        }
+        let version_ptr = ((*api_base).get_version_string)();
+        if version_ptr.is_null() {
+            return Err(format!("GetVersionString returned null for '{}'", path.display()));
+        }
+        Ok(CStr::from_ptr(version_ptr).to_string_lossy().trim().to_string())
+    }
 }
 
 fn parse_version_tuple(raw: &str) -> Option<(u32, u32, u32)> {
@@ -1076,6 +1184,12 @@ fn is_supported_ort_version(raw: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn existing_ort_version_is_supported(path: &str) -> bool {
+    get_onnxruntime_version_from_dll(Path::new(path))
+        .map(|version| is_supported_ort_version(&version))
+        .unwrap_or(false)
+}
+
 fn set_ort_dylib_path(path: &str, source_label: &str) {
     std::env::set_var("ORT_DYLIB_PATH", path);
     prepare_ort_dependency_search_paths(path);
@@ -1093,104 +1207,226 @@ fn ort_bundle_has_provider_shared(onnxruntime_dll_path: &str) -> bool {
     dir.join("onnxruntime_providers_shared.dll").exists()
 }
 
-fn ensure_ort_dylib_path() -> Option<String> {
-    let mut incomplete_candidate: Option<String> = None;
-
-    if let Ok(current) = std::env::var("ORT_DYLIB_PATH") {
-        let p = PathBuf::from(&current);
-        if p.exists() {
-            if ort_bundle_has_provider_shared(&current) {
-                prepare_ort_dependency_search_paths(&current);
-                return Some(current);
-            }
-            log_debug(&format!(
-                "ORT_DYLIB_PATH points to '{}' but onnxruntime_providers_shared.dll is missing nearby; trying fallback candidates",
-                current
-            ));
-            incomplete_candidate = Some(current);
-        } else {
-            log_debug(&format!(
-                "ORT_DYLIB_PATH is set but not found on disk: {}",
-                current
-            ));
-        }
-    }
-
-    if let Some(path) = resolve_existing_path("model/onnxruntime.dll") {
-        if ort_bundle_has_provider_shared(&path) {
-            set_ort_dylib_path(&path, "model directory");
-            return Some(path);
-        }
-        log_debug(&format!(
-            "model/onnxruntime.dll found but onnxruntime_providers_shared.dll is missing; skipping model bundle candidate: {}",
-            path
-        ));
-        incomplete_candidate.get_or_insert(path);
-    }
-
-    if let Some(path) = find_onnxruntime_dll_via_python() {
-        set_ort_dylib_path(&path, "python onnxruntime");
-        return Some(path);
-    }
-
-    if let Some(path) = incomplete_candidate {
-        set_ort_dylib_path(&path, "incomplete fallback candidate");
-        log_debug(&format!(
-            "using incomplete ORT candidate (fallback): {}. provider startup may fail until runtime DLL bundle is fixed",
-            path
-        ));
-        return Some(path);
-    }
-
-    None
+fn ort_bundle_has_required_gpu_dlls(onnxruntime_dll_path: &Path) -> bool {
+    let Some(dir) = onnxruntime_dll_path.parent() else {
+        return false;
+    };
+    ORT_REQUIRED_DLLS.iter().all(|name| dir.join(name).exists())
 }
 
-fn find_onnxruntime_dll_via_python() -> Option<String> {
-    let py = r#"import os
-import onnxruntime as ort
-print(ort.__version__)
-print(os.path.join(os.path.dirname(ort.__file__), "capi", "onnxruntime.dll"))
-print(",".join(ort.get_available_providers()))"#;
+fn ensure_ort_dylib_path() -> Option<String> {
+    let path = resolve_existing_path("model/onnxruntime.dll")?;
+    if !existing_ort_version_is_supported(&path) {
+        log_debug(&format!(
+            "model/onnxruntime.dll is older than required {}; refusing candidate: {}",
+            ORT_VERSION, path
+        ));
+        return None;
+    }
+    if !ort_bundle_has_provider_shared(&path) {
+        log_debug(&format!(
+            "model/onnxruntime.dll found but provider shared DLL is missing; refusing candidate: {}",
+            path
+        ));
+        return None;
+    }
+    set_ort_dylib_path(&path, "model directory");
+    Some(path)
+}
 
-    let output = Command::new("python").args(["-c", py]).output().ok()?;
-    if !output.status.success() {
-        return None;
+fn remove_existing_ort_bundle(model_dir: &Path) -> Result<(), String> {
+    for name in ORT_REQUIRED_DLLS {
+        let path = model_dir.join(name);
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|e| format!("failed to remove '{}': {e}", path.display()))?;
+        }
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-    let version = lines.next().unwrap_or("").trim().to_string();
-    let candidate = lines.next().unwrap_or("").trim().to_string();
-    let providers_line = lines.next().unwrap_or("").trim().to_string();
-    if !is_supported_ort_version(&version) {
-        log_debug(&format!(
-            "python onnxruntime candidate rejected: version={} path={} (need >= 1.23.x)",
-            version, candidate
-        ));
-        return None;
-    }
-    if candidate.is_empty() {
-        return None;
-    }
-    if !providers_line.is_empty() {
-        let providers: Vec<String> = providers_line
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let has_gpu = providers.iter().any(|p| {
-            p.eq_ignore_ascii_case("CUDAExecutionProvider")
-                || p.eq_ignore_ascii_case("DmlExecutionProvider")
-        });
-        log_debug(&format!(
-            "python onnxruntime version={} providers={:?} gpu_available={}",
-            version, providers, has_gpu
+    Ok(())
+}
+
+fn download_ort_zip(app: &tauri::AppHandle, client: &Client, zip_path: &Path) -> Result<(), String> {
+    let mut response = client
+        .get(ORT_DOWNLOAD_URL)
+        .send()
+        .map_err(|e| format!("failed to request ONNX Runtime zip: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "failed to download ONNX Runtime zip: HTTP {}",
+            response.status()
         ));
     }
-    if Path::new(&candidate).exists() {
-        Some(candidate)
-    } else {
-        None
+
+    let total_size = response.content_length();
+    let mut out = fs::File::create(zip_path)
+        .map_err(|e| format!("failed to create '{}': {e}", zip_path.display()))?;
+    let mut downloaded = 0u64;
+    let mut last_bucket = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    emit_ort_setup_progress(
+        app,
+        "downloading",
+        0.0,
+        format!("Downloading ONNX Runtime {}", ORT_VERSION),
+    );
+    loop {
+        let read = response
+            .read(&mut buf)
+            .map_err(|e| format!("failed while downloading ONNX Runtime zip: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&buf[..read])
+            .map_err(|e| format!("failed to write '{}': {e}", zip_path.display()))?;
+        downloaded += read as u64;
+        if let Some(total) = total_size {
+            if total > 0 {
+                let bucket = (downloaded.saturating_mul(100) / total).min(100);
+                if bucket != last_bucket {
+                    last_bucket = bucket;
+                    emit_ort_setup_progress(
+                        app,
+                        "downloading",
+                        (bucket as f32 / 100.0) * 0.85,
+                        format!("Downloading ONNX Runtime... {}%", bucket),
+                    );
+                }
+            }
+        }
     }
+    Ok(())
+}
+
+fn extract_ort_zip(app: &tauri::AppHandle, zip_path: &Path, model_dir: &Path) -> Result<(), String> {
+    emit_ort_setup_progress(app, "extracting", 0.9, "Extracting ONNX Runtime DLLs");
+    let file = fs::File::open(zip_path)
+        .map_err(|e| format!("failed to open '{}': {e}", zip_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("failed to open zip '{}': {e}", zip_path.display()))?;
+    let total_required = ORT_REQUIRED_DLLS.len() as f32;
+    let mut extracted = Vec::<String>::new();
+
+    for idx in 0..archive.len() {
+        let mut entry = archive
+            .by_index(idx)
+            .map_err(|e| format!("failed to read zip entry #{idx}: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(file_name) = Path::new(entry.name()).file_name() else {
+            continue;
+        };
+        let file_name = file_name.to_string_lossy().to_string();
+        if !ORT_REQUIRED_DLLS
+            .iter()
+            .any(|required| required.eq_ignore_ascii_case(&file_name))
+        {
+            continue;
+        }
+        let out_path = model_dir.join(&file_name);
+        let mut out = fs::File::create(&out_path)
+            .map_err(|e| format!("failed to create '{}': {e}", out_path.display()))?;
+        io::copy(&mut entry, &mut out)
+            .map_err(|e| format!("failed to extract '{}': {e}", out_path.display()))?;
+        if !extracted.iter().any(|name| name.eq_ignore_ascii_case(&file_name)) {
+            extracted.push(file_name.clone());
+        }
+        let progress = 0.9 + (extracted.len() as f32 / total_required) * 0.09;
+        emit_ort_setup_progress(
+            app,
+            "extracting",
+            progress,
+            format!("Extracting: {}", file_name),
+        );
+    }
+
+    for required in ORT_REQUIRED_DLLS {
+        if !model_dir.join(required).exists() {
+            return Err(format!(
+                "required DLL '{}' was not found in downloaded archive",
+                required
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_ort_runtime_bundle(app: &tauri::AppHandle) -> Result<(), String> {
+    let model_dir = resolve_model_dir();
+    emit_ort_setup_progress(
+        app,
+        "checking",
+        0.0,
+        format!("Checking ONNX Runtime {} bundle", ORT_VERSION),
+    );
+    fs::create_dir_all(&model_dir)
+        .map_err(|e| format!("failed to create model directory '{}': {e}", model_dir.display()))?;
+    let dll_path = model_dir.join("onnxruntime.dll");
+
+    if dll_path.exists() {
+        if !ort_bundle_has_required_gpu_dlls(&dll_path) {
+            log_debug(&format!(
+                "model ORT bundle is incomplete; refreshing '{}'",
+                dll_path.display()
+            ));
+            remove_existing_ort_bundle(&model_dir)?;
+        } else {
+            match get_onnxruntime_version_from_dll(&dll_path) {
+                Ok(version) if is_supported_ort_version(&version) => {
+                    let dll = dll_path.to_string_lossy().to_string();
+                    set_ort_dylib_path(&dll, "startup model bundle");
+                    emit_ort_setup_progress(
+                        app,
+                        "done",
+                        1.0,
+                        format!("ONNX Runtime {version} is ready"),
+                    );
+                    return Ok(());
+                }
+                Ok(version) => {
+                    log_debug(&format!(
+                        "model ORT bundle version {} is older than {}; refreshing",
+                        version, ORT_VERSION
+                    ));
+                    remove_existing_ort_bundle(&model_dir)?;
+                }
+                Err(err) => {
+                    log_debug(&format!(
+                        "failed to inspect model ORT bundle '{}': {}; refreshing",
+                        dll_path.display(),
+                        err
+                    ));
+                    remove_existing_ort_bundle(&model_dir)?;
+                }
+            }
+        }
+    }
+
+    let temp_root = std::env::temp_dir().join(format!("rust-vc-ort-{}", now_millis()));
+    fs::create_dir_all(&temp_root)
+        .map_err(|e| format!("failed to create temp directory '{}': {e}", temp_root.display()))?;
+    let zip_path = temp_root.join("onnxruntime-win-x64-gpu-1.23.0.zip");
+    let client = Client::builder()
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+    let result = (|| -> Result<(), String> {
+        download_ort_zip(app, &client, &zip_path)?;
+        extract_ort_zip(app, &zip_path, &model_dir)?;
+        let dll = model_dir.join("onnxruntime.dll");
+        let dll_s = dll.to_string_lossy().to_string();
+        set_ort_dylib_path(&dll_s, "downloaded model bundle");
+        emit_ort_setup_progress(
+            app,
+            "done",
+            1.0,
+            format!("ONNX Runtime {} bundle installed", ORT_VERSION),
+        );
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&temp_root);
+    result
 }
 
 fn main() {
@@ -1201,6 +1437,15 @@ fn main() {
             set_log_sink(Some(Arc::new(move |level, message| {
                 emit_log(&handle, level, message);
             })));
+            let ort_handle = app.handle().clone();
+            thread::spawn(move || {
+                if let Err(err) = ensure_ort_runtime_bundle(&ort_handle) {
+                    let message = format!("ONNX Runtime setup failed: {err}");
+                    log_debug(&message);
+                    emit_ort_setup_progress(&ort_handle, "error", 1.0, message.clone());
+                    emit_log(&ort_handle, "error", &message);
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

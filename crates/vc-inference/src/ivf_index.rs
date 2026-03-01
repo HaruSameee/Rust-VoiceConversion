@@ -116,9 +116,8 @@ impl IvfIndex {
         query: &[f32],
         top_k: usize,
         nprobe: usize,
-        max_rows: usize,
     ) -> Vec<(f32, usize)> {
-        self.search_with_stats(query, top_k, nprobe, max_rows).0
+        self.search_with_stats(query, top_k, nprobe).0
     }
 
     pub fn search_with_stats(
@@ -126,7 +125,6 @@ impl IvfIndex {
         query: &[f32],
         top_k: usize,
         nprobe: usize,
-        _max_rows: usize,
     ) -> (Vec<(f32, usize)>, usize) {
         if self.dims == 0 || self.ntotal() == 0 || query.len() != self.dims || top_k == 0 {
             return (Vec::new(), 0);

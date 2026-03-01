@@ -26,55 +26,24 @@ set "INFER_PACK_PATH=infer_pack"
 if not exist "%INFER_PACK_PATH%" set "INFER_PACK_PATH=scripts\infer_pack"
 set "RMVPE_PATH=rmvpe"
 if not exist "%RMVPE_PATH%" set "RMVPE_PATH=scripts\rmvpe"
+if not exist "%INFER_PACK_PATH%" (
+  echo infer_pack directory not found.
+  exit /b 1
+)
+if not exist "%RMVPE_PATH%" (
+  echo rmvpe directory not found.
+  exit /b 1
+)
 
 if exist build rmdir /s /q build
-if exist dist\setup.exe del /q dist\setup.exe
-if exist setup.spec del /q setup.spec
+if exist dist\setup rmdir /s /q dist\setup
 
-pyinstaller ^
-  --noconfirm ^
-  --clean ^
-  --onefile ^
-  --name setup ^
-  --add-data "%INFER_PACK_PATH%;infer_pack" ^
-  --add-data "%RMVPE_PATH%;rmvpe" ^
-  --add-data "scripts\export_generator_standalone.py;scripts" ^
-  --add-data "scripts\convert_index_standalone.py;scripts" ^
-  --add-data "scripts\convert_to_ivf.py;scripts" ^
-  --paths "scripts" ^
-  --hidden-import torch ^
-  --hidden-import torch._C ^
-  --hidden-import onnx ^
-  --hidden-import onnxscript ^
-  --hidden-import faiss ^
-  --hidden-import tqdm ^
-  --hidden-import requests ^
-  --collect-binaries torch ^
-  --collect-data torch ^
-  --copy-metadata torch ^
-  --collect-binaries onnx ^
-  --collect-data onnx ^
-  --copy-metadata onnx ^
-  --collect-binaries onnxscript ^
-  --collect-data onnxscript ^
-  --copy-metadata onnxscript ^
-  --collect-binaries faiss ^
-  --collect-data faiss ^
-  --copy-metadata faiss-cpu ^
-  --exclude-module torchaudio ^
-  --exclude-module torchvision ^
-  --exclude-module torchtext ^
-  --exclude-module transformers ^
-  --exclude-module onnxruntime ^
-  --exclude-module numba ^
-  --exclude-module scipy ^
-  --exclude-module pandas ^
-  setup.py
+pyinstaller --noconfirm --clean setup.spec
 if errorlevel 1 (
   echo PyInstaller build failed.
   exit /b 1
 )
 
 echo.
-echo Build complete: dist\setup.exe
+echo Build complete: dist\setup\setup.exe
 exit /b 0

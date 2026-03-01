@@ -1,4 +1,4 @@
-﻿# pyinstaller --onefile --name setup setup.py
+﻿# pyinstaller setup.spec
 #
 # 必要パッケージ:
 #   requests, tqdm, numpy, faiss-cpu, onnx, onnxscript
@@ -12,6 +12,9 @@ import sys
 import tempfile
 import traceback
 import types
+import ctypes
+import shutil
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Tuple
@@ -32,10 +35,48 @@ if BASE_DIR not in sys.path:
 
 STEP_LABEL_TOTAL = 6
 
-CUDA_INSTALLERS = {
-    "11.8": "https://developer.download.nvidia.com/compute/cuda/11.8.0/local_installers/cuda_11.8.0_522.06_windows.exe",
-    "12.4": "https://developer.download.nvidia.com/compute/cuda/12.4.0/local_installers/cuda_12.4.0_551.61_windows.exe",
+ORT_VERSION = "1.23.0"
+ORT_PACKAGE_URL = (
+    "https://github.com/microsoft/onnxruntime/releases/download/"
+    "v1.23.0/onnxruntime-win-x64-gpu-1.23.0.zip"
+)
+ORT_REQUIRED_DLLS = [
+    "onnxruntime.dll",
+    "onnxruntime_providers_cuda.dll",
+    "onnxruntime_providers_shared.dll",
+    "onnxruntime_providers_tensorrt.dll",
+]
+CUDA_PACKAGE_URLS = {
+    "cuda_cudart": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip",
+    "libcublas": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
+    "libcufft": "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.2.1.3-archive.zip",
+    "libcurand": "https://developer.download.nvidia.com/compute/cuda/redist/libcurand/windows-x86_64/libcurand-windows-x86_64-10.3.5.147-archive.zip",
+    "libcusolver": "https://developer.download.nvidia.com/compute/cuda/redist/libcusolver/windows-x86_64/libcusolver-windows-x86_64-11.6.1.9-archive.zip",
+    "libcusparse": "https://developer.download.nvidia.com/compute/cuda/redist/libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.3.1.170-archive.zip",
 }
+CUDA_REQUIRED_DLLS = [
+    "cudart64_12.dll",
+    "cublas64_12.dll",
+    "cublasLt64_12.dll",
+    "cufft64_11.dll",
+    "curand64_10.dll",
+    "cusolver64_11.dll",
+    "cusparse64_12.dll",
+]
+CUDNN_PACKAGE_URL = (
+    "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/"
+    "windows-x86_64/cudnn-windows-x86_64-9.1.1.17_cuda12-archive.zip"
+)
+CUDNN_REQUIRED_DLLS = [
+    "cudnn64_9.dll",
+    "cudnn_adv64_9.dll",
+    "cudnn_cnn64_9.dll",
+    "cudnn_engines_precompiled64_9.dll",
+    "cudnn_engines_runtime_compiled64_9.dll",
+    "cudnn_graph64_9.dll",
+    "cudnn_heuristic64_9.dll",
+    "cudnn_ops64_9.dll",
+]
 
 MODE_TABLE = {
     "ultra_low": 12000,
@@ -116,6 +157,10 @@ def _load_script_module(script_name: str, module_name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class _OrtApiBase(ctypes.Structure):
+    _fields_ = [("_get_api", ctypes.c_void_p), ("get_version_string", ctypes.c_void_p)]
 
 
 def _attach_site_packages_from_python(python_cmd: str) -> None:
@@ -293,75 +338,151 @@ def select_mode_interactive(suggested_mode: str) -> Tuple[str, int]:
     return selected_mode, MODE_TABLE[selected_mode]
 
 
-def detect_required_cuda(gpu_name: str) -> str:
-    upper = gpu_name.upper()
-    if "RTX" in upper:
-        return "12.4"
-    if re.search(r"GTX\s*(10\d{2}|16\d{2})", upper):
-        return "11.8"
-    if "GTX" in upper:
-        return "11.8"
-    return "11.8"
+def parse_version_tuple(raw: str) -> Tuple[int, int, int]:
+    parts = (raw or "").strip().split(".")
+    values = []
+    for part in parts[:3]:
+        digits = "".join(ch for ch in part if ch.isdigit())
+        values.append(int(digits or "0"))
+    while len(values) < 3:
+        values.append(0)
+    return tuple(values[:3])
 
 
-def detect_nvcc_version() -> str:
+def get_onnxruntime_version_from_dll(path: Path) -> str:
+    handle = None
     try:
-        proc = subprocess.run(
-            ["nvcc", "--version"],
-            capture_output=True,
-            text=True,
-            check=True,
+        if hasattr(os, "add_dll_directory"):
+            handle = os.add_dll_directory(str(path.parent))
+        dll = ctypes.WinDLL(str(path))
+        get_api_base = dll.OrtGetApiBase
+        get_api_base.restype = ctypes.POINTER(_OrtApiBase)
+        api_base = get_api_base()
+        if not api_base:
+            raise RuntimeError("OrtGetApiBase returned NULL")
+        version_fn = ctypes.CFUNCTYPE(ctypes.c_char_p)(api_base.contents.get_version_string)
+        version_ptr = version_fn()
+        if not version_ptr:
+            raise RuntimeError("GetVersionString returned NULL")
+        return version_ptr.decode("utf-8", errors="replace").strip()
+    finally:
+        if handle is not None:
+            handle.close()
+
+
+def is_supported_ort_version(raw: str) -> bool:
+    return parse_version_tuple(raw) >= (1, 23, 0)
+
+
+def collect_missing_dlls(model_dir: Path, names) -> list[str]:
+    return [name for name in names if not (model_dir / name).exists()]
+
+
+def remove_existing_files(model_dir: Path, names) -> None:
+    for name in names:
+        path = model_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def extract_dlls_from_zip(zip_path: Path, dest_dir: Path, required_names) -> None:
+    required_lower = {name.lower() for name in required_names}
+    extracted = set()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            member_name = Path(info.filename).name
+            if not member_name.lower().endswith(".dll"):
+                continue
+            target = dest_dir / member_name
+            with zf.open(info, "r") as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted.add(member_name.lower())
+
+    missing = [name for name in required_names if name.lower() not in extracted and not (dest_dir / name).exists()]
+    if missing:
+        raise RuntimeError(
+            f"required DLLs were not found in zip: {', ' .join(missing)} ({zip_path.name})"
         )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return ""
-
-    text = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    m = re.search(r"release\s+(\d+\.\d+)", text)
-    return m.group(1) if m else ""
 
 
-def download_file(url: str, dest_path: str) -> None:
-    with requests.get(url, stream=True, timeout=30) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", "0"))
-        with open(dest_path, "wb") as f, tqdm(
-            total=total,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            desc="ダウンロード中",
-        ) as bar:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
-                f.write(chunk)
-                bar.update(len(chunk))
+def download_package(url: str, temp_root: Path, label: str) -> Path:
+    parsed = urlparse(url)
+    filename = os.path.basename(parsed.path) or f"{label}.zip"
+    dest = temp_root / filename
+    print(f"  downloading {label}: {url}")
+    download_file(url, str(dest))
+    return dest
 
 
-def ensure_cuda(required_cuda: str) -> None:
-    detected = detect_nvcc_version()
-    if detected == required_cuda:
-        print(f"CUDA {detected} 検出済み、スキップします")
+def ensure_ort_dlls(model_dir: Path) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    ort_dll = model_dir / "onnxruntime.dll"
+    ort_needs_refresh = not ort_dll.exists()
+    if ort_dll.exists():
+        try:
+            version = get_onnxruntime_version_from_dll(ort_dll)
+            print(f"  existing onnxruntime.dll: {version}")
+            if not is_supported_ort_version(version):
+                print(f"  replacing old onnxruntime.dll: {version}")
+                ort_needs_refresh = True
+        except Exception as exc:
+            print(f"  warning: failed to inspect onnxruntime.dll, refreshing bundle: {exc}")
+            ort_needs_refresh = True
+
+    if ort_needs_refresh:
+        remove_existing_files(model_dir, ORT_REQUIRED_DLLS)
+
+    ort_missing = collect_missing_dlls(model_dir, ORT_REQUIRED_DLLS)
+    cuda_package_map = {
+        "cuda_cudart": ["cudart64_12.dll"],
+        "libcublas": ["cublas64_12.dll", "cublasLt64_12.dll"],
+        "libcufft": ["cufft64_11.dll"],
+        "libcurand": ["curand64_10.dll"],
+        "libcusolver": ["cusolver64_11.dll"],
+        "libcusparse": ["cusparse64_12.dll"],
+    }
+    cuda_missing_packages = [
+        key
+        for key, names in cuda_package_map.items()
+        if collect_missing_dlls(model_dir, names)
+    ]
+    cudnn_missing = collect_missing_dlls(model_dir, CUDNN_REQUIRED_DLLS)
+
+    if not ort_missing and not cuda_missing_packages and not cudnn_missing:
+        print("  all required DLLs are already present in model/")
         return
 
-    if detected:
-        print(f"CUDA {detected} が検出されました。{required_cuda} が必要です")
-        ans = input("上書きインストールしますか？ [y/N]: ").strip().lower()
-        if ans != "y":
-            print("警告: CUDAのバージョンが推奨と異なります。このまま続行します。")
-            return
+    with tempfile.TemporaryDirectory(prefix="rustvc_ort_") as temp_dir:
+        temp_root = Path(temp_dir)
 
-    url = CUDA_INSTALLERS.get(required_cuda)
-    if not url:
-        raise RuntimeError(f"CUDA {required_cuda} のインストーラURLが未定義です。")
+        if ort_missing:
+            zip_path = download_package(ORT_PACKAGE_URL, temp_root, "ONNX Runtime 1.23.0")
+            print("  extracting onnxruntime DLLs...")
+            extract_dlls_from_zip(zip_path, model_dir, ORT_REQUIRED_DLLS)
 
-    filename = os.path.basename(urlparse(url).path) or f"cuda_{required_cuda}.exe"
-    installer_path = os.path.join(tempfile.gettempdir(), filename)
-    print(f"CUDA {required_cuda} をダウンロードします: {url}")
-    download_file(url, installer_path)
-    print("CUDAインストーラをサイレント実行します...")
-    subprocess.run([installer_path, "-s"], check=True)
-    print("CUDAのインストールが完了しました")
+        for package_key in cuda_missing_packages:
+            zip_path = download_package(CUDA_PACKAGE_URLS[package_key], temp_root, package_key)
+            print(f"  extracting DLLs from {package_key}...")
+            extract_dlls_from_zip(zip_path, model_dir, cuda_package_map[package_key])
+
+        if cudnn_missing:
+            zip_path = download_package(CUDNN_PACKAGE_URL, temp_root, "cuDNN 9.1.1")
+            print("  extracting cuDNN DLLs...")
+            extract_dlls_from_zip(zip_path, model_dir, CUDNN_REQUIRED_DLLS)
+
+    all_required = ORT_REQUIRED_DLLS + CUDA_REQUIRED_DLLS + CUDNN_REQUIRED_DLLS
+    missing = collect_missing_dlls(model_dir, all_required)
+    if missing:
+        raise RuntimeError(f"failed to place required DLLs into model/: {', ' .join(missing)}")
+
+    version = get_onnxruntime_version_from_dll(model_dir / 'onnxruntime.dll')
+    if not is_supported_ort_version(version):
+        raise RuntimeError(f"onnxruntime.dll version is still unsupported after refresh: {version}")
+
+    print(f"  onnxruntime {version} and all required DLLs were placed in model/")
 
 
 def export_generator(pth_path: str, out_path: str) -> None:
@@ -551,10 +672,9 @@ def run_setup() -> None:
     print(f"選択モード: {selected_mode} (block_size={selected_block})")
     print("mode.txt に保存しました: ./model/mode.txt")
 
-    print_step(4, "CUDA確認・インストール")
-    required_cuda = detect_required_cuda(gpu_name)
-    print(f"推奨CUDAバージョン: {required_cuda}")
-    ensure_cuda(required_cuda)
+    print_step(4, "Required DLLs")
+    ensure_ort_dlls(Path("./model"))
+
 
     print_step(5, ".pth → model_dynamic.onnx 変換")
     pth_path = input("学習済みモデル(.pth)のパスを入力してください: ").strip().strip('"')
