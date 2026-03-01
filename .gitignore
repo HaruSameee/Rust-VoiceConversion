@@ -37,7 +37,6 @@ logs/
 # ------------------------------------------------------------
 build/
 dist/
-setup.spec
 setup.exe
 .tmp_setup_bin/
 

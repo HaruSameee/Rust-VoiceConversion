@@ -20,13 +20,55 @@ npm --prefix apps/tauri/ui install
 cargo tauri dev
 ```
 
+## User Setup
+For end users, ship the Tauri app together with the `dist/setup/` folder produced by PyInstaller.
+
+Setup flow:
+1. Extract the package.
+2. Run `dist/setup/setup.exe`.
+3. Follow the prompts:
+   - GPU detect
+   - mode selection
+   - required DLL bundle download into `model/`
+   - `.pth -> model_dynamic.onnx`
+   - `added.index -> model_vectors.bin`
+   - `model_vectors_ivf.bin` generation
+4. Start the RustVC app.
+
+Notes:
+- The setup package is `onedir`, not `onefile`.
+- Step 4 no longer depends on system CUDA/cuDNN.
+- Required ONNX Runtime / CUDA / cuDNN DLLs are placed into `model/`.
+- The app is configured to prefer the bundled `model/onnxruntime.dll` instead of random system Python/WebUI copies.
+
+## Build Setup Package
+Build the distributable setup bundle:
+
+```powershell
+cmd /c build.bat
+```
+
+Output:
+```text
+dist/
+└── setup/
+    ├── setup.exe
+    └── _internal/...
+```
+
+Distribute the whole `dist/setup/` directory as a zip. Do not copy only `setup.exe`.
+
 ## Model Setup / Conversion
-- First-time setup (GPU detect + mode + CUDA + conversion): `setup.py`
+- First-time setup bundle: `dist/setup/setup.exe`
+- Developer entrypoint for the same flow: `python setup.py`
 - Convert only when swapping voice model (no full setup rerun): `scripts/convert_model_only.py`
 - Export fixed HuBERT/RMVPE variants (`b12000/b24000/b48000`): `scripts/export_fixed_variants.py`
 
 Examples:
 ```powershell
+# Full interactive setup without the packaged exe
+python setup.py
+
 # Convert .pth only (writes model/model_dynamic.onnx)
 python scripts/convert_model_only.py --pth model\your_model.pth --skip-index
 
@@ -40,6 +82,7 @@ python scripts/export_fixed_variants.py --project-root . --hubert scripts/hubert
 ## Runtime Notes
 - `process_window` is computed in `vc-audio` from block geometry.
 - Playback queue size is controlled by `target_buffer_ms` (independent from process window).
+- Tauri startup validates `model/onnxruntime.dll` and can auto-fetch ONNX Runtime 1.23.0 if the bundle is missing.
 - Tauri startup reads `model/mode.txt` (`12000|24000|48000`) and auto-selects:
   - `hubert_b{block_size}.onnx`
   - `rmvpe_b{block_size}.onnx`
@@ -64,6 +107,7 @@ python scripts/verify_rmvpe_mel_parity.py --input apps/tauri/src-tauri/debug_inp
 ## Git Hygiene
 - Model artifacts and large local assets under `model/` are ignored by `.gitignore`.
 - Local debug dumps (`debug_*.wav`, `mel_parity_*.npy`, logs) are ignored.
+- `setup.spec` is tracked because the packaged setup build depends on it.
 - Before commit, run:
 ```powershell
 cargo check -p vc-inference
