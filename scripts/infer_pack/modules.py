@@ -17,6 +17,75 @@ from lib.infer_pack.transforms import piecewise_rational_quadratic_transform
 LRELU_SLOPE = 0.1
 
 
+class CausalConv1d(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        dilation=1,
+        groups=1,
+        bias=True,
+    ):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.dilation = int(dilation)
+        self.cache_size = max(0, (self.kernel_size - 1) * self.dilation)
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=0,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    @classmethod
+    def from_conv1d(cls, conv: nn.Conv1d):
+        layer = cls(
+            conv.in_channels,
+            conv.out_channels,
+            conv.kernel_size[0],
+            stride=conv.stride[0],
+            dilation=conv.dilation[0],
+            groups=conv.groups,
+            bias=conv.bias is not None,
+        )
+        layer.conv.load_state_dict(conv.state_dict())
+        return layer
+
+    def initial_state(self, batch_size, device=None, dtype=None):
+        if self.cache_size == 0:
+            return torch.zeros(
+                batch_size,
+                self.conv.in_channels,
+                0,
+                device=device,
+                dtype=dtype,
+            )
+        return torch.zeros(
+            batch_size,
+            self.conv.in_channels,
+            self.cache_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x, cache):
+        if self.cache_size > 0:
+            if cache is None or cache.numel() == 0:
+                cache = self.initial_state(x.shape[0], x.device, x.dtype)
+            x_padded = torch.cat([cache, x], dim=2)
+            new_cache = x_padded[:, :, -self.cache_size :]
+        else:
+            x_padded = x
+            new_cache = self.initial_state(x.shape[0], x.device, x.dtype)
+        return self.conv(x_padded), new_cache
+
+
 class LayerNorm(nn.Module):
     def __init__(self, channels, eps=1e-5):
         super().__init__()

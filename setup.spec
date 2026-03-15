@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata, collect_submodules
 
 
 ROOT = Path(SPECPATH).resolve()
@@ -26,15 +26,18 @@ datas += collect_data_files("torch")
 datas += collect_data_files("onnx")
 datas += collect_data_files("onnxscript")
 datas += collect_data_files("faiss")
+datas += collect_data_files("scipy")
 datas += copy_metadata("torch")
 datas += copy_metadata("onnx")
 datas += copy_metadata("onnxscript")
 datas += copy_metadata("faiss-cpu")
+datas += copy_metadata("scipy")
 
 binaries += collect_dynamic_libs("torch")
 binaries += collect_dynamic_libs("onnx")
 binaries += collect_dynamic_libs("onnxscript")
 binaries += collect_dynamic_libs("faiss")
+binaries += collect_dynamic_libs("scipy")
 
 a = Analysis(
     ["setup.py"],
@@ -49,7 +52,7 @@ a = Analysis(
         "faiss",
         "tqdm",
         "requests",
-    ],
+    ] + collect_submodules("scipy"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -60,7 +63,6 @@ a = Analysis(
         "transformers",
         "onnxruntime",
         "numba",
-        "scipy",
         "pandas",
     ],
     noarchive=False,

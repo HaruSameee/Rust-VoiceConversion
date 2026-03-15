@@ -1,3 +1,4 @@
+import copy
 import math, pdb, os
 from time import time as ttime
 import torch
@@ -520,6 +521,266 @@ class GeneratorNSF(torch.nn.Module):
             remove_weight_norm(l)
         for l in self.resblocks:
             l.remove_weight_norm()
+
+
+class StatefulSineGen(torch.nn.Module):
+    def __init__(
+        self,
+        samp_rate,
+        harmonic_num=0,
+        sine_amp=0.1,
+        noise_std=0.003,
+        voiced_threshold=0,
+        output_start=24000,
+    ):
+        super().__init__()
+        self.sine_amp = sine_amp
+        self.noise_std = noise_std
+        self.harmonic_num = harmonic_num
+        self.dim = self.harmonic_num + 1
+        self.sampling_rate = samp_rate
+        self.voiced_threshold = voiced_threshold
+        self.output_start = output_start
+
+    def _f02uv(self, f0):
+        uv = torch.ones_like(f0)
+        uv = uv * (f0 > self.voiced_threshold)
+        return uv
+
+    def forward(self, f0, upp, phase):
+        with torch.no_grad():
+            f0 = f0[:, None].transpose(1, 2)
+            f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
+            f0_buf[:, :, 0] = f0[:, :, 0]
+            for idx in np.arange(self.harmonic_num):
+                f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (idx + 2)
+
+            uv = self._f02uv(f0)
+            uv = F.interpolate(
+                uv.transpose(2, 1), scale_factor=upp, mode="nearest"
+            ).transpose(2, 1)
+
+            f0_up = F.interpolate(
+                f0_buf.transpose(2, 1),
+                scale_factor=upp,
+                mode="linear",
+                align_corners=True,
+            ).transpose(2, 1)
+            phase_inc = f0_up / self.sampling_rate * (2 * np.pi)
+
+            if phase.dim() == 2:
+                phase = phase.unsqueeze(1)
+            phase = phase.to(f0_up.dtype)
+            phase_seq = torch.cumsum(phase_inc, dim=1) + phase
+            phase_out_index = min(
+                max(self.output_start - 1, 0),
+                phase_seq.shape[1] - 1,
+            )
+            new_phase = torch.remainder(phase_seq[:, phase_out_index, :], 2 * np.pi)
+
+            sine_waves = torch.sin(phase_seq) * self.sine_amp
+            noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+            noise = noise_amp * torch.randn_like(sine_waves)
+            sine_waves = sine_waves * uv + noise
+        return sine_waves, uv, noise, new_phase
+
+
+class StatefulSourceModuleHnNSF(torch.nn.Module):
+    def __init__(
+        self,
+        sampling_rate,
+        harmonic_num=0,
+        sine_amp=0.1,
+        add_noise_std=0.003,
+        voiced_threshod=0,
+        is_half=True,
+        output_start=24000,
+    ):
+        super().__init__()
+        self.sine_amp = sine_amp
+        self.noise_std = add_noise_std
+        self.is_half = is_half
+        self.l_sin_gen = StatefulSineGen(
+            sampling_rate,
+            harmonic_num,
+            sine_amp,
+            add_noise_std,
+            voiced_threshod,
+            output_start=output_start,
+        )
+        self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
+        self.l_tanh = torch.nn.Tanh()
+
+    @classmethod
+    def from_source_module(cls, source_module, output_start=24000):
+        layer = cls(
+            source_module.l_sin_gen.sampling_rate,
+            harmonic_num=source_module.l_sin_gen.harmonic_num,
+            sine_amp=source_module.sine_amp,
+            add_noise_std=source_module.noise_std,
+            voiced_threshod=source_module.l_sin_gen.voiced_threshold,
+            is_half=source_module.is_half,
+            output_start=output_start,
+        )
+        layer.l_linear.load_state_dict(source_module.l_linear.state_dict())
+        return layer
+
+    def initial_phase(self, batch_size, device=None, dtype=None):
+        return torch.zeros(
+            batch_size,
+            self.l_sin_gen.dim,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x, phase, upp=None):
+        sine_wavs, uv, _, phase_out = self.l_sin_gen(x, upp, phase)
+        if self.is_half:
+            sine_wavs = sine_wavs.half()
+        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+        return sine_merge, None, None, phase_out
+
+
+class StatefulResBlock1(nn.Module):
+    def __init__(self, convs1, convs2, state_prefix):
+        super().__init__()
+        self.convs1 = convs1
+        self.convs2 = convs2
+        self.state_prefix = state_prefix
+        self.state_specs = []
+        for idx, (conv1, conv2) in enumerate(zip(self.convs1, self.convs2)):
+            self.state_specs.append(
+                (f"{self.state_prefix}_conv1_{idx}", conv1.conv.in_channels, conv1.cache_size)
+            )
+            self.state_specs.append(
+                (f"{self.state_prefix}_conv2_{idx}", conv2.conv.in_channels, conv2.cache_size)
+            )
+
+    @classmethod
+    def from_resblock1(cls, block, state_prefix):
+        convs1 = nn.ModuleList(
+            [modules.CausalConv1d.from_conv1d(conv) for conv in block.convs1]
+        )
+        convs2 = nn.ModuleList(
+            [modules.CausalConv1d.from_conv1d(conv) for conv in block.convs2]
+        )
+        return cls(convs1, convs2, state_prefix)
+
+    def forward(self, x, states_in):
+        states_out = []
+        pos = 0
+        for c1, c2 in zip(self.convs1, self.convs2):
+            xt = F.leaky_relu(x, modules.LRELU_SLOPE)
+            xt, cache1 = c1(xt, states_in[pos])
+            states_out.append(cache1)
+            pos += 1
+
+            xt = F.leaky_relu(xt, modules.LRELU_SLOPE)
+            xt, cache2 = c2(xt, states_in[pos])
+            states_out.append(cache2)
+            pos += 1
+
+            x = xt + x
+        return x, states_out
+
+
+class StatefulGeneratorNSF(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @classmethod
+    def from_generatornsf(cls, generator, output_start_samples=24000):
+        if generator.num_kernels != 3 or generator.num_upsamples != 5:
+            raise RuntimeError("stateful generator export is only implemented for v2/48k fixed layout")
+
+        obj = cls()
+        obj.num_kernels = generator.num_kernels
+        obj.num_upsamples = generator.num_upsamples
+        obj.upp = generator.upp
+        obj.m_source = StatefulSourceModuleHnNSF.from_source_module(
+            generator.m_source,
+            output_start=output_start_samples,
+        )
+        obj.conv_pre = copy.deepcopy(generator.conv_pre)
+        obj.ups = nn.ModuleList([copy.deepcopy(layer) for layer in generator.ups])
+        obj.noise_convs = nn.ModuleList([copy.deepcopy(conv) for conv in generator.noise_convs])
+        obj.resblocks = nn.ModuleList([copy.deepcopy(block) for block in generator.resblocks])
+        obj.conv_post = copy.deepcopy(generator.conv_post)
+        if hasattr(generator, "cond"):
+            obj.cond = copy.deepcopy(generator.cond)
+        obj.state_names = ["nsf_phase"]
+        return obj
+
+    def initial_state_tensors(self, batch_size, device=None, dtype=None):
+        return [self.m_source.initial_phase(batch_size, device=device, dtype=dtype)]
+
+    def forward(self, x, f0, phase=None, g=None):
+        if phase is None:
+            phase = self.initial_state_tensors(x.shape[0], x.device, x.dtype)[0]
+
+        phase_in = phase
+        har_source, _, _, phase_out = self.m_source(f0, phase_in, self.upp)
+        har_source = har_source.transpose(1, 2)
+        x = self.conv_pre(x)
+
+        if g is not None:
+            x = x + self.cond(g)
+
+        for i in range(self.num_upsamples):
+            x = F.leaky_relu(x, modules.LRELU_SLOPE)
+            x = self.ups[i](x)
+            x_source = self.noise_convs[i](har_source)
+            x = x + x_source
+
+            xs = None
+            for j in range(self.num_kernels):
+                block_out = self.resblocks[i * self.num_kernels + j](x)
+                if xs is None:
+                    xs = block_out
+                else:
+                    xs += block_out
+            x = xs / self.num_kernels
+
+        x = F.leaky_relu(x)
+        x = self.conv_post(x)
+        x = torch.tanh(x)
+        return x, phase_out
+
+
+class StatefulSynthesizerTrnMsNSFsidM(nn.Module):
+    def __init__(self, base_model, output_start_samples=24000):
+        super().__init__()
+        self.enc_p = base_model.enc_p
+        self.flow = base_model.flow
+        self.emb_g = base_model.emb_g
+        self.dec = StatefulGeneratorNSF.from_generatornsf(
+            base_model.dec,
+            output_start_samples=output_start_samples,
+        )
+        self.speaker_map = base_model.speaker_map
+        self.gin_channels = base_model.gin_channels
+        self.spk_embed_dim = base_model.spk_embed_dim
+        self.state_names = self.dec.state_names
+
+    def initial_state_tensors(self, batch_size, device=None, dtype=None):
+        return self.dec.initial_state_tensors(batch_size, device=device, dtype=dtype)
+
+    def forward(self, phone, phone_lengths, pitch, nsff0, g, rnd, *states, max_len=None):
+        if self.speaker_map is not None:
+            g = g.reshape((g.shape[0], g.shape[1], 1, 1, 1))
+            g = g * self.speaker_map
+            g = torch.sum(g, dim=1)
+            g = g.transpose(0, -1).transpose(0, -2).squeeze(0)
+        else:
+            g = g.unsqueeze(0)
+            g = self.emb_g(g).transpose(1, 2)
+
+        m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+        z_p = (m_p + torch.exp(logs_p) * rnd) * x_mask
+        z = self.flow(z_p, x_mask, g=g, reverse=True)
+        phase_state = states[0] if len(states) > 0 else None
+        out = self.dec((z * x_mask)[:, :, :max_len], nsff0, phase_state, g)
+        return out
 
 
 sr2sr = {

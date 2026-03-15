@@ -46,7 +46,7 @@ def configure_paths():
     sys.modules["lib.infer_pack"] = infer_pack
 
 
-def export_generator(pth_path: str, out_path: str):
+def load_generator_checkpoint(pth_path: str):
     import torch
 
     patch_torch_load()
@@ -71,8 +71,13 @@ def export_generator(pth_path: str, out_path: str):
     if unexpected:
         print(f"[generator] 警告: 余剰キーがあります（先頭5件）: {unexpected[:5]}")
     model.eval().remove_weight_norm()
+    return model, sd, version
 
-    n_frames = 100
+
+def build_generator_inputs(sd, version, block_size_samples=24000):
+    import torch
+
+    n_frames = block_size_samples // 240
     if "enc_p.emb_phone.weight" in sd:
         hidden_dim = int(sd["enc_p.emb_phone.weight"].shape[1])
     else:
@@ -84,9 +89,15 @@ def export_generator(pth_path: str, out_path: str):
     pitchf = torch.zeros(1, n_frames)
     sid = torch.zeros(1, dtype=torch.long)
     rnd = torch.zeros(1, 192, n_frames)
+    return phone, phone_l, pitch, pitchf, sid, rnd
+
+
+def export_dynamic_generator(model, out_path: str, export_inputs):
+    import torch
 
     import warnings
 
+    phone, phone_l, pitch, pitchf, sid, rnd = export_inputs
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         torch.onnx.export(
@@ -108,6 +119,93 @@ def export_generator(pth_path: str, out_path: str):
             do_constant_folding=True,
             dynamo=False,
         )
+
+    print(f"[generator] dynamic -> {out_path}")
+
+
+def export_stateful_generator(
+    model, out_path: str, export_inputs, block_size_samples=24000
+):
+    import torch
+
+    from infer_pack.models_onnx import StatefulSynthesizerTrnMsNSFsidM
+
+    phone, phone_l, pitch, pitchf, sid, rnd = export_inputs
+    stateful_model = StatefulSynthesizerTrnMsNSFsidM(
+        model,
+        output_start_samples=block_size_samples,
+    )
+    state_inputs = stateful_model.initial_state_tensors(
+        batch_size=phone.shape[0],
+        device=phone.device,
+        dtype=phone.dtype,
+    )
+    input_names = ["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd"]
+    input_names.extend([f"state_{name}_in" for name in stateful_model.state_names])
+    output_names = ["audio"]
+    output_names.extend([f"state_{name}_out" for name in stateful_model.state_names])
+    dynamic_axes = {
+        "phone": {0: "batch", 1: "n_frames"},
+        "phone_lengths": {0: "batch"},
+        "pitch": {0: "batch", 1: "n_frames"},
+        "pitchf": {0: "batch", 1: "n_frames"},
+        "sid": {0: "batch"},
+        "rnd": {0: "batch", 2: "n_frames"},
+        "audio": {0: "batch", 2: "n_samples"},
+    }
+    for name, state in zip(input_names[6:], state_inputs):
+        if state.dim() >= 1:
+            dynamic_axes[name] = {0: "batch"}
+    for name, state in zip(output_names[1:], state_inputs):
+        if state.dim() >= 1:
+            dynamic_axes[name] = {0: "batch"}
+
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torch.onnx.export(
+            stateful_model,
+            args=(phone, phone_l, pitch, pitchf, sid, rnd, *state_inputs),
+            f=out_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=18,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+
+    print(f"[generator] stateful -> {out_path}")
+
+
+def export_generator(pth_path: str, out_path: str):
+    model, sd, version = load_generator_checkpoint(pth_path)
+    export_inputs = build_generator_inputs(sd, version)
+    export_dynamic_generator(model, out_path, export_inputs)
+    for block_size in (24000, 48000):
+        stateful_inputs = build_generator_inputs(
+            sd,
+            version,
+            block_size_samples=block_size,
+        )
+        stateful_out_path = str(
+            Path(out_path).with_name(f"model_stateful_b{block_size}.onnx")
+        )
+        export_stateful_generator(
+            model,
+            stateful_out_path,
+            stateful_inputs,
+            block_size_samples=block_size,
+        )
+
+    legacy_stateful_out_path = str(Path(out_path).with_name("model_stateful.onnx"))
+    export_stateful_generator(
+        model,
+        legacy_stateful_out_path,
+        build_generator_inputs(sd, version, block_size_samples=24000),
+        block_size_samples=24000,
+    )
 
 
 def main():

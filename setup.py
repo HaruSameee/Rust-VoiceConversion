@@ -36,19 +36,36 @@ if BASE_DIR not in sys.path:
 STEP_LABEL_TOTAL = 6
 
 ORT_VERSION = "1.23.0"
-ORT_PACKAGE_URL = (
+ORT_CUDA_PACKAGE_URL = (
     "https://github.com/microsoft/onnxruntime/releases/download/"
     "v1.23.0/onnxruntime-win-x64-gpu-1.23.0.zip"
 )
-ORT_REQUIRED_DLLS = [
+ORT_DML_PACKAGE_URL = (
+    "https://www.nuget.org/api/v2/package/"
+    "Microsoft.ML.OnnxRuntime.DirectML/1.23.0"
+)
+DIRECTML_RUNTIME_PACKAGE_URL = (
+    "https://www.nuget.org/api/v2/package/"
+    "Microsoft.AI.DirectML/1.15.4"
+)
+ORT_CUDA_REQUIRED_DLLS = [
     "onnxruntime.dll",
     "onnxruntime_providers_cuda.dll",
     "onnxruntime_providers_shared.dll",
+]
+ORT_CUDA_OPTIONAL_REMOVE_DLLS = [
     "onnxruntime_providers_tensorrt.dll",
+]
+ORT_DIRECTML_REQUIRED_DLLS = [
+    "onnxruntime.dll",
+    "onnxruntime_providers_shared.dll",
+    "DirectML.dll",
 ]
 CUDA_PACKAGE_URLS = {
     "cuda_cudart": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip",
     "libcublas": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
+    "libcublas11": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-11.11.3.6-archive.zip",
+    "cuda_nvrtc11": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-11.8.89-archive.zip",
     "libcufft": "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.2.1.3-archive.zip",
     "libcurand": "https://developer.download.nvidia.com/compute/cuda/redist/libcurand/windows-x86_64/libcurand-windows-x86_64-10.3.5.147-archive.zip",
     "libcusolver": "https://developer.download.nvidia.com/compute/cuda/redist/libcusolver/windows-x86_64/libcusolver-windows-x86_64-11.6.1.9-archive.zip",
@@ -58,6 +75,11 @@ CUDA_REQUIRED_DLLS = [
     "cudart64_12.dll",
     "cublas64_12.dll",
     "cublasLt64_12.dll",
+    # cuDNN 9.x runtime in this bundle may still lazily request CUDA 11 cublas/nvrtc names.
+    "cublas64_11.dll",
+    "cublasLt64_11.dll",
+    "nvrtc64_112_0.dll",
+    "nvrtc-builtins64_118.dll",
     "cufft64_11.dll",
     "curand64_10.dll",
     "cusolver64_11.dll",
@@ -350,6 +372,7 @@ def parse_version_tuple(raw: str) -> Tuple[int, int, int]:
 
 
 def get_onnxruntime_version_from_dll(path: Path) -> str:
+    path = path.resolve()
     handle = None
     try:
         if hasattr(os, "add_dll_directory"):
@@ -385,22 +408,57 @@ def remove_existing_files(model_dir: Path, names) -> None:
             path.unlink()
 
 
-def extract_dlls_from_zip(zip_path: Path, dest_dir: Path, required_names) -> None:
-    required_lower = {name.lower() for name in required_names}
-    extracted = set()
+def download_file(url: str, dest_path: str) -> None:
+    with requests.get(url, stream=True, timeout=30) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("content-length", "0"))
+        with open(dest_path, "wb") as fp, tqdm(
+            total=total,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc="Downloading",
+        ) as bar:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                fp.write(chunk)
+                bar.update(len(chunk))
+
+
+def extract_dlls_from_zip(zip_path: Path, dest_dir: Path, required_names, preferred_roots=None) -> None:
+    required_lower = {name.lower(): name for name in required_names}
+    preferred_roots = [
+        root.replace("\\", "/").rstrip("/") + "/"
+        for root in (preferred_roots or [])
+    ]
+    selected: dict[str, zipfile.ZipInfo] = {}
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
             if info.is_dir():
                 continue
-            member_name = Path(info.filename).name
+            normalized = info.filename.replace("\\", "/")
+            if preferred_roots and not any(
+                normalized.startswith(root) for root in preferred_roots
+            ):
+                continue
+            member_name = Path(normalized).name
             if not member_name.lower().endswith(".dll"):
                 continue
-            target = dest_dir / member_name
+            key = member_name.lower()
+            if key not in required_lower:
+                continue
+            selected.setdefault(key, info)
+
+        for key, required_name in required_lower.items():
+            info = selected.get(key)
+            if info is None:
+                continue
+            target = dest_dir / required_name
             with zf.open(info, "r") as src, target.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
-            extracted.add(member_name.lower())
 
-    missing = [name for name in required_names if name.lower() not in extracted and not (dest_dir / name).exists()]
+    missing = [name for name in required_names if not (dest_dir / name).exists()]
     if missing:
         raise RuntimeError(
             f"required DLLs were not found in zip: {', ' .join(missing)} ({zip_path.name})"
@@ -416,10 +474,29 @@ def download_package(url: str, temp_root: Path, label: str) -> Path:
     return dest
 
 
-def ensure_ort_dlls(model_dir: Path) -> None:
-    model_dir.mkdir(parents=True, exist_ok=True)
+def move_file_if_present(src: Path, dst: Path) -> None:
+    if not src.exists() or dst.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(src), str(dst))
+    except Exception:
+        shutil.copy2(src, dst)
+        src.unlink(missing_ok=True)
 
-    ort_dll = model_dir / "onnxruntime.dll"
+
+def migrate_legacy_cuda_bundle(model_dir: Path, bundle_dir: Path) -> None:
+    names = ORT_CUDA_REQUIRED_DLLS + CUDA_REQUIRED_DLLS + CUDNN_REQUIRED_DLLS
+    for name in names:
+        move_file_if_present(model_dir / name, bundle_dir / name)
+
+
+def ensure_ort_cuda_bundle(model_dir: Path, bundle_dir: Path) -> None:
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    migrate_legacy_cuda_bundle(model_dir, bundle_dir)
+    remove_existing_files(bundle_dir, ORT_CUDA_OPTIONAL_REMOVE_DLLS)
+
+    ort_dll = bundle_dir / "onnxruntime.dll"
     ort_needs_refresh = not ort_dll.exists()
     if ort_dll.exists():
         try:
@@ -433,12 +510,14 @@ def ensure_ort_dlls(model_dir: Path) -> None:
             ort_needs_refresh = True
 
     if ort_needs_refresh:
-        remove_existing_files(model_dir, ORT_REQUIRED_DLLS)
+        remove_existing_files(bundle_dir, ORT_CUDA_REQUIRED_DLLS)
 
-    ort_missing = collect_missing_dlls(model_dir, ORT_REQUIRED_DLLS)
+    ort_missing = collect_missing_dlls(bundle_dir, ORT_CUDA_REQUIRED_DLLS)
     cuda_package_map = {
         "cuda_cudart": ["cudart64_12.dll"],
         "libcublas": ["cublas64_12.dll", "cublasLt64_12.dll"],
+        "libcublas11": ["cublas64_11.dll", "cublasLt64_11.dll"],
+        "cuda_nvrtc11": ["nvrtc64_112_0.dll", "nvrtc-builtins64_118.dll"],
         "libcufft": ["cufft64_11.dll"],
         "libcurand": ["curand64_10.dll"],
         "libcusolver": ["cusolver64_11.dll"],
@@ -447,42 +526,128 @@ def ensure_ort_dlls(model_dir: Path) -> None:
     cuda_missing_packages = [
         key
         for key, names in cuda_package_map.items()
-        if collect_missing_dlls(model_dir, names)
+        if collect_missing_dlls(bundle_dir, names)
     ]
-    cudnn_missing = collect_missing_dlls(model_dir, CUDNN_REQUIRED_DLLS)
+    cudnn_missing = collect_missing_dlls(bundle_dir, CUDNN_REQUIRED_DLLS)
 
     if not ort_missing and not cuda_missing_packages and not cudnn_missing:
-        print("  all required DLLs are already present in model/")
+        print("  all required CUDA DLLs are already present in model/ort_cuda")
         return
 
     with tempfile.TemporaryDirectory(prefix="rustvc_ort_") as temp_dir:
         temp_root = Path(temp_dir)
 
         if ort_missing:
-            zip_path = download_package(ORT_PACKAGE_URL, temp_root, "ONNX Runtime 1.23.0")
-            print("  extracting onnxruntime DLLs...")
-            extract_dlls_from_zip(zip_path, model_dir, ORT_REQUIRED_DLLS)
+            zip_path = download_package(ORT_CUDA_PACKAGE_URL, temp_root, "ONNX Runtime CUDA 1.23.0")
+            print("  extracting onnxruntime CUDA DLLs...")
+            extract_dlls_from_zip(zip_path, bundle_dir, ORT_CUDA_REQUIRED_DLLS)
 
         for package_key in cuda_missing_packages:
             zip_path = download_package(CUDA_PACKAGE_URLS[package_key], temp_root, package_key)
             print(f"  extracting DLLs from {package_key}...")
-            extract_dlls_from_zip(zip_path, model_dir, cuda_package_map[package_key])
+            extract_dlls_from_zip(zip_path, bundle_dir, cuda_package_map[package_key])
 
         if cudnn_missing:
             zip_path = download_package(CUDNN_PACKAGE_URL, temp_root, "cuDNN 9.1.1")
             print("  extracting cuDNN DLLs...")
-            extract_dlls_from_zip(zip_path, model_dir, CUDNN_REQUIRED_DLLS)
+            extract_dlls_from_zip(zip_path, bundle_dir, CUDNN_REQUIRED_DLLS)
 
-    all_required = ORT_REQUIRED_DLLS + CUDA_REQUIRED_DLLS + CUDNN_REQUIRED_DLLS
-    missing = collect_missing_dlls(model_dir, all_required)
+    all_required = ORT_CUDA_REQUIRED_DLLS + CUDA_REQUIRED_DLLS + CUDNN_REQUIRED_DLLS
+    missing = collect_missing_dlls(bundle_dir, all_required)
     if missing:
-        raise RuntimeError(f"failed to place required DLLs into model/: {', ' .join(missing)}")
+        raise RuntimeError(
+            f"failed to place required CUDA DLLs into {bundle_dir}: {', ' .join(missing)}"
+        )
 
-    version = get_onnxruntime_version_from_dll(model_dir / 'onnxruntime.dll')
+    version = get_onnxruntime_version_from_dll(bundle_dir / "onnxruntime.dll")
     if not is_supported_ort_version(version):
         raise RuntimeError(f"onnxruntime.dll version is still unsupported after refresh: {version}")
 
-    print(f"  onnxruntime {version} and all required DLLs were placed in model/")
+    print(f"  onnxruntime {version} and all required CUDA DLLs were placed in {bundle_dir}")
+
+
+def ensure_ort_dml_bundle(bundle_dir: Path) -> None:
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    ort_dll = bundle_dir / "onnxruntime.dll"
+    ort_needs_refresh = not ort_dll.exists()
+    if ort_dll.exists():
+        try:
+            version = get_onnxruntime_version_from_dll(ort_dll)
+            print(f"  existing DirectML onnxruntime.dll: {version}")
+            if not is_supported_ort_version(version):
+                print(f"  replacing old DirectML onnxruntime.dll: {version}")
+                ort_needs_refresh = True
+        except Exception as exc:
+            print(f"  warning: failed to inspect DirectML onnxruntime.dll, refreshing bundle: {exc}")
+            ort_needs_refresh = True
+
+    ort_core_missing = collect_missing_dlls(
+        bundle_dir, ["onnxruntime.dll", "onnxruntime_providers_shared.dll"]
+    )
+    dml_runtime_missing = collect_missing_dlls(bundle_dir, ["DirectML.dll"])
+
+    if ort_needs_refresh:
+        remove_existing_files(
+            bundle_dir,
+            ["onnxruntime.dll", "onnxruntime_providers_shared.dll"],
+        )
+        ort_core_missing = ["onnxruntime.dll", "onnxruntime_providers_shared.dll"]
+
+    if not ort_core_missing and not dml_runtime_missing:
+        print("  all required DirectML DLLs are already present in model/ort_dml")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="rustvc_ort_dml_") as temp_dir:
+        temp_root = Path(temp_dir)
+
+        if ort_core_missing:
+            zip_path = download_package(
+                ORT_DML_PACKAGE_URL,
+                temp_root,
+                "ONNX Runtime DirectML 1.23.0",
+            )
+            print("  extracting DirectML ORT DLLs...")
+            extract_dlls_from_zip(
+                zip_path,
+                bundle_dir,
+                ["onnxruntime.dll", "onnxruntime_providers_shared.dll"],
+                preferred_roots=["runtimes/win-x64/native"],
+            )
+
+        if dml_runtime_missing:
+            zip_path = download_package(
+                DIRECTML_RUNTIME_PACKAGE_URL,
+                temp_root,
+                "DirectML runtime 1.15.4",
+            )
+            print("  extracting DirectML runtime DLLs...")
+            extract_dlls_from_zip(
+                zip_path,
+                bundle_dir,
+                ["DirectML.dll"],
+                preferred_roots=["bin/x64-win"],
+            )
+
+    missing = collect_missing_dlls(bundle_dir, ORT_DIRECTML_REQUIRED_DLLS)
+    if missing:
+        raise RuntimeError(
+            f"failed to place required DirectML DLLs into {bundle_dir}: {', ' .join(missing)}"
+        )
+
+    version = get_onnxruntime_version_from_dll(bundle_dir / "onnxruntime.dll")
+    if not is_supported_ort_version(version):
+        raise RuntimeError(
+            f"DirectML onnxruntime.dll version is still unsupported after refresh: {version}"
+        )
+
+    print(f"  onnxruntime {version} and all required DirectML DLLs were placed in {bundle_dir}")
+
+
+def ensure_ort_dlls(model_dir: Path) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    ensure_ort_cuda_bundle(model_dir, model_dir / "ort_cuda")
+    ensure_ort_dml_bundle(model_dir / "ort_dml")
 
 
 def export_generator(pth_path: str, out_path: str) -> None:
@@ -492,7 +657,10 @@ def export_generator(pth_path: str, out_path: str) -> None:
     _configure_script_module_paths()
 
     try:
-        from infer_pack.models_onnx import SynthesizerTrnMsNSFsidM
+        from infer_pack.models_onnx import (
+            StatefulSynthesizerTrnMsNSFsidM,
+            SynthesizerTrnMsNSFsidM,
+        )
     except Exception as e:
         raise RuntimeError(f"infer_pack.models_onnx の読み込みに失敗しました: {e}") from e
 
@@ -515,21 +683,24 @@ def export_generator(pth_path: str, out_path: str) -> None:
         print(f"[generator] 警告: 余剰キーがあります（先頭5件）: {unexpected[:5]}")
     model.eval().remove_weight_norm()
 
-    n_frames = 100
-    if "enc_p.emb_phone.weight" in sd:
-        hidden_dim = int(sd["enc_p.emb_phone.weight"].shape[1])
-    else:
-        hidden_dim = 768 if version == "v2" else 256
+    def build_generator_inputs(block_size_samples: int = 24000):
+        n_frames = block_size_samples // 240
+        if "enc_p.emb_phone.weight" in sd:
+            hidden_dim = int(sd["enc_p.emb_phone.weight"].shape[1])
+        else:
+            hidden_dim = 768 if version == "v2" else 256
 
-    phone = torch.zeros(1, n_frames, hidden_dim)
-    phone_l = torch.LongTensor([n_frames])
-    pitch = torch.zeros(1, n_frames, dtype=torch.long)
-    pitchf = torch.zeros(1, n_frames)
-    sid = torch.zeros(1, dtype=torch.long)
-    rnd = torch.zeros(1, 192, n_frames)
+        phone = torch.zeros(1, n_frames, hidden_dim)
+        phone_l = torch.LongTensor([n_frames])
+        pitch = torch.zeros(1, n_frames, dtype=torch.long)
+        pitchf = torch.zeros(1, n_frames)
+        sid = torch.zeros(1, dtype=torch.long)
+        rnd = torch.zeros(1, 192, n_frames)
+        return phone, phone_l, pitch, pitchf, sid, rnd
 
     import warnings
 
+    phone, phone_l, pitch, pitchf, sid, rnd = build_generator_inputs()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         torch.onnx.export(
@@ -553,6 +724,67 @@ def export_generator(pth_path: str, out_path: str) -> None:
         )
 
     print(f"[generator] -> {out_path}")
+    def export_stateful_generator(stateful_out_path: str, block_size_samples: int):
+        phone, phone_l, pitch, pitchf, sid, rnd = build_generator_inputs(
+            block_size_samples
+        )
+        stateful_model = StatefulSynthesizerTrnMsNSFsidM(
+            model,
+            output_start_samples=block_size_samples,
+        )
+        state_inputs = stateful_model.initial_state_tensors(
+            batch_size=phone.shape[0],
+            device=phone.device,
+            dtype=phone.dtype,
+        )
+        state_input_names = [f"state_{name}_in" for name in stateful_model.state_names]
+        state_output_names = [f"state_{name}_out" for name in stateful_model.state_names]
+        dynamic_axes = {
+            "phone": {0: "batch", 1: "n_frames"},
+            "phone_lengths": {0: "batch"},
+            "pitch": {0: "batch", 1: "n_frames"},
+            "pitchf": {0: "batch", 1: "n_frames"},
+            "sid": {0: "batch"},
+            "rnd": {0: "batch", 2: "n_frames"},
+            "audio": {0: "batch", 2: "n_samples"},
+        }
+        for name, tensor in zip(state_input_names, state_inputs):
+            if tensor.dim() >= 1:
+                dynamic_axes[name] = {0: "batch"}
+        for name, tensor in zip(state_output_names, state_inputs):
+            if tensor.dim() >= 1:
+                dynamic_axes[name] = {0: "batch"}
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch.onnx.export(
+                stateful_model,
+                args=(phone, phone_l, pitch, pitchf, sid, rnd, *state_inputs),
+                f=stateful_out_path,
+                input_names=[
+                    "phone",
+                    "phone_lengths",
+                    "pitch",
+                    "pitchf",
+                    "sid",
+                    "rnd",
+                    *state_input_names,
+                ],
+                output_names=["audio", *state_output_names],
+                dynamic_axes=dynamic_axes,
+                opset_version=18,
+                do_constant_folding=True,
+                dynamo=False,
+            )
+
+        print(f"[generator] stateful -> {stateful_out_path}")
+
+    for block_size in (24000, 48000):
+        export_stateful_generator(
+            str(Path(out_path).with_name(f"model_stateful_b{block_size}.onnx")),
+            block_size,
+        )
+    export_stateful_generator(str(Path(out_path).with_name("model_stateful.onnx")), 24000)
 
 
 def convert_index_to_bin(index_path: str, out_path: str) -> Tuple[int, int]:

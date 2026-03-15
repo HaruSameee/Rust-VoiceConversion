@@ -72,13 +72,119 @@ impl Default for OrtSetupState {
 }
 
 const ORT_VERSION: &str = "1.23.0";
-const ORT_DOWNLOAD_URL: &str =
+const ORT_CUDA_DOWNLOAD_URL: &str =
     "https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-win-x64-gpu-1.23.0.zip";
-const ORT_REQUIRED_DLLS: &[&str] = &[
+const ORT_DML_DOWNLOAD_URL: &str =
+    "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.23.0";
+const DIRECTML_RUNTIME_DOWNLOAD_URL: &str =
+    "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.15.4";
+const ORT_CUDA_REQUIRED_DLLS: &[&str] = &[
     "onnxruntime.dll",
     "onnxruntime_providers_cuda.dll",
     "onnxruntime_providers_shared.dll",
 ];
+const ORT_CUDA_OPTIONAL_REMOVE_DLLS: &[&str] = &["onnxruntime_providers_tensorrt.dll"];
+const ORT_DML_REQUIRED_DLLS: &[&str] = &["onnxruntime.dll", "onnxruntime_providers_shared.dll"];
+const DIRECTML_RUNTIME_REQUIRED_DLLS: &[&str] = &["DirectML.dll"];
+const CUDA_REQUIRED_DLLS: &[&str] = &[
+    "cudart64_12.dll",
+    "cublas64_12.dll",
+    "cublasLt64_12.dll",
+    // cuDNN 9.x runtime in this bundle may still lazily request CUDA 11 cublas/nvrtc names.
+    "cublas64_11.dll",
+    "cublasLt64_11.dll",
+    "nvrtc64_112_0.dll",
+    "nvrtc-builtins64_118.dll",
+    "cufft64_11.dll",
+    "curand64_10.dll",
+    "cusolver64_11.dll",
+    "cusparse64_12.dll",
+];
+const CUDNN_REQUIRED_DLLS: &[&str] = &[
+    "cudnn64_9.dll",
+    "cudnn_adv64_9.dll",
+    "cudnn_cnn64_9.dll",
+    "cudnn_engines_precompiled64_9.dll",
+    "cudnn_engines_runtime_compiled64_9.dll",
+    "cudnn_graph64_9.dll",
+    "cudnn_heuristic64_9.dll",
+    "cudnn_ops64_9.dll",
+];
+
+struct RuntimeDllBundle {
+    label: &'static str,
+    url: &'static str,
+    download_status: &'static str,
+    extract_status: &'static str,
+    dlls: &'static [&'static str],
+}
+
+const CUDA_REDIST_BUNDLES: &[RuntimeDllBundle] = &[
+    RuntimeDllBundle {
+        label: "CUDA Runtime",
+        url: "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip",
+        download_status: "downloading_cuda",
+        extract_status: "extracting_cuda",
+        dlls: &["cudart64_12.dll"],
+    },
+    RuntimeDllBundle {
+        label: "cuBLAS",
+        url: "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.4.5.8-archive.zip",
+        download_status: "downloading_cuda",
+        extract_status: "extracting_cuda",
+        dlls: &["cublas64_12.dll", "cublasLt64_12.dll"],
+    },
+    RuntimeDllBundle {
+        label: "cuBLAS (compat CUDA11 names)",
+        url: "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-11.11.3.6-archive.zip",
+        download_status: "downloading_cuda",
+        extract_status: "extracting_cuda",
+        dlls: &["cublas64_11.dll", "cublasLt64_11.dll"],
+    },
+    RuntimeDllBundle {
+        label: "NVRTC (compat CUDA11 names)",
+        url: "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-11.8.89-archive.zip",
+        download_status: "downloading_cuda",
+        extract_status: "extracting_cuda",
+        dlls: &["nvrtc64_112_0.dll", "nvrtc-builtins64_118.dll"],
+    },
+    RuntimeDllBundle {
+        label: "cuFFT",
+        url: "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/windows-x86_64/libcufft-windows-x86_64-11.2.1.3-archive.zip",
+        download_status: "downloading_cuda",
+        extract_status: "extracting_cuda",
+        dlls: &["cufft64_11.dll"],
+    },
+    RuntimeDllBundle {
+        label: "cuRAND",
+        url: "https://developer.download.nvidia.com/compute/cuda/redist/libcurand/windows-x86_64/libcurand-windows-x86_64-10.3.5.147-archive.zip",
+        download_status: "downloading_cuda",
+        extract_status: "extracting_cuda",
+        dlls: &["curand64_10.dll"],
+    },
+    RuntimeDllBundle {
+        label: "cuSOLVER",
+        url: "https://developer.download.nvidia.com/compute/cuda/redist/libcusolver/windows-x86_64/libcusolver-windows-x86_64-11.6.1.9-archive.zip",
+        download_status: "downloading_cuda",
+        extract_status: "extracting_cuda",
+        dlls: &["cusolver64_11.dll"],
+    },
+    RuntimeDllBundle {
+        label: "cuSPARSE",
+        url: "https://developer.download.nvidia.com/compute/cuda/redist/libcusparse/windows-x86_64/libcusparse-windows-x86_64-12.3.1.170-archive.zip",
+        download_status: "downloading_cuda",
+        extract_status: "extracting_cuda",
+        dlls: &["cusparse64_12.dll"],
+    },
+];
+
+const CUDNN_REDIST_BUNDLES: &[RuntimeDllBundle] = &[RuntimeDllBundle {
+    label: "cuDNN 9.1",
+    url: "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.1.1.17_cuda12-archive.zip",
+    download_status: "downloading_cudnn",
+    extract_status: "extracting_cudnn",
+    dlls: CUDNN_REQUIRED_DLLS,
+}];
 static ORT_SETUP_STATE: OnceLock<Mutex<OrtSetupState>> = OnceLock::new();
 
 fn now_millis() -> u64 {
@@ -495,7 +601,6 @@ fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
     run_panic_safe("start_engine_cmd", || {
         log_debug("start_engine_cmd");
         emit_log(&app, "info", "start_engine_cmd");
-        let _ = ensure_ort_dylib_path();
         let (mut runtime_config, model_raw) = {
             let mut guard = state.lock_runtime();
             if guard.running {
@@ -522,9 +627,12 @@ fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
         }
         let model = resolve_model_config_for_start(model_raw)?;
         apply_mode_selection(&model, &mut runtime_config);
+        let model_dir = resolve_model_dir();
+        let ort_dylib = ensure_ort_dylib_path_for_provider(&model_dir, &runtime_config.ort_provider)?;
         log_debug(&format!(
-            "ORT_DYLIB_PATH={:?}",
-            std::env::var("ORT_DYLIB_PATH").ok()
+            "ORT_DYLIB_PATH={:?} provider_bundle={}",
+            std::env::var("ORT_DYLIB_PATH").ok(),
+            ort_dylib
         ));
         log_debug(&format!(
             "start with model={} hubert={:?} rmvpe={:?} index={:?} sr={} block={} in_dev={:?} out_dev={:?} extra_ms={} target_buffer_ms={} threshold={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate_db={:.1} fade_in_ms={} fade_out_ms={} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={} pitch_shift={:.2} index_rate={} index_smooth={:.2} top_k={} rows={} nprobe={} index_provider={} protect={:.2} rmvpe_th={:.3} pitch_smooth={:.2} rms_mix={:.2} post_filter={:.3} f0_med_r={} ort_provider={} ort_dev={} ort_vram_mb={} ort_threads={}/{} ort_parallel={} hubert_ctx_sec={:.2} hubert_ctx_16k={} hubert_layer={} hubert_up={} cuda_conv_algo={} cuda_ws={} cuda_pad_nc1d={} cuda_tf32={} index_bin_dim={} index_max_vectors={}",
@@ -585,6 +693,10 @@ fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
             runtime_config.index_max_vectors
         ));
         let infer_engine = RvcOrtEngine::new(model, &runtime_config).map_err(|e| e.to_string())?;
+        let stateful_generator_model = infer_engine
+            .model_path()
+            .to_ascii_lowercase()
+            .contains("stateful");
         let voice_changer = VoiceChanger::new(infer_engine, runtime_config.clone());
         // Compatibility plumbing only; vc-audio currently runs with fixed process_window.
         let allow_process_window_grow = false;
@@ -613,6 +725,7 @@ fn start_engine_cmd(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
                 output_tail_offset_ms: runtime_config.output_tail_offset_ms,
                 output_slice_offset_samples: runtime_config.output_slice_offset_samples,
                 bypass_slicing: runtime_config.bypass_slicing,
+                stateful_generator_model,
                 record_dump: runtime_config.record_dump,
             },
         )
@@ -977,8 +1090,24 @@ fn apply_mode_selection(model: &ModelConfig, runtime_config: &mut RuntimeConfig)
     let model_path = Path::new(&model.model_path);
     let model_dir = model_path.parent().unwrap_or(Path::new("."));
     let mode_block_size = read_mode_block_size(model_dir);
+    let configured_block_size = runtime_config.block_size;
+    if matches!(configured_block_size, 12_000 | 24_000 | 48_000) {
+        if configured_block_size == mode_block_size {
+            log_debug(&format!("mode.txt: block_size={mode_block_size}"));
+        } else {
+            log_debug(&format!(
+                "mode.txt ignored: block_size={} (runtime block_size={})",
+                mode_block_size, configured_block_size
+            ));
+        }
+        return;
+    }
+
     runtime_config.block_size = mode_block_size;
-    log_debug(&format!("mode.txt: block_size={}", mode_block_size));
+    log_debug(&format!(
+        "mode.txt applied: block_size={} (runtime block_size was {})",
+        mode_block_size, configured_block_size
+    ));
 }
 
 fn resolve_model_config_for_start(mut model: ModelConfig) -> Result<ModelConfig, String> {
@@ -1184,10 +1313,27 @@ fn is_supported_ort_version(raw: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn existing_ort_version_is_supported(path: &str) -> bool {
-    get_onnxruntime_version_from_dll(Path::new(path))
-        .map(|version| is_supported_ort_version(&version))
-        .unwrap_or(false)
+fn ort_cuda_bundle_dir(model_dir: &Path) -> PathBuf {
+    model_dir.join("ort_cuda")
+}
+
+fn ort_dml_bundle_dir(model_dir: &Path) -> PathBuf {
+    model_dir.join("ort_dml")
+}
+
+fn resolve_ort_bundle(model_dir: &Path, provider: &str) -> PathBuf {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "directml" => ort_dml_bundle_dir(model_dir),
+        _ => ort_cuda_bundle_dir(model_dir),
+    }
+}
+
+fn ort_bundle_dll_path(bundle_dir: &Path) -> PathBuf {
+    bundle_dir.join("onnxruntime.dll")
+}
+
+fn check_ort_version(bundle_dir: &Path) -> Result<String, String> {
+    get_onnxruntime_version_from_dll(&ort_bundle_dll_path(bundle_dir))
 }
 
 fn set_ort_dylib_path(path: &str, source_label: &str) {
@@ -1199,44 +1345,53 @@ fn set_ort_dylib_path(path: &str, source_label: &str) {
     ));
 }
 
-fn ort_bundle_has_provider_shared(onnxruntime_dll_path: &str) -> bool {
-    let dll_path = Path::new(onnxruntime_dll_path);
-    let Some(dir) = dll_path.parent() else {
-        return false;
+fn bundle_missing_dlls(model_dir: &Path, dlls: &[&str]) -> Vec<String> {
+    dlls.iter()
+        .filter(|dll| !model_dir.join(dll).exists())
+        .map(|dll| (*dll).to_string())
+        .collect()
+}
+
+fn ort_bundle_has_required_dlls(bundle_dir: &Path, required: &[&str]) -> bool {
+    required.iter().all(|name| bundle_dir.join(name).exists())
+}
+
+fn ensure_ort_dylib_path_for_provider(model_dir: &Path, provider: &str) -> Result<String, String> {
+    let bundle_dir = resolve_ort_bundle(model_dir, provider);
+    let required: Vec<&str> = if provider.trim().eq_ignore_ascii_case("directml") {
+        ORT_DML_REQUIRED_DLLS
+            .iter()
+            .chain(DIRECTML_RUNTIME_REQUIRED_DLLS.iter())
+            .copied()
+            .collect()
+    } else {
+        ORT_CUDA_REQUIRED_DLLS.to_vec()
     };
-    dir.join("onnxruntime_providers_shared.dll").exists()
-}
-
-fn ort_bundle_has_required_gpu_dlls(onnxruntime_dll_path: &Path) -> bool {
-    let Some(dir) = onnxruntime_dll_path.parent() else {
-        return false;
-    };
-    ORT_REQUIRED_DLLS.iter().all(|name| dir.join(name).exists())
-}
-
-fn ensure_ort_dylib_path() -> Option<String> {
-    let path = resolve_existing_path("model/onnxruntime.dll")?;
-    if !existing_ort_version_is_supported(&path) {
-        log_debug(&format!(
-            "model/onnxruntime.dll is older than required {}; refusing candidate: {}",
-            ORT_VERSION, path
+    if !ort_bundle_has_required_dlls(&bundle_dir, &required) {
+        return Err(format!(
+            "ORT bundle is incomplete for provider '{}': {}",
+            provider,
+            bundle_dir.display()
         ));
-        return None;
     }
-    if !ort_bundle_has_provider_shared(&path) {
-        log_debug(&format!(
-            "model/onnxruntime.dll found but provider shared DLL is missing; refusing candidate: {}",
-            path
+    let version = check_ort_version(&bundle_dir)?;
+    if !is_supported_ort_version(&version) {
+        return Err(format!(
+            "ORT bundle version {} is older than required {} in {}",
+            version,
+            ORT_VERSION,
+            bundle_dir.display()
         ));
-        return None;
     }
-    set_ort_dylib_path(&path, "model directory");
-    Some(path)
+    let dll_path = ort_bundle_dll_path(&bundle_dir);
+    let dll = dll_path.to_string_lossy().to_string();
+    set_ort_dylib_path(&dll, &format!("{} provider bundle", provider));
+    Ok(dll)
 }
 
-fn remove_existing_ort_bundle(model_dir: &Path) -> Result<(), String> {
-    for name in ORT_REQUIRED_DLLS {
-        let path = model_dir.join(name);
+fn remove_existing_ort_bundle(bundle_dir: &Path, names: &[&str]) -> Result<(), String> {
+    for name in names {
+        let path = bundle_dir.join(name);
         if path.exists() {
             fs::remove_file(&path)
                 .map_err(|e| format!("failed to remove '{}': {e}", path.display()))?;
@@ -1245,14 +1400,61 @@ fn remove_existing_ort_bundle(model_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn download_ort_zip(app: &tauri::AppHandle, client: &Client, zip_path: &Path) -> Result<(), String> {
+fn move_file_if_present(src: &Path, dst: &Path) -> Result<(), String> {
+    if !src.exists() || dst.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create '{}': {e}", parent.display()))?;
+    }
+    match fs::rename(src, dst) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dst).map_err(|e| {
+                format!(
+                    "failed to copy '{}' -> '{}': {e}",
+                    src.display(),
+                    dst.display()
+                )
+            })?;
+            fs::remove_file(src)
+                .map_err(|e| format!("failed to remove '{}': {e}", src.display()))?;
+            Ok(())
+        }
+    }
+}
+
+fn migrate_legacy_cuda_bundle(model_dir: &Path, bundle_dir: &Path) -> Result<(), String> {
+    let names: Vec<&str> = ORT_CUDA_REQUIRED_DLLS
+        .iter()
+        .chain(CUDA_REQUIRED_DLLS.iter())
+        .chain(CUDNN_REQUIRED_DLLS.iter())
+        .copied()
+        .collect();
+    for name in names {
+        move_file_if_present(&model_dir.join(name), &bundle_dir.join(name))?;
+    }
+    Ok(())
+}
+
+fn download_zip_with_progress(
+    app: &tauri::AppHandle,
+    client: &Client,
+    url: &str,
+    zip_path: &Path,
+    status: &str,
+    progress_start: f32,
+    progress_span: f32,
+    label: &str,
+) -> Result<(), String> {
     let mut response = client
-        .get(ORT_DOWNLOAD_URL)
+        .get(url)
         .send()
-        .map_err(|e| format!("failed to request ONNX Runtime zip: {e}"))?;
+        .map_err(|e| format!("failed to request {label}: {e}"))?;
     if !response.status().is_success() {
         return Err(format!(
-            "failed to download ONNX Runtime zip: HTTP {}",
+            "failed to download {label}: HTTP {}",
             response.status()
         ));
     }
@@ -1265,14 +1467,14 @@ fn download_ort_zip(app: &tauri::AppHandle, client: &Client, zip_path: &Path) ->
     let mut buf = vec![0u8; 64 * 1024];
     emit_ort_setup_progress(
         app,
-        "downloading",
-        0.0,
-        format!("Downloading ONNX Runtime {}", ORT_VERSION),
+        status,
+        progress_start,
+        format!("Downloading {label}"),
     );
     loop {
         let read = response
             .read(&mut buf)
-            .map_err(|e| format!("failed while downloading ONNX Runtime zip: {e}"))?;
+            .map_err(|e| format!("failed while downloading {label}: {e}"))?;
         if read == 0 {
             break;
         }
@@ -1286,9 +1488,9 @@ fn download_ort_zip(app: &tauri::AppHandle, client: &Client, zip_path: &Path) ->
                     last_bucket = bucket;
                     emit_ort_setup_progress(
                         app,
-                        "downloading",
-                        (bucket as f32 / 100.0) * 0.85,
-                        format!("Downloading ONNX Runtime... {}%", bucket),
+                        status,
+                        progress_start + (bucket as f32 / 100.0) * progress_span,
+                        format!("Downloading {label}... {}%", bucket),
                     );
                 }
             }
@@ -1297,14 +1499,33 @@ fn download_ort_zip(app: &tauri::AppHandle, client: &Client, zip_path: &Path) ->
     Ok(())
 }
 
-fn extract_ort_zip(app: &tauri::AppHandle, zip_path: &Path, model_dir: &Path) -> Result<(), String> {
-    emit_ort_setup_progress(app, "extracting", 0.9, "Extracting ONNX Runtime DLLs");
+fn extract_selected_dlls_from_zip(
+    app: &tauri::AppHandle,
+    zip_path: &Path,
+    model_dir: &Path,
+    required_dlls: &[&str],
+    preferred_roots: &[&str],
+    status: &str,
+    progress_start: f32,
+    progress_span: f32,
+    label: &str,
+) -> Result<(), String> {
+    emit_ort_setup_progress(
+        app,
+        status,
+        progress_start,
+        format!("Extracting {label}"),
+    );
     let file = fs::File::open(zip_path)
         .map_err(|e| format!("failed to open '{}': {e}", zip_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| format!("failed to open zip '{}': {e}", zip_path.display()))?;
-    let total_required = ORT_REQUIRED_DLLS.len() as f32;
+    let total_required = required_dlls.len().max(1) as f32;
     let mut extracted = Vec::<String>::new();
+    let normalized_roots: Vec<String> = preferred_roots
+        .iter()
+        .map(|root| root.replace('\\', "/").trim_end_matches('/').to_string() + "/")
+        .collect();
 
     for idx in 0..archive.len() {
         let mut entry = archive
@@ -1313,11 +1534,19 @@ fn extract_ort_zip(app: &tauri::AppHandle, zip_path: &Path, model_dir: &Path) ->
         if entry.is_dir() {
             continue;
         }
-        let Some(file_name) = Path::new(entry.name()).file_name() else {
+        let entry_name = entry.name().replace('\\', "/");
+        if !normalized_roots.is_empty()
+            && !normalized_roots
+                .iter()
+                .any(|root| entry_name.starts_with(root))
+        {
+            continue;
+        }
+        let Some(file_name) = Path::new(&entry_name).file_name() else {
             continue;
         };
         let file_name = file_name.to_string_lossy().to_string();
-        if !ORT_REQUIRED_DLLS
+        if !required_dlls
             .iter()
             .any(|required| required.eq_ignore_ascii_case(&file_name))
         {
@@ -1331,16 +1560,16 @@ fn extract_ort_zip(app: &tauri::AppHandle, zip_path: &Path, model_dir: &Path) ->
         if !extracted.iter().any(|name| name.eq_ignore_ascii_case(&file_name)) {
             extracted.push(file_name.clone());
         }
-        let progress = 0.9 + (extracted.len() as f32 / total_required) * 0.09;
+        let progress = progress_start + (extracted.len() as f32 / total_required) * progress_span;
         emit_ort_setup_progress(
             app,
-            "extracting",
+            status,
             progress,
-            format!("Extracting: {}", file_name),
+            format!("Extracting {label}: {}", file_name),
         );
     }
 
-    for required in ORT_REQUIRED_DLLS {
+    for required in required_dlls {
         if !model_dir.join(required).exists() {
             return Err(format!(
                 "required DLL '{}' was not found in downloaded archive",
@@ -1351,76 +1580,336 @@ fn extract_ort_zip(app: &tauri::AppHandle, zip_path: &Path, model_dir: &Path) ->
     Ok(())
 }
 
+fn ensure_redist_bundles(
+    app: &tauri::AppHandle,
+    client: &Client,
+    temp_root: &Path,
+    model_dir: &Path,
+    bundles: &[RuntimeDllBundle],
+    status_base_progress: f32,
+    status_span: f32,
+) -> Result<(), String> {
+    let total = bundles.len().max(1) as f32;
+    for (index, bundle) in bundles.iter().enumerate() {
+        if bundle_missing_dlls(model_dir, bundle.dlls).is_empty() {
+            continue;
+        }
+
+        let step_start = status_base_progress + (index as f32 / total) * status_span;
+        let step_span = status_span / total;
+        let download_span = step_span * 0.7;
+        let extract_span = step_span * 0.3;
+
+        let file_name = Path::new(bundle.url)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("failed to derive zip filename from '{}'", bundle.url))?;
+        let zip_path = temp_root.join(file_name);
+
+        download_zip_with_progress(
+            app,
+            client,
+            bundle.url,
+            &zip_path,
+            bundle.download_status,
+            step_start,
+            download_span,
+            bundle.label,
+        )?;
+        extract_selected_dlls_from_zip(
+            app,
+            &zip_path,
+            model_dir,
+            bundle.dlls,
+            &[],
+            bundle.extract_status,
+            step_start + download_span,
+            extract_span,
+            bundle.label,
+        )?;
+
+        let _ = fs::remove_file(&zip_path);
+    }
+    Ok(())
+}
+
+fn ensure_ort_cuda_bundle(
+    app: &tauri::AppHandle,
+    client: &Client,
+    temp_root: &Path,
+    model_dir: &Path,
+) -> Result<String, String> {
+    let bundle_dir = ort_cuda_bundle_dir(model_dir);
+    fs::create_dir_all(&bundle_dir)
+        .map_err(|e| format!("failed to create '{}': {e}", bundle_dir.display()))?;
+    migrate_legacy_cuda_bundle(model_dir, &bundle_dir)?;
+    for name in ORT_CUDA_OPTIONAL_REMOVE_DLLS {
+        let stale = bundle_dir.join(name);
+        if stale.exists() {
+            let _ = fs::remove_file(&stale);
+            log_debug(&format!(
+                "removed optional CUDA provider dll '{}'",
+                stale.display()
+            ));
+        }
+    }
+
+    let dll_path = ort_bundle_dll_path(&bundle_dir);
+    let mut existing_version: Option<String> = None;
+    if dll_path.exists() {
+        if !ort_bundle_has_required_dlls(&bundle_dir, ORT_CUDA_REQUIRED_DLLS) {
+            log_debug(&format!(
+                "ORT CUDA bundle is incomplete; refreshing '{}'",
+                bundle_dir.display()
+            ));
+            remove_existing_ort_bundle(&bundle_dir, ORT_CUDA_REQUIRED_DLLS)?;
+        } else {
+            match check_ort_version(&bundle_dir) {
+                Ok(version) if is_supported_ort_version(&version) => {
+                    existing_version = Some(version);
+                }
+                Ok(version) => {
+                    log_debug(&format!(
+                        "ORT CUDA bundle version {} is older than {}; refreshing '{}'",
+                        version,
+                        ORT_VERSION,
+                        bundle_dir.display()
+                    ));
+                    remove_existing_ort_bundle(&bundle_dir, ORT_CUDA_REQUIRED_DLLS)?;
+                }
+                Err(err) => {
+                    log_debug(&format!(
+                        "failed to inspect ORT CUDA bundle '{}': {}; refreshing",
+                        bundle_dir.display(),
+                        err
+                    ));
+                    remove_existing_ort_bundle(&bundle_dir, ORT_CUDA_REQUIRED_DLLS)?;
+                }
+            }
+        }
+    }
+
+    let zip_path = temp_root.join("onnxruntime-win-x64-gpu-1.23.0.zip");
+    if ort_bundle_has_required_dlls(&bundle_dir, ORT_CUDA_REQUIRED_DLLS) && dll_path.exists() {
+        emit_ort_setup_progress(
+            app,
+            "checking",
+            0.10,
+            format!("ORT CUDA bundle already present ({})", bundle_dir.display()),
+        );
+    } else {
+        download_zip_with_progress(
+            app,
+            client,
+            ORT_CUDA_DOWNLOAD_URL,
+            &zip_path,
+            "downloading",
+            0.0,
+            0.40,
+            &format!("ONNX Runtime CUDA {}", ORT_VERSION),
+        )?;
+        extract_selected_dlls_from_zip(
+            app,
+            &zip_path,
+            &bundle_dir,
+            ORT_CUDA_REQUIRED_DLLS,
+            &[],
+            "extracting",
+            0.40,
+            0.10,
+            "ONNX Runtime CUDA DLLs",
+        )?;
+    }
+
+    ensure_redist_bundles(app, client, temp_root, &bundle_dir, CUDA_REDIST_BUNDLES, 0.50, 0.22)?;
+    ensure_redist_bundles(app, client, temp_root, &bundle_dir, CUDNN_REDIST_BUNDLES, 0.72, 0.10)?;
+
+    let missing_cuda = bundle_missing_dlls(&bundle_dir, CUDA_REQUIRED_DLLS);
+    if !missing_cuda.is_empty() {
+        return Err(format!(
+            "missing CUDA runtime DLLs after setup in '{}': {}",
+            bundle_dir.display(),
+            missing_cuda.join(", ")
+        ));
+    }
+    let missing_cudnn = bundle_missing_dlls(&bundle_dir, CUDNN_REQUIRED_DLLS);
+    if !missing_cudnn.is_empty() {
+        return Err(format!(
+            "missing cuDNN DLLs after setup in '{}': {}",
+            bundle_dir.display(),
+            missing_cudnn.join(", ")
+        ));
+    }
+    let version = check_ort_version(&bundle_dir)?;
+    if !is_supported_ort_version(&version) {
+        return Err(format!(
+            "ORT CUDA bundle version is unsupported after refresh: {} ({})",
+            version,
+            bundle_dir.display()
+        ));
+    }
+    Ok(existing_version.unwrap_or(version))
+}
+
+fn ensure_ort_dml_bundle(
+    app: &tauri::AppHandle,
+    client: &Client,
+    temp_root: &Path,
+    model_dir: &Path,
+) -> Result<String, String> {
+    let bundle_dir = ort_dml_bundle_dir(model_dir);
+    fs::create_dir_all(&bundle_dir)
+        .map_err(|e| format!("failed to create '{}': {e}", bundle_dir.display()))?;
+
+    let dll_path = ort_bundle_dll_path(&bundle_dir);
+    let mut existing_version: Option<String> = None;
+    if dll_path.exists() {
+        if !ort_bundle_has_required_dlls(&bundle_dir, ORT_DML_REQUIRED_DLLS) {
+            log_debug(&format!(
+                "ORT DirectML bundle is incomplete; refreshing '{}'",
+                bundle_dir.display()
+            ));
+            remove_existing_ort_bundle(&bundle_dir, ORT_DML_REQUIRED_DLLS)?;
+        } else {
+            match check_ort_version(&bundle_dir) {
+                Ok(version) if is_supported_ort_version(&version) => {
+                    existing_version = Some(version);
+                }
+                Ok(version) => {
+                    log_debug(&format!(
+                        "ORT DirectML bundle version {} is older than {}; refreshing '{}'",
+                        version,
+                        ORT_VERSION,
+                        bundle_dir.display()
+                    ));
+                    remove_existing_ort_bundle(&bundle_dir, ORT_DML_REQUIRED_DLLS)?;
+                }
+                Err(err) => {
+                    log_debug(&format!(
+                        "failed to inspect ORT DirectML bundle '{}': {}; refreshing",
+                        bundle_dir.display(),
+                        err
+                    ));
+                    remove_existing_ort_bundle(&bundle_dir, ORT_DML_REQUIRED_DLLS)?;
+                }
+            }
+        }
+    }
+
+    let ort_dml_zip_path = temp_root.join("microsoft.ml.onnxruntime.directml.1.23.0.nupkg");
+    if ort_bundle_has_required_dlls(&bundle_dir, ORT_DML_REQUIRED_DLLS) && dll_path.exists() {
+        emit_ort_setup_progress(
+            app,
+            "checking",
+            0.85,
+            format!("ORT DirectML bundle already present ({})", bundle_dir.display()),
+        );
+    } else {
+        download_zip_with_progress(
+            app,
+            client,
+            ORT_DML_DOWNLOAD_URL,
+            &ort_dml_zip_path,
+            "downloading_directml",
+            0.82,
+            0.08,
+            &format!("ONNX Runtime DirectML {}", ORT_VERSION),
+        )?;
+        extract_selected_dlls_from_zip(
+            app,
+            &ort_dml_zip_path,
+            &bundle_dir,
+            ORT_DML_REQUIRED_DLLS,
+            &["runtimes/win-x64/native"],
+            "extracting_directml",
+            0.90,
+            0.04,
+            "ORT DirectML DLLs",
+        )?;
+    }
+
+    if !ort_bundle_has_required_dlls(&bundle_dir, DIRECTML_RUNTIME_REQUIRED_DLLS) {
+        let dml_runtime_zip = temp_root.join("microsoft.ai.directml.1.15.4.nupkg");
+        download_zip_with_progress(
+            app,
+            client,
+            DIRECTML_RUNTIME_DOWNLOAD_URL,
+            &dml_runtime_zip,
+            "downloading_directml",
+            0.94,
+            0.04,
+            "DirectML runtime 1.15.4",
+        )?;
+        extract_selected_dlls_from_zip(
+            app,
+            &dml_runtime_zip,
+            &bundle_dir,
+            DIRECTML_RUNTIME_REQUIRED_DLLS,
+            &["bin/x64-win"],
+            "extracting_directml",
+            0.98,
+            0.01,
+            "DirectML runtime DLLs",
+        )?;
+    }
+
+    let missing_ort = bundle_missing_dlls(&bundle_dir, ORT_DML_REQUIRED_DLLS);
+    if !missing_ort.is_empty() {
+        return Err(format!(
+            "missing DirectML ORT DLLs after setup in '{}': {}",
+            bundle_dir.display(),
+            missing_ort.join(", ")
+        ));
+    }
+    let missing_runtime = bundle_missing_dlls(&bundle_dir, DIRECTML_RUNTIME_REQUIRED_DLLS);
+    if !missing_runtime.is_empty() {
+        return Err(format!(
+            "missing DirectML runtime DLLs after setup in '{}': {}",
+            bundle_dir.display(),
+            missing_runtime.join(", ")
+        ));
+    }
+    let version = check_ort_version(&bundle_dir)?;
+    if !is_supported_ort_version(&version) {
+        return Err(format!(
+            "ORT DirectML bundle version is unsupported after refresh: {} ({})",
+            version,
+            bundle_dir.display()
+        ));
+    }
+    Ok(existing_version.unwrap_or(version))
+}
+
 fn ensure_ort_runtime_bundle(app: &tauri::AppHandle) -> Result<(), String> {
     let model_dir = resolve_model_dir();
     emit_ort_setup_progress(
         app,
         "checking",
         0.0,
-        format!("Checking ONNX Runtime {} bundle", ORT_VERSION),
+        format!("Checking ONNX Runtime {} bundles", ORT_VERSION),
     );
     fs::create_dir_all(&model_dir)
         .map_err(|e| format!("failed to create model directory '{}': {e}", model_dir.display()))?;
-    let dll_path = model_dir.join("onnxruntime.dll");
-
-    if dll_path.exists() {
-        if !ort_bundle_has_required_gpu_dlls(&dll_path) {
-            log_debug(&format!(
-                "model ORT bundle is incomplete; refreshing '{}'",
-                dll_path.display()
-            ));
-            remove_existing_ort_bundle(&model_dir)?;
-        } else {
-            match get_onnxruntime_version_from_dll(&dll_path) {
-                Ok(version) if is_supported_ort_version(&version) => {
-                    let dll = dll_path.to_string_lossy().to_string();
-                    set_ort_dylib_path(&dll, "startup model bundle");
-                    emit_ort_setup_progress(
-                        app,
-                        "done",
-                        1.0,
-                        format!("ONNX Runtime {version} is ready"),
-                    );
-                    return Ok(());
-                }
-                Ok(version) => {
-                    log_debug(&format!(
-                        "model ORT bundle version {} is older than {}; refreshing",
-                        version, ORT_VERSION
-                    ));
-                    remove_existing_ort_bundle(&model_dir)?;
-                }
-                Err(err) => {
-                    log_debug(&format!(
-                        "failed to inspect model ORT bundle '{}': {}; refreshing",
-                        dll_path.display(),
-                        err
-                    ));
-                    remove_existing_ort_bundle(&model_dir)?;
-                }
-            }
-        }
-    }
 
     let temp_root = std::env::temp_dir().join(format!("rust-vc-ort-{}", now_millis()));
     fs::create_dir_all(&temp_root)
         .map_err(|e| format!("failed to create temp directory '{}': {e}", temp_root.display()))?;
-    let zip_path = temp_root.join("onnxruntime-win-x64-gpu-1.23.0.zip");
     let client = Client::builder()
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
     let result = (|| -> Result<(), String> {
-        download_ort_zip(app, &client, &zip_path)?;
-        extract_ort_zip(app, &zip_path, &model_dir)?;
-        let dll = model_dir.join("onnxruntime.dll");
-        let dll_s = dll.to_string_lossy().to_string();
-        set_ort_dylib_path(&dll_s, "downloaded model bundle");
+        let cuda_version = ensure_ort_cuda_bundle(app, &client, &temp_root, &model_dir)?;
+        let dml_version = ensure_ort_dml_bundle(app, &client, &temp_root, &model_dir)?;
+
         emit_ort_setup_progress(
             app,
             "done",
             1.0,
-            format!("ONNX Runtime {} bundle installed", ORT_VERSION),
+            format!(
+                "ORT bundles ready: cuda={} dml={}",
+                cuda_version, dml_version
+            ),
         );
         Ok(())
     })();

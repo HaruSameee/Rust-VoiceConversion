@@ -189,6 +189,8 @@ pub struct AudioStreamOptions {
     pub output_slice_offset_samples: usize,
     /// Bypass output slicing and emit full decoder output as-is.
     pub bypass_slicing: bool,
+    /// Stateful generator models should not apply block-boundary bypass crossfade.
+    pub stateful_generator_model: bool,
     /// Enables debug WAV dump output at shutdown.
     pub record_dump: bool,
 }
@@ -333,6 +335,7 @@ where
     let output_tail_offset_ms = options.output_tail_offset_ms;
     let requested_output_slice_offset_samples = options.output_slice_offset_samples;
     let bypass_slicing = options.bypass_slicing;
+    let stateful_generator_model = options.stateful_generator_model;
     let record_dump = options.record_dump;
 
     let input_device = find_input_device(&host, options.input_device_name.as_deref())?;
@@ -389,7 +392,7 @@ where
         requested_block_size
     );
     eprintln!(
-        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} target_buffer_ms={} threshold_legacy={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} record_dump={}",
+        "[vc-audio] input_device='{}' output_device='{}' extra_inference_ms={} target_buffer_ms={} threshold_legacy={:.4} vad_on={:.4} vad_off={:.4} vad_hysteresis={:.2} noise_suppress={} noise_suppress_db={:.1} noise_learn_sec={:.1} frame_gate={:.4} fade_in_ms={} fade_out_ms={} sola_search_ms={} sola_reset_threshold={} tail_offset_ms={} slice_offset_samples={} bypass_slicing={} stateful_generator_model={} record_dump={}",
         input_device.name().unwrap_or_else(|_| "unknown-input".to_string()),
         output_device.name().unwrap_or_else(|_| "unknown-output".to_string()),
         extra_inference_ms,
@@ -409,6 +412,7 @@ where
         output_tail_offset_ms,
         requested_output_slice_offset_samples,
         bypass_slicing,
+        stateful_generator_model,
         record_dump
     );
     // Warm up the model before starting audio streams to avoid first-block stalls
@@ -607,6 +611,7 @@ where
             output_tail_offset_ms,
             output_slice_offset_samples,
             bypass_slicing,
+            stateful_generator_model,
             record_dump,
             process_window_samples,
             &running_worker,
@@ -892,6 +897,7 @@ fn worker_loop<E>(
     output_tail_offset_ms: u32,
     output_slice_offset_samples: usize,
     bypass_slicing: bool,
+    stateful_generator_model: bool,
     record_dump: bool,
     configured_process_window_samples: usize,
     running: &Arc<AtomicBool>,
@@ -907,10 +913,17 @@ fn worker_loop<E>(
     let io_block_size = block_size.max(1);
     let output_step_samples =
         map_model_samples_to_output(io_block_size, model_sample_rate, output_rate);
-    let crossfade_samples =
-        configured_output_crossfade_samples(output_rate, fade_in_ms, output_step_samples);
+    let crossfade_samples = if bypass_slicing && stateful_generator_model {
+        0
+    } else {
+        configured_output_crossfade_samples(output_rate, fade_in_ms, output_step_samples)
+    };
     let sola_search_output = sola_search_samples(output_rate, sola_search_ms);
-    let edge_guard_samples = crossfade_samples.max(sola_search_output / 2);
+    let edge_guard_samples = if bypass_slicing && stateful_generator_model {
+        0
+    } else {
+        crossfade_samples.max(sola_search_output / 2)
+    };
     let output_tail_offset_samples =
         resolve_output_tail_offset_samples(output_rate, edge_guard_samples, output_tail_offset_ms);
     let sola_search_model =
@@ -1006,6 +1019,11 @@ fn worker_loop<E>(
         edge_guard_samples,
         output_slice_offset_samples
     );
+    if bypass_slicing && stateful_generator_model {
+        eprintln!(
+            "[vc-audio] output: stateful bypass mode; boundary crossfade disabled edge_guard_out=0"
+        );
+    }
     eprintln!(
         "[vc-audio] vad: on_threshold={:.4} ({:.1}dB) off_threshold={:.4} ({:.1}dB) frame_hysteresis={:.2} frame_gate={:.1}dB",
         vad_on_threshold,
@@ -1463,9 +1481,13 @@ fn worker_loop<E>(
             if !bypass_slicing && overlap > 0 && (!bypass_inference || was_active) {
                 apply_equal_power_overlap(&previous_output_tail, &mut smoothed_output, overlap);
             }
-            let bypass_overlap = BYPASS_CROSSFADE_SAMPLES
-                .min(smoothed_output.len())
-                .min(previous_output_tail.len());
+            let bypass_overlap = if stateful_generator_model {
+                0
+            } else {
+                BYPASS_CROSSFADE_SAMPLES
+                    .min(smoothed_output.len())
+                    .min(previous_output_tail.len())
+            };
             if bypass_slicing && bypass_overlap > 0 {
                 if processed_blocks < OUTPUT_SLICE_AUDIT_BLOCKS {
                     eprintln!(

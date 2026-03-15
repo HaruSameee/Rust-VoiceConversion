@@ -7,8 +7,10 @@ NOTE: このスクリプトで生成した固定長ONNXは品質面の問題に�
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import traceback
+import importlib
 from pathlib import Path
 
 import torch
@@ -42,6 +44,33 @@ def _add_scripts_to_path(project_root: Path) -> None:
     scripts_dir = project_root / "scripts"
     if str(scripts_dir) not in sys.path:
         sys.path.insert(0, str(scripts_dir))
+
+
+def _patch_fairseq_pad_to_multiple_for_fixed_export() -> None:
+    utils_module = importlib.import_module("fairseq.models.wav2vec.utils")
+    wav2vec2_module = importlib.import_module("fairseq.models.wav2vec.wav2vec2")
+    original = getattr(utils_module, "pad_to_multiple", None)
+    if original is None or getattr(utils_module, "_rust_vc_fixed_export_patched", False):
+        return
+
+    def patched_pad_to_multiple(x, multiple, dim=-1, value=0):
+        if x is None:
+            return None, 0
+        tsz = x.size(dim)
+        if isinstance(tsz, torch.Tensor):
+            tsz = int(tsz.item())
+        else:
+            tsz = int(tsz)
+        m = tsz / multiple
+        remainder = math.ceil(m) * multiple - tsz
+        if remainder == 0:
+            return x, 0
+        pad_offset = (0,) * (-1 - dim) * 2
+        return F.pad(x, (*pad_offset, 0, remainder), value=value), remainder
+
+    utils_module.pad_to_multiple = patched_pad_to_multiple
+    wav2vec2_module.pad_to_multiple = patched_pad_to_multiple
+    utils_module._rust_vc_fixed_export_patched = True
 
 
 class HubertWrapper(torch.nn.Module):
@@ -81,7 +110,7 @@ class RmvpeMelToF0(torch.nn.Module):
 VARIANTS = [
     {"block_size": 12000, "window_16k": 8000, "hop_16k": 4000, "n_frames": 64},
     {"block_size": 24000, "window_16k": 16000, "hop_16k": 8000, "n_frames": 128},
-    {"block_size": 48000, "window_16k": 32000, "hop_16k": 16000, "n_frames": 256},
+    {"block_size": 48000, "window_16k": 32000, "hop_16k": 16000, "n_frames": 224},
 ]
 
 
@@ -92,6 +121,7 @@ def export_hubert_fixed(
     opset: int,
     device: str,
 ) -> None:
+    _patch_fairseq_pad_to_multiple_for_fixed_export()
     from fairseq import checkpoint_utils
 
     print(f"[hubert] loading {pt_path}")
@@ -100,7 +130,7 @@ def export_hubert_fixed(
     wrapped_model = HubertWrapper(model).eval()
     dummy = torch.zeros(1, window_16k, dtype=torch.float32, device=device)
 
-    # HuBERT (fairseq) exports more reliably with the new exporter path.
+    # DirectML compatibility is better with the legacy exporter path.
     hubert_opset = max(opset, 18)
     torch.onnx.export(
         wrapped_model,
@@ -111,7 +141,7 @@ def export_hubert_fixed(
         # Fixed shape export (no dynamic_axes)
         opset_version=hubert_opset,
         do_constant_folding=True,
-        dynamo=True,
+        dynamo=False,
     )
     print(f"[hubert] fixed window={window_16k} -> {out_path}")
 

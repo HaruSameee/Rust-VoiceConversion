@@ -2,7 +2,7 @@
 setlocal
 
 echo Building RustVC setup.exe...
-python -m pip install pyinstaller faiss-cpu tqdm requests onnx onnxscript --quiet
+python -m pip install pyinstaller faiss-cpu tqdm requests onnx onnxscript scipy --quiet
 if errorlevel 1 (
   echo Failed to install build dependencies.
   exit /b 1
@@ -19,6 +19,13 @@ python -c "import onnx, onnxscript" >nul 2>nul
 if errorlevel 1 (
   echo onnx and onnxscript are required in the build environment.
   echo Run: python -m pip install onnx onnxscript
+  exit /b 1
+)
+
+python -c "import scipy" >nul 2>nul
+if errorlevel 1 (
+  echo scipy is required in the build environment.
+  echo Run: python -m pip install scipy
   exit /b 1
 )
 
