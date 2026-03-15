@@ -37,7 +37,11 @@ use faiss_index::FaissIndex;
 use ivf_index::{IvfIndex, IVF_MAGIC};
 
 const STRICT_ONNX_INPUT_SAMPLES_16K: usize = 16_000;
+#[allow(dead_code)]
 const STRICT_HUBERT_OUTPUT_FRAMES: usize = 50;
+/// Standard HuBERT convolutional feature extractor parameters (kernel=400, hop=320 @ 16 kHz).
+const HUBERT_CONV_KERNEL_16K: usize = 400;
+const HUBERT_CONV_HOP_16K: usize = 320;
 const DEFAULT_RMVPE_THRESHOLD: f32 = 0.01;
 const TIMING_LOG_EVERY_BLOCKS: u64 = 10;
 // scipy.signal.butter(N=5, Wn=48, btype="high", fs=16000, output="sos")
@@ -535,33 +539,87 @@ impl RvcOrtEngine {
             }
             let fallback_hubert_input_samples_16k =
                 infer_hubert_input_samples_fallback_from_config(runtime_config);
-            let hubert_input_samples_16k = hubert_session
+            let session_hubert_input_16k = hubert_session
                 .as_ref()
-                .and_then(infer_hubert_input_samples_from_session)
-                .unwrap_or_else(|| {
+                .and_then(infer_hubert_input_samples_from_session);
+            // When the session reports a fixed input shape smaller than the
+            // config-derived fallback, override with the fallback.  This handles
+            // dynamic-capable models (e.g. hubert_pad80.onnx) whose ONNX metadata
+            // advertises a default/minimum shape (often 16 000) even though the
+            // model accepts larger inputs at runtime.  Using the session value
+            // as-is would starve the engine of context samples and produce too
+            // few HuBERT frames for the downstream Generator.
+            let hubert_input_samples_16k = match session_hubert_input_16k {
+                Some(fixed) if fixed >= fallback_hubert_input_samples_16k => {
                     eprintln!(
-                        "[vc-inference] hubert input shape is dynamic; fallback input_16k={} (block_16k={} requested_context_16k={} effective_context_16k={})",
-                        fallback_hubert_input_samples_16k,
-                        estimate_hop_samples_16k(
-                            runtime_config.block_size.max(1),
-                            runtime_config.sample_rate.max(1),
-                        ),
-                        (runtime_config.hubert_context_sec.clamp(0.25, 2.0)
-                            * RMVPE_SAMPLE_RATE as f32)
-                            .round() as usize,
-                        fallback_hubert_input_samples_16k.saturating_sub(
-                            estimate_hop_samples_16k(
-                                runtime_config.block_size.max(1),
-                                runtime_config.sample_rate.max(1),
-                            )
-                        ),
+                        "[vc-inference] hubert input_16k={} (from session, >= fallback={})",
+                        fixed, fallback_hubert_input_samples_16k,
                     );
+                    fixed
+                }
+                other => {
+                    let block_16k = estimate_hop_samples_16k(
+                        runtime_config.block_size.max(1),
+                        runtime_config.sample_rate.max(1),
+                    );
+                    let requested_context_16k = (runtime_config.hubert_context_sec.clamp(0.25, 2.0)
+                        * RMVPE_SAMPLE_RATE as f32)
+                        .round() as usize;
+                    let effective_context_16k =
+                        fallback_hubert_input_samples_16k.saturating_sub(block_16k);
+                    if let Some(fixed) = other {
+                        eprintln!(
+                            "[vc-inference] hubert session input_16k={} < fallback={}; overriding \
+                             (block_16k={} requested_context_16k={} effective_context_16k={})",
+                            fixed,
+                            fallback_hubert_input_samples_16k,
+                            block_16k,
+                            requested_context_16k,
+                            effective_context_16k,
+                        );
+                    } else {
+                        eprintln!(
+                            "[vc-inference] hubert input shape is dynamic; fallback input_16k={} \
+                             (block_16k={} requested_context_16k={} effective_context_16k={})",
+                            fallback_hubert_input_samples_16k,
+                            block_16k,
+                            requested_context_16k,
+                            effective_context_16k,
+                        );
+                    }
                     fallback_hubert_input_samples_16k
-                });
-            let hubert_output_frames = hubert_session
+                }
+            };
+            // Resolve HuBERT output frame count.  When the session reports a
+            // fixed output shape, it may reflect a default export geometry
+            // (e.g. 50 frames for 16 000 input samples) that is inconsistent
+            // with the actual input length we will use at runtime.
+            // Compare the session value against the conv1d estimate derived
+            // from hubert_input_samples_16k and prefer the larger of the two.
+            let estimated_hubert_frames = estimate_hubert_output_frames(hubert_input_samples_16k);
+            let session_hubert_frames = hubert_session
                 .as_ref()
-                .and_then(infer_hubert_output_frames_from_session)
-                .unwrap_or(STRICT_HUBERT_OUTPUT_FRAMES);
+                .and_then(infer_hubert_output_frames_from_session);
+            let hubert_output_frames = match session_hubert_frames {
+                Some(fixed) if fixed >= estimated_hubert_frames => fixed,
+                other => {
+                    if let Some(fixed) = other {
+                        eprintln!(
+                            "[vc-inference] hubert session output frames={} < estimated={} for input_16k={}; using estimate",
+                            fixed, estimated_hubert_frames, hubert_input_samples_16k,
+                        );
+                    } else {
+                        eprintln!(
+                            "[vc-inference] hubert output shape is dynamic; estimated frames={} from input_16k={} (kernel={} hop={})",
+                            estimated_hubert_frames,
+                            hubert_input_samples_16k,
+                            HUBERT_CONV_KERNEL_16K,
+                            HUBERT_CONV_HOP_16K,
+                        );
+                    }
+                    estimated_hubert_frames
+                }
+            };
             let decoder_frame_count = hubert_output_frames
                 .saturating_mul(hubert_upsample_factor)
                 .max(1);
@@ -2770,6 +2828,26 @@ fn infer_hubert_output_frames_from_session(session: &Session) -> Option<usize> {
         .map(|dim| dim as usize)
 }
 
+/// Estimates how many frames HuBERT will produce for a given input length.
+///
+/// The standard HuBERT convolutional feature extractor uses kernel=400, hop=320
+/// at 16 kHz.  The frame count formula mirrors `conv1d` with `padding=0`:
+///
+/// ```text
+/// frames = floor((input_samples - kernel) / hop) + 1
+/// ```
+///
+/// This is used when the session's reported output frame count is smaller than
+/// what the actual runtime input length would produce — which happens when a
+/// dynamic-capable model (e.g. `hubert_pad80.onnx`) advertises its
+/// default/minimum geometry in the ONNX metadata.
+fn estimate_hubert_output_frames(input_samples_16k: usize) -> usize {
+    if input_samples_16k <= HUBERT_CONV_KERNEL_16K {
+        return 1;
+    }
+    (input_samples_16k - HUBERT_CONV_KERNEL_16K) / HUBERT_CONV_HOP_16K + 1
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct RvcRequirements {
     needs_phone_features: bool,
@@ -4052,9 +4130,9 @@ fn resolve_model_path(base_path: &Path, block_size: usize) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_hop_samples_16k, fit_waveform_to_len, has_block_suffix, normalize_model_stem,
-        resolve_runtime_hop_samples_16k, slide_context_window, upsample_phone_frames_repeat,
-        STRICT_ONNX_INPUT_SAMPLES_16K,
+        estimate_hop_samples_16k, estimate_hubert_output_frames, fit_waveform_to_len,
+        has_block_suffix, normalize_model_stem, resolve_runtime_hop_samples_16k,
+        slide_context_window, upsample_phone_frames_repeat, STRICT_ONNX_INPUT_SAMPLES_16K,
     };
     use ndarray::Array3;
     use std::collections::VecDeque;
@@ -4116,6 +4194,19 @@ mod tests {
         // Window-sized configured hop permits runtime sync from input length.
         let hop = resolve_runtime_hop_samples_16k(16_000, 24_000, 48_000);
         assert_eq!(hop, 8_000);
+    }
+
+    #[test]
+    fn hubert_output_frames_estimation_matches_known_values() {
+        // hubert_pad80.onnx with 32000 input @16kHz → 99 frames
+        assert_eq!(estimate_hubert_output_frames(32_000), 99);
+        // Standard 16000 input → 49 frames (fixed models add internal padding for 50)
+        assert_eq!(estimate_hubert_output_frames(16_000), 49);
+        // 24000 input (hubert_ctx_sec=0.5 with block_size=48000) → 74 frames
+        assert_eq!(estimate_hubert_output_frames(24_000), 74);
+        // Edge cases
+        assert_eq!(estimate_hubert_output_frames(400), 1);
+        assert_eq!(estimate_hubert_output_frames(0), 1);
     }
 
     #[test]
