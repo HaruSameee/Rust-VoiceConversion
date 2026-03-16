@@ -32,8 +32,30 @@ class HubertWrapper(torch.nn.Module):
 def export_hubert(pt_path: str, out_path: str):
     print(f"\n[hubert] loading {pt_path}")
     from fairseq import checkpoint_utils
+    import torch.nn.functional as F
+    import fairseq.models.wav2vec.utils as wav2vec_utils
+    import fairseq.models.wav2vec.wav2vec2 as wav2vec2_module
     models, _, _ = checkpoint_utils.load_model_ensemble_and_task([pt_path])
     model = models[0].eval()
+    if hasattr(model, "encoder") and hasattr(model.encoder, "required_seq_len_multiple"):
+        model.encoder.required_seq_len_multiple = 1
+
+    def _pad_to_multiple_export_safe(x, multiple, dim=-1, value=0):
+        if x is None:
+            return None, 0
+        if multiple <= 1:
+            return x, 0
+        tsz = x.shape[dim]
+        if isinstance(tsz, int):
+            remainder = ((tsz + multiple - 1) // multiple) * multiple - tsz
+            if remainder == 0:
+                return x, 0
+            pad_offset = (0,) * (-1 - dim) * 2
+            return F.pad(x, (*pad_offset, 0, remainder), value=value), remainder
+        return x, 0
+
+    wav2vec_utils.pad_to_multiple = _pad_to_multiple_export_safe
+    wav2vec2_module.pad_to_multiple = _pad_to_multiple_export_safe
     wrapped_model = HubertWrapper(model)
 
     dummy = torch.zeros(1, 16000)

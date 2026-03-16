@@ -374,9 +374,16 @@ where
         "[vc-audio] synced effective block_size to inference config: {} samples",
         block_size
     );
-    let process_window_samples = block_size
-        .saturating_mul(PROCESS_WINDOW_BLOCK_MULTIPLIER)
-        .max(block_size);
+    let process_window_samples = if stateful_generator_model {
+        // Stateful generators carry forward context in internal hidden state.
+        // Re-feeding previous_block into the next input double-processes audio
+        // and corrupts that state.
+        block_size
+    } else {
+        block_size
+            .saturating_mul(PROCESS_WINDOW_BLOCK_MULTIPLIER)
+            .max(block_size)
+    };
     // Warmup must use the same steady-state model input shape, especially when
     // CUDA Graph capture is enabled.
     let warmup_inference_block_size = process_window_samples.max(MIN_INFERENCE_BLOCK);
@@ -440,7 +447,20 @@ where
         }
     };
     let inference_block_size = process_window_samples.saturating_add(sola_search_model);
-    let output_slice_offset_samples = requested_output_slice_offset_samples;
+    let output_slice_offset_samples =
+        if stateful_generator_model && process_window_samples == block_size {
+            // With no overlap window, output length is block-sized and there is
+            // no context region to skip at the head.
+            if requested_output_slice_offset_samples > 0 {
+                eprintln!(
+                    "[vc-audio] stateful: overriding output_slice_offset_samples {} -> 0 (no overlap window)",
+                    requested_output_slice_offset_samples,
+                );
+            }
+            0
+        } else {
+            requested_output_slice_offset_samples
+        };
     eprintln!(
         "[vc-audio] resolved output_slice_offset_samples={} (runtime-config controlled)",
         output_slice_offset_samples,
@@ -452,8 +472,11 @@ where
         );
     }
     eprintln!(
-        "[vc-audio] process_window={}smp (2x block_size={})",
-        process_window_samples, block_size
+        "[vc-audio] process_window={}smp ({}x block_size={}) stateful={}",
+        process_window_samples,
+        process_window_samples / block_size.max(1),
+        block_size,
+        stateful_generator_model,
     );
     let requested_target_buffer_out_samples =
         target_buffer_samples_from_ms(target_buffer_ms, output_rate).max(1);
@@ -1208,10 +1231,17 @@ fn worker_loop<E>(
                 // Skip inference in sustained silence, but keep SOLA/context state intact.
                 vec![0.0_f32; expected_len]
             } else {
-                let mut padded_input =
-                    Vec::<f32>::with_capacity(previous_input.len() + current_input.len());
-                padded_input.extend_from_slice(&previous_input);
-                padded_input.extend_from_slice(&current_input);
+                let mut padded_input = if stateful_generator_model
+                    && process_window_samples == io_block_size
+                {
+                    current_input.clone()
+                } else {
+                    let mut buf =
+                        Vec::<f32>::with_capacity(previous_input.len() + current_input.len());
+                    buf.extend_from_slice(&previous_input);
+                    buf.extend_from_slice(&current_input);
+                    buf
+                };
                 if vad_gate_enabled {
                     apply_frame_level_gate(
                         &mut padded_input,
